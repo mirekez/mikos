@@ -10,7 +10,7 @@ fi
 qemu="$root/build/qemu/qemu-system-riscv32"
 kernel="$root/build/linux-qemu-out/arch/riscv/boot/Image"
 initramfs="$root/build/mikos-ssh-initramfs.cpio"
-bridge="$root/build/ethgig_tap"
+bridge="$root/build/tests/qemu/ethgig_tap"
 identity="$root/build/mikos_ssh_key"
 top_log="$root/build/qemu-ssh-top.log"
 qemu_log="$root/build/qemu-ssh.log"

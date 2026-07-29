@@ -1,0 +1,30 @@
+#include <string>
+
+#include <mikos/abi/riscv32.hpp>
+#include <mikos/base.hpp>
+
+#include <support/test.hpp>
+
+int main() {
+  mikos::test::Suite suite{"kernel/abi_riscv32"};
+  using mikos::abi::riscv32::Errno;
+  using mikos::abi::riscv32::Syscall;
+
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::write) == 64);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::exit_group) == 94);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::brk) == 214);
+  MIKOS_CHECK(suite,
+              static_cast<mikos::u32>(Syscall::clock_gettime64) == 403);
+  MIKOS_CHECK(suite,
+              mikos::abi::riscv32::error(Errno::no_syscall) == -38);
+  MIKOS_CHECK(suite,
+              std::string{mikos::abi::riscv32::name(64)} == "write");
+  MIKOS_CHECK(
+      suite, std::string{mikos::abi::riscv32::name(123)} ==
+                 "sched_getaffinity");
+  MIKOS_CHECK(suite,
+              std::string{mikos::abi::riscv32::name(0xffffffff)} ==
+                  "unknown");
+
+  return suite.finish();
+}

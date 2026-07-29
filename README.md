@@ -12,6 +12,7 @@ Start with:
 - [Development plan](PLAN.md)
 - [RV32 BusyBox proof of concept](docs/poc-rv32.md)
 - [Polling network proof of concept](docs/network-poc.md)
+- [Regression and acceptance tests](tests/README.md)
 
 The current proof of concept boots on the supplied RV32 QEMU, enters a
 PMP-protected flat U-mode region, and runs bundled static BusyBox and stress-ng
@@ -29,20 +30,24 @@ behind a small shared NIC interface so the x86 PCI transport can reuse the
 Ethernet/IP code. SSH and `top` are not supported yet; their explicit gates are
 listed in the network POC document.
 
-## build
+## Build and test
 
-Win64 requires the following to be done:
- - Install msys2-x86_64-20240727.exe, Miniconda3-py39_24.7.1-0-Windows-x86_64.exe, run MSYS2 MSYS console
- - git clone https://github.com/mirekez/cpphdl; cd cpphdl
+Create the local Conda environment, then use the root Makefile for kernel and
+regression entry points:
 
-And for Linux:
- - git clone ssh://github.com/mirekez/cpphdl; cd cpphdl
- - wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh; ./Miniconda3-latest-Linux-x86_64.sh
- - source ~/miniconda3/bin/activate; conda init
+```sh
+git submodule update --init
+conda create -p ./.conda
+conda env update -p ./.conda --file requirements.yaml
+make test
+make kernel
+```
 
-Then for both Win&Lin:
- - conda create -p ./.conda; source activate base; conda activate ./.conda; conda env update --file requirements.yaml
- - mkdir build; cd build; cmake -DCMAKE_BUILD_TYPE=Release -G "Unix Makefiles" ..; make
+The kernel target requests the pinned BusyBox and stress-ng acceptance
+payloads from `tests/busybox/`. The first build downloads BusyBox; an existing
+checkout can be selected with `BUSYBOX_REFERENCE=/path/to/busybox`. QEMU
+acceptance runners are under `tests/qemu/` and remain available through
+`make qemu-test` and `make qemu-net-test`.
 
 ## author
 

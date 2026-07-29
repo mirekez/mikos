@@ -1,6 +1,6 @@
 #include <mikos/arch.hpp>
 #include <mikos/kernel.hpp>
-#include <mikos/linux/riscv32.hpp>
+#include <mikos/abi/riscv32.hpp>
 
 extern "C" void* memset(void*, int, mikos::usize);
 extern "C" void* memcpy(void*, const void*, mikos::usize);
@@ -8,9 +8,9 @@ extern "C" void* memcpy(void*, const void*, mikos::usize);
 namespace mikos {
 namespace {
 
-using linux_abi::riscv32::Errno;
-using linux_abi::riscv32::Syscall;
-using linux_abi::riscv32::error;
+using abi::riscv32::Errno;
+using abi::riscv32::Syscall;
+using abi::riscv32::error;
 
 struct [[gnu::packed]] Iovec32 {
   u32 base;
@@ -283,7 +283,7 @@ struct TickTime {
   write_text("MIKOS:ENOSYS ");
   write_u32(number);
   write_text(" ");
-  write_text(linux_abi::riscv32::name(number));
+  write_text(abi::riscv32::name(number));
   write_text("\n");
   return error(Errno::no_syscall);
 }

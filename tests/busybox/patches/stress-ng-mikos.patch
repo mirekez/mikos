@@ -1,0 +1,81 @@
+diff --git a/stress-ng.c b/stress-ng.c
+index 3b81a81..d0fb247 100644
+--- a/stress-ng.c
++++ b/stress-ng.c
+@@ -1643,6 +1643,7 @@ static int MLOCKED_TEXT stress_child_run(
+ 	stress_proc_state_set(name, STRESS_STATE_START);
+ 	g_shared->instance_count.started++;
+ 
++#if !defined(STRESS_MIKOS)
+ 	if (stress_sched_settings_apply(false) < 0) {
+ 		rc = EXIT_FAILURE;
+ 		stress_signals_block();
+@@ -1657,6 +1658,7 @@ static int MLOCKED_TEXT stress_child_run(
+ 	stress_parent_died_alarm();
+ 	stress_process_dumpable(false);
+ 	stress_timer_slack_set(false);
++#endif
+ 
+ 	if (g_opt_flags & OPT_FLAGS_KSM)
+ 		stress_memory_ksm_merge(1);
+@@ -1919,6 +1921,26 @@ again:
+ 			stress_memory_compact();
+ 
+ 			fork_time_start = stress_time_now();
++#if defined(STRESS_MIKOS)
++			/*
++			 * Mikos's rv32-flat profile deliberately has one process and
++			 * no fork. Run the requested single worker in place while still
++			 * using stress-ng's normal setup, stressor and verification path.
++			 */
++			child_pid = getpid();
++			stats->s_pid.pid = child_pid;
++			stats->s_pid.reaped = true;
++			stats->signalled = false;
++			started_instances++;
++			rc = stress_child_run(checksum, stats, fork_time_start,
++				backoff, ticks_per_sec, j, started_instances - 1,
++				page_size, child_pid);
++			stats->s_pid.wait_status = (rc & 0xff) << 8;
++			stress_wait_status(stats, success, resource_success, metrics_success);
++			if (rc != EXIT_SUCCESS)
++				*success = false;
++			continue;
++#else
+ 			pid = fork();
+ 			switch (pid) {
+ 			case -1:
+@@ -1979,6 +2000,7 @@ again:
+ 			 */
+ 			(void)stress_child_wait(WNOHANG, success, resource_success, metrics_success);
++#endif
+ 		}
+ 	}
+ 	if (!handler_set) {
+ 		(void)stress_handler_set("stress-ng", false);
+@@ -1999,7 +2021,9 @@ wait_for_stressors:
+ 	if (!(g_opt_flags & OPT_FLAGS_SYNC_START))
+ 		stress_start_timeout();
+ #endif
++#if !defined(STRESS_MIKOS)
+ 	stress_stressors_wait(s_pids_head, ticks_per_sec, stressors_list, success, resource_success, metrics_success);
++#endif
+ 	time_finish = stress_time_now();
+ 
+ 	*duration += time_finish - time_start;
+diff --git a/core-shared-cache.c b/core-shared-cache.c
+index bdfaf40..be3882a 100644
+--- a/core-shared-cache.c
++++ b/core-shared-cache.c
+@@ -42,7 +42,11 @@ int stress_shared_cache_alloc(const char *name)
+ 	if (UNLIKELY(numa_nodes < 1))
+ 		numa_nodes = 1;
+ 
++#if defined(STRESS_MIKOS)
++	cpu_caches = NULL;
++#else
+ 	cpu_caches = stress_cpu_cache_details_get();
++#endif
+ 
+ 	if (g_shared->mem_cache.size > 0)
+ 		goto init_done;

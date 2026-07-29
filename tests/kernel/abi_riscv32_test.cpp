@@ -12,9 +12,15 @@ int main() {
 
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::write) == 64);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::exit_group) == 94);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::waitid) == 95);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::brk) == 214);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::clone) == 220);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::execve) == 221);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::wait4) == 260);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::statx) == 291);
   MIKOS_CHECK(suite,
               static_cast<mikos::u32>(Syscall::clock_gettime64) == 403);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::ppoll64) == 414);
   MIKOS_CHECK(suite,
               mikos::abi::riscv32::error(Errno::no_syscall) == -38);
   MIKOS_CHECK(suite,

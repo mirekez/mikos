@@ -3,8 +3,13 @@
 namespace mikos::arch {
 namespace {
 
+#ifdef MIKOS_TRIBE
+inline constexpr u32 mtimecmp = 0x82004100;
+inline constexpr u32 mtime = 0x8200c0f8;
+#else
 inline constexpr u32 mtimecmp = 0x02004000;
 inline constexpr u32 mtime = 0x0200bff8;
+#endif
 inline constexpr u32 quantum_ticks = 200'000;  // 20 ms at QEMU's 10 MHz.
 
 struct Counter {

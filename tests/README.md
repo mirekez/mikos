@@ -9,6 +9,7 @@ by the subsystem they exercise:
 - `drivers/` covers reusable device and transport logic;
 - `net/` covers protocol parsing and response generation;
 - `qemu/` contains target acceptance runners and their host-side helpers;
+- `tribe/` builds cpphdl's Tribe CPU and runs its rootless board acceptance;
 - `busybox/` owns the external BusyBox/stress-ng compatibility workload.
 
 Any `kernel/*_test.cpp`, `drivers/*_test.cpp`, or `net/*_test.cpp` file is

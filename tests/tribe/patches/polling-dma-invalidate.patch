@@ -1,0 +1,47 @@
+diff --git a/tribe/TribeTest.h b/tribe/TribeTest.h
+index 9df29f7..d1435a0 100644
+--- a/tribe/TribeTest.h
++++ b/tribe/TribeTest.h
+@@ -245,6 +245,7 @@ class TestTribe : public Module
+     reg<u1> uart_script_reported_reg;
+     reg<u1> sd_dma_cache_invalidate_reg;
+     reg<u1> eth_dma_cache_invalidate_reg;
++    reg<u1> eth_dma_irq_latched_reg;
+     bool eth_loopback_enabled = false;
+     EthGigTapSocket eth_tap_socket;
+     bool tohost_done = false;
+@@ -1224,7 +1225,8 @@ public:
+         else {
+             sd_dma_cache_invalidate_reg._next = sd_dma_cache_invalidate_reg;
+         }
+-        if (eth_dma_needs_cache_invalidate(ethgig_dma.tx_irq_out(), ethgig_dma.rx_irq_out())) {
++        bool eth_dma_irq = eth_dma_needs_cache_invalidate(ethgig_dma.tx_irq_out(), ethgig_dma.rx_irq_out());
++        if (eth_dma_irq && !eth_dma_irq_latched_reg) {
+             eth_dma_cache_invalidate_reg._next = true;
+         }
+         else if (eth_dma_cache_invalidate_reg && eth_dma_cache_invalidate_ready) {
+@@ -1233,6 +1235,7 @@ public:
+         else {
+             eth_dma_cache_invalidate_reg._next = eth_dma_cache_invalidate_reg;
+         }
++        eth_dma_irq_latched_reg._next = eth_dma_irq;
+ #ifdef VERILATOR
+         AXI4_RESPONDER_FROM_VERILATOR(tribe, mem0.axi_in, 0);
+         AXI4_RESPONDER_FROM_VERILATOR(tribe, mem1.axi_in, 1);
+@@ -1247,6 +1250,7 @@ public:
+         if (reset) {
+             error = false;
+             sd_dma_cache_invalidate_reg.clr();
+             eth_dma_cache_invalidate_reg.clr();
++            eth_dma_irq_latched_reg.clr();
+             return;
+         }
+@@ -1291,6 +1295,7 @@ public:
+         uart_script_enabled_reg.strobe(checkpoint_fd);
+         uart_script_reported_reg.strobe(checkpoint_fd);
+         sd_dma_cache_invalidate_reg.strobe(checkpoint_fd);
+         eth_dma_cache_invalidate_reg.strobe();
++        eth_dma_irq_latched_reg.strobe();
+ #ifndef VERILATOR
+         uint64_t tribe_strobe_time_start = tribe_runtime_tick();
+         tribe._strobe(checkpoint_fd);

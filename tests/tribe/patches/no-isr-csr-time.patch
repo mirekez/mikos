@@ -1,0 +1,32 @@
+diff --git a/tribe/Tribe.h b/tribe/Tribe.h
+index 8356e75..cae8df0 100644
+--- a/tribe/Tribe.h
++++ b/tribe/Tribe.h
+@@ -240,8 +240,13 @@ public:
+         csr.state_in       = _ASSIGN_COMB( csr_state_comb_func() );
+         csr.trap_check_state_in = _ASSIGN_REG(state_reg[0]);
+         csr.reset_priv_in = boot_priv_in;
++#ifdef ENABLE_ISR
+         csr.time_lo_in = time_lo_in;
+         csr.time_hi_in = time_hi_in;
++#else
++        csr.time_lo_in = _ASSIGN((uint32_t)0);
++        csr.time_hi_in = _ASSIGN((uint32_t)0);
++#endif
+ #ifdef ENABLE_ISR
+         csr.interrupt_valid_in = _ASSIGN_COMB(interrupt_accept_comb_func());
+         csr.interrupt_cause_in = irq.interrupt_cause_out;
+diff --git a/include/cpphdl_port.h b/include/cpphdl_port.h
+index 79b6de5..5ee8ae1 100644
+--- a/include/cpphdl_port.h
++++ b/include/cpphdl_port.h
+@@ -4,7 +4,8 @@
+ #include <memory>
+ #include <stdio.h>
+ 
+-#if __cplusplus >= 202302L && __has_include(<stacktrace>) && \
++#if defined(CPPHDL_HAVE_STACKTRACE) && \
++    __cplusplus >= 202302L && __has_include(<stacktrace>) && \
+     !defined(SYNTHESIS) && !defined(VERILATOR)
+ // Record that this translation unit can use stacktrace; CMake's capability
+ // result alone is insufficient when a consumer selects C++17.

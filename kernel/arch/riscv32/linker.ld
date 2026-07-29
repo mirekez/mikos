@@ -28,6 +28,11 @@ SECTIONS
     __bss_end = .;
   }
 
+  /* Large syscall scratch storage does not need boot-time zeroing. */
+  .noinit (NOLOAD) : ALIGN(16) {
+    *(.noinit .noinit.*)
+  }
+
   . = ALIGN(16);
   __kernel_stack_bottom = .;
   . += 64K;

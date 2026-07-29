@@ -1,4 +1,8 @@
 #include <mikos/arch.hpp>
+#include <mikos/drivers/uart.hpp>
+#ifdef MIKOS_TRIBE
+#include <mikos/drivers/tribe_sd.hpp>
+#endif
 #include <mikos/kernel.hpp>
 
 extern "C" void* memcpy(void*, const void*, mikos::usize);
@@ -8,10 +12,16 @@ extern "C" void trap_entry();
 namespace mikos {
 namespace {
 
-inline constexpr u32 uart_base = 0x82000000;
+#ifdef MIKOS_TRIBE
+inline constexpr u32 plic_m_enable = 0x82012000;
+inline constexpr u32 plic_s_enable = 0x82012080;
+#else
 inline constexpr u32 plic_m_enable = 0x0c002000;
 inline constexpr u32 plic_s_enable = 0x0c002080;
+#endif
+#ifndef MIKOS_TRIBE
 inline constexpr u32 sifive_test = 0x00100000;
+#endif
 
 struct [[gnu::packed]] ElfHeader {
   u8 ident[16];
@@ -46,16 +56,13 @@ struct Image {
   u32 program_headers;
   u32 program_count;
   u32 brk;
+  u32 mutable_begin;
 };
 
 struct Aux {
   u32 type;
   u32 value;
 };
-
-[[nodiscard]] volatile u8& uart_register(u32 offset) {
-  return *reinterpret_cast<volatile u8*>(uart_base + offset);
-}
 
 [[nodiscard]] bool valid_elf(const ElfHeader& header, u32 blob_size) {
   return header.ident[0] == 0x7f && header.ident[1] == 'E' &&
@@ -68,7 +75,8 @@ struct Aux {
              (blob_size - header.program_offset) / sizeof(ProgramHeader);
 }
 
-[[nodiscard]] Image load_image(const u8* blob, u32 blob_size) {
+[[nodiscard]] Image load_image(const u8* blob, u32 blob_size,
+                               bool writable_only = false) {
   const auto& header = *reinterpret_cast<const ElfHeader*>(blob);
   if (!valid_elf(header, blob_size)) {
     write_text("MIKOS:BAD_ELF\n");
@@ -76,6 +84,7 @@ struct Aux {
   }
 
   u32 image_end = user_begin;
+  u32 mutable_begin = user_end;
   const auto* programs = reinterpret_cast<const ProgramHeader*>(
       blob + header.program_offset);
   for (u32 i = 0; i < header.program_count; ++i) {
@@ -90,13 +99,20 @@ struct Aux {
       write_text("MIKOS:BAD_SEGMENT\n");
       shutdown(2);
     }
-    auto* destination = reinterpret_cast<void*>(segment.virtual_address);
-    memcpy(destination, blob + segment.offset, segment.file_size);
-    memset(reinterpret_cast<u8*>(destination) + segment.file_size, 0,
-           segment.memory_size - segment.file_size);
+    constexpr u32 writable = 2;
+    if (!writable_only || (segment.flags & writable) != 0) {
+      auto* destination = reinterpret_cast<void*>(segment.virtual_address);
+      memcpy(destination, blob + segment.offset, segment.file_size);
+      memset(reinterpret_cast<u8*>(destination) + segment.file_size, 0,
+             segment.memory_size - segment.file_size);
+    }
     const u32 end = segment.virtual_address + segment.memory_size;
     if (end > image_end) {
       image_end = end;
+    }
+    if ((segment.flags & writable) != 0 &&
+        segment.virtual_address < mutable_begin) {
+      mutable_begin = segment.virtual_address;
     }
   }
 
@@ -105,13 +121,20 @@ struct Aux {
   return Image{header.entry,
                program_headers,
                header.program_count,
-               align_up(image_end, static_cast<u32>(4096))};
+               align_up(image_end, static_cast<u32>(4096)),
+               mutable_begin};
 }
 
 [[nodiscard]] Image load_busybox() {
   const auto* blob = _binary_busybox_busybox_start;
   return load_image(
       blob, static_cast<u32>(_binary_busybox_busybox_end - blob));
+}
+
+[[nodiscard]] Image restart_busybox() {
+  const auto* blob = _binary_busybox_busybox_start;
+  return load_image(
+      blob, static_cast<u32>(_binary_busybox_busybox_end - blob), true);
 }
 
 [[nodiscard]] Image load_stress_ng() {
@@ -135,8 +158,8 @@ struct Aux {
                                      const char* const* arguments,
                                      u32 argument_count) {
   u32 cursor = user_stack_top;
-  u32 argument_addresses[10]{};
-  if (argument_count == 0 || argument_count > 10) {
+  u32 argument_addresses[16]{};
+  if (argument_count == 0 || argument_count > 16) {
     write_text("MIKOS:BAD_ARGUMENTS\n");
     shutdown(6);
   }
@@ -207,6 +230,7 @@ void disable_interrupt_controllers() {
   return mie == 0 && (mstatus & 8u) == 0 && satp == 0 && plic_off;
 }
 
+#ifndef MIKOS_TRIBE
 [[nodiscard]] bool protect_kernel() {
   const u32 lower_top = user_begin >> 2;
   const u32 user_top = user_end >> 2;
@@ -220,15 +244,37 @@ void disable_interrupt_controllers() {
   asm volatile("csrr %0, pmpcfg0" : "=r"(actual));
   return (actual & 0xffffu) == config;
 }
+#endif
 
 }  // namespace
 
 Process process{};
 Scheduler scheduler{};
 
+bool replace_with_busybox(TrapFrame& frame, const char* const* arguments,
+                          u32 argument_count) {
+  if (argument_count == 0 || argument_count > 16) {
+    return false;
+  }
+  const auto image = restart_busybox();
+  process.brk = image.brk;
+  process.mutable_begin = image.mutable_begin;
+  process.mmap_cursor = 0x81800000;
+  const u32 stack = make_initial_stack(image, arguments, argument_count);
+  for (auto& value : frame.x) {
+    value = 0;
+  }
+  frame.x[2] = stack;
+  frame.mepc = image.entry;
+  process.image = 0;
+  process.image_replaced = true;
+  return true;
+}
+
 void start_stress_ng(TrapFrame& frame) {
   const auto image = load_stress_ng();
   process.brk = image.brk;
+  process.mutable_begin = image.mutable_begin;
   constexpr u32 heap_reserve = 512 * 1024;
   if (process.brk > user_stack_top - heap_reserve) {
     write_text("MIKOS:STRESS_NG_MEMORY_BAD\n");
@@ -253,9 +299,15 @@ void start_stress_ng(TrapFrame& frame) {
 }
 
 void uart_put(char value) {
-  while ((uart_register(5) & 0x20u) == 0) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  // The interactive UART is attached directly to a host terminal. A line feed
+  // alone preserves the cursor column there, so implement the advertised
+  // ONLCR behavior and start each new line at column zero.
+  if (value == '\n') {
+    drivers::uart::put('\r');
   }
-  uart_register(0) = static_cast<u8>(value);
+#endif
+  drivers::uart::put(static_cast<u8>(value));
 }
 
 void uart_write(const char* data, u32 size) {
@@ -284,8 +336,10 @@ void write_u32(u32 value) {
 
 [[noreturn]] void shutdown(u32 code) {
   process.exit_code = code;
+#ifndef MIKOS_TRIBE
   *reinterpret_cast<volatile u32*>(sifive_test) =
       code == 0 ? 0x5555 : ((code << 16) | 0x3333);
+#endif
   for (;;) {
     asm volatile("wfi");
   }
@@ -300,18 +354,41 @@ extern "C" void kernel_main() {
   asm volatile("csrw mtvec, %0" : : "r"(trap_entry));
   disable_interrupt_controllers();
 
+  static_cast<void>(drivers::uart::initialize());
   write_text("MIKOS:BOOT\n");
   if (!flat_and_device_irq_off()) {
     write_text("MIKOS:PLATFORM_STATE_BAD\n");
     shutdown(3);
   }
   write_text("MIKOS:FLAT_DEVICE_IRQ_OFF\n");
+#ifndef MIKOS_TRIBE_INTERACTIVE
   static_cast<void>(network::boot_probe());
+#ifdef MIKOS_TRIBE
+  // Arm Ethernet before starting the comparatively slow bit-level SD model,
+  // so a host peer can retry packets while the rest of the boot continues.
+  alignas(4) u8 sd_block[drivers::tribe_sd::block_size]{};
+  constexpr char sd_marker[] = "MIKOS_SD_OK";
+  bool sd_ok = drivers::tribe_sd::initialize() &&
+               drivers::tribe_sd::read_block(0, sd_block);
+  for (u32 i = 0; sd_ok && i < sizeof(sd_marker) - 1; ++i) {
+    sd_ok = sd_block[i] == static_cast<u8>(sd_marker[i]);
+  }
+  write_text(sd_ok ? "MIKOS:TRIBE_SD_OK\n" : "MIKOS:TRIBE_SD_FAIL\n");
+#endif
+#else
+  write_text("MIKOS:TRIBE_INTERACTIVE\n");
+#endif
   const auto image = load_busybox();
   process.brk = image.brk;
+  process.mutable_begin = image.mutable_begin;
   process.mmap_cursor = 0x81800000;
+  process.pid = 1;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  constexpr const char* arguments[] = {"busybox", "sh", "-i", "+m"};
+#else
   constexpr const char* arguments[] = {
       "busybox", "echo", "MIKOS_BUSYBOX_OK"};
+#endif
   const u32 stack = make_initial_stack(
       image, arguments, sizeof(arguments) / sizeof(arguments[0]));
   const u32 probe = process.brk;
@@ -324,6 +401,12 @@ extern "C" void kernel_main() {
   memcpy(reinterpret_cast<void*>(probe), uncooperative_probe_begin, probe_size);
   process.brk = align_up(probe + probe_size, static_cast<u32>(4096));
 
+#ifdef MIKOS_TRIBE
+  // Minimal Tribe excludes the optional PMP CSR range.
+  write_text("MIKOS:PMP_UNAVAILABLE\n");
+  write_text("MIKOS:TRIBE_POLLING\n");
+  enter_user(image.entry, stack);
+#else
   if (!protect_kernel()) {
     write_text("MIKOS:PMP_BAD\n");
     shutdown(4);
@@ -334,11 +417,100 @@ extern "C" void kernel_main() {
   write_text("MIKOS:SCHED_TIMER_ON\n");
   write_text("MIKOS:UNCOOPERATIVE_ENTRY\n");
   enter_user(probe, stack - 4096);
+#endif
 }
 
 extern "C" void trap_handler(mikos::TrapFrame* frame) {
   using namespace mikos;
   constexpr u32 user_ecall = 8;
+#ifdef MIKOS_TRIBE
+  constexpr u32 illegal_instruction = 2;
+  if (frame->mcause == illegal_instruction) {
+    const u32 instruction = frame->mtval;
+    const u32 opcode = instruction & 0x7fu;
+    const u32 function3 = (instruction >> 12) & 7u;
+    if (opcode == 0x2fu && function3 == 2u) {
+      const u32 destination = (instruction >> 7) & 31u;
+      const u32 source1 = (instruction >> 15) & 31u;
+      const u32 source2 = (instruction >> 20) & 31u;
+      const u32 operation = instruction >> 27;
+      const u32 address = frame->x[source1];
+      static u32 reservation{};
+      static bool reservation_valid{};
+      if (user_memory.contains(address, sizeof(u32)) &&
+          user_memory.aligned(address, alignof(u32))) {
+        auto* memory = reinterpret_cast<volatile u32*>(address);
+        const u32 old = *memory;
+        u32 result = old;
+        bool handled = true;
+        bool write = true;
+        switch (operation) {
+          case 0x02:  // LR.W
+            reservation = address;
+            reservation_valid = true;
+            write = false;
+            break;
+          case 0x03:  // SC.W
+            result = reservation_valid && reservation == address ? 0u : 1u;
+            if (result == 0) {
+              *memory = frame->x[source2];
+            }
+            reservation_valid = false;
+            write = false;
+            break;
+          case 0x00:  // AMOADD.W
+            result = old + frame->x[source2];
+            break;
+          case 0x01:  // AMOSWAP.W
+            result = frame->x[source2];
+            break;
+          case 0x04:  // AMOXOR.W
+            result = old ^ frame->x[source2];
+            break;
+          case 0x08:  // AMOOR.W
+            result = old | frame->x[source2];
+            break;
+          case 0x0c:  // AMOAND.W
+            result = old & frame->x[source2];
+            break;
+          case 0x10:  // AMOMIN.W
+            result = static_cast<i32>(old) <
+                             static_cast<i32>(frame->x[source2])
+                         ? old
+                         : frame->x[source2];
+            break;
+          case 0x14:  // AMOMAX.W
+            result = static_cast<i32>(old) >
+                             static_cast<i32>(frame->x[source2])
+                         ? old
+                         : frame->x[source2];
+            break;
+          case 0x18:  // AMOMINU.W
+            result = old < frame->x[source2] ? old : frame->x[source2];
+            break;
+          case 0x1c:  // AMOMAXU.W
+            result = old > frame->x[source2] ? old : frame->x[source2];
+            break;
+          default:
+            handled = false;
+            break;
+        }
+        if (handled) {
+          if (write) {
+            *memory = result;
+            reservation_valid = false;
+            result = old;
+          }
+          if (destination != 0) {
+            frame->x[destination] = result;
+          }
+          frame->mepc += 4;
+          return;
+        }
+      }
+    }
+  }
+#endif
   if (frame->mcause == arch::scheduler_timer_cause) {
     arch::rearm_scheduler_timer();
     u32 mstatus;

@@ -49,6 +49,10 @@ checkout can be selected with `BUSYBOX_REFERENCE=/path/to/busybox`. QEMU
 acceptance runners are under `tests/qemu/` and remain available through
 `make qemu-test` and `make qemu-net-test`.
 
+`make tribe-test` builds a pinned cpphdl Tribe simulator and runs the same
+BusyBox payload with Tribe UART, SD, and Ethernet drivers. Its rootless network
+peer verifies ARP and IPv4 ICMP echo replies; see `tests/tribe/README.md`.
+
 ## author
 
 This software is developed by Mike Reznikov (https://www.linkedin.com/in/mike-reznikov) based on the results of own research.

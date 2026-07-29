@@ -14,8 +14,11 @@ inline constexpr UserRange user_memory{user_begin, user_end};
 struct Process {
   u32 brk;
   u32 mmap_cursor;
+  u32 mutable_begin;
   u32 exit_code;
   u32 image;
+  u32 pid;
+  bool cwd_proc;
   bool image_replaced;
 };
 
@@ -29,6 +32,9 @@ void write_u32(u32 value);
 [[noreturn]] void shutdown(u32 code);
 i32 dispatch_syscall(TrapFrame& frame);
 void start_stress_ng(TrapFrame& frame);
+[[nodiscard]] bool replace_with_busybox(TrapFrame& frame,
+                                        const char* const* arguments,
+                                        u32 argument_count);
 
 }  // namespace mikos
 

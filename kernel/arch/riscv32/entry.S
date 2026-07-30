@@ -6,6 +6,14 @@ _start:
   li t0, 8
   csrc mstatus, t0
 
+#ifdef MIKOS_TRIBE
+  /* MikOS currently schedules on the boot hart. Keep additional Tribe harts
+     from racing through the shared BSS, stack, and device initialization. */
+  /* cpphdl supplies the hart ID in the standard reset argument a0; its
+     mhartid CSR is currently hardwired to zero. */
+  bnez a0, .Lsecondary_hart
+#endif
+
   la sp, __kernel_stack_top
 
   la t0, __bss_begin
@@ -20,6 +28,11 @@ _start:
 3:
   wfi
   j 3b
+#ifdef MIKOS_TRIBE
+.Lsecondary_hart:
+  wfi
+  j .Lsecondary_hart
+#endif
 .size _start, . - _start
 
 .section .text, "ax"

@@ -11,6 +11,29 @@ revision="${CPPHDL_REVISION:-d131e7b670e5b69b8df322ca0adfe9f714446494}"
 jobs="${JOBS:-2}"
 toolchain="${CPPHDL_TOOLCHAIN:-$root/.conda}"
 riscv_home="${RISCV_HOME:-/home/me/riscv}"
+target="tribe64"
+
+usage() {
+  echo "usage: $0 [--multicore]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --multicore)
+      target="tribe64_multicore"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 mkdir -p "$work"
 if [[ ! -d "$source_tree/.git" ]]; then
@@ -23,17 +46,26 @@ fi
 git -C "$source_tree" checkout --detach --force "$revision"
 
 config="$source_tree/tribe/Config.h"
-for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
-  sed -i "s/^#define ${feature}\(.*\)$/\/\/ ${feature} disabled for MikOS\1/" \
-    "$config"
-done
+if [[ "$target" == "tribe64" ]]; then
+  for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
+    sed -i "s/^#define ${feature}\(.*\)$/\/\/ ${feature} disabled for MikOS\1/" \
+      "$config"
+  done
 
-for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
-  if rg -q "^#define ${feature}\\b" "$config"; then
-    echo "FAIL: $feature remains enabled in Tribe Config.h" >&2
-    exit 1
-  fi
-done
+  for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
+    if rg -q "^#define ${feature}\\b" "$config"; then
+      echo "FAIL: $feature remains enabled in Tribe Config.h" >&2
+      exit 1
+    fi
+  done
+else
+  for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
+    if ! rg -q "^#define ${feature}\\b" "$config"; then
+      echo "FAIL: $feature is required by multicore Tribe" >&2
+      exit 1
+    fi
+  done
+fi
 for feature in ENABLE_ZICSR ENABLE_TRAPS; do
   if ! rg -q "^#define ${feature}\\b" "$config"; then
     echo "FAIL: $feature is required by MikOS user-mode ecalls" >&2
@@ -64,6 +96,6 @@ git -C "$source_tree" apply \
   -DTRIBE_IO_REGION_SIZE_CONFIG=4194304
 
 RISCV_HOME="$riscv_home" \
-  "$toolchain/bin/cmake" --build "$build_tree" --target tribe64 -j"$jobs"
+  "$toolchain/bin/cmake" --build "$build_tree" --target "$target" -j"$jobs"
 
-echo "Prepared minimal Tribe simulator at $build_tree/tribe64/tribe64"
+echo "Prepared minimal Tribe simulator at $build_tree/$target/$target"

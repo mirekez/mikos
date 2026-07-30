@@ -2,13 +2,41 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-simulator="$root/build/tests/tribe/cpphdl-build/tribe64/tribe64"
+simulator_name="tribe64"
+
+usage() {
+  echo "usage: $0 [--multicore]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --multicore)
+      simulator_name="tribe64_multicore"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+simulator="$root/build/tests/tribe/cpphdl-build/$simulator_name/$simulator_name"
 kernel="$root/build/mikos-tribe-rv32.elf"
 peer="$root/build/tests/tribe/net_peer"
 log="$root/build/tribe-test.log"
 peer_log="$root/build/tribe-net-peer.log"
 cycles="${TRIBE_CYCLES:-30000000}"
-wall_timeout="${TRIBE_TIMEOUT:-600}"
+default_wall_timeout=600
+if [[ "$simulator_name" == "tribe64_multicore" ]]; then
+  default_wall_timeout=1800
+fi
+wall_timeout="${TRIBE_TIMEOUT:-$default_wall_timeout}"
 runtime="$(mktemp -d /tmp/mikos-tribe.XXXXXX)"
 media_socket="$runtime/ethernet.sock"
 sd_image="$runtime/sd.img"

@@ -23,6 +23,11 @@ For an interactive UART session, run:
 tests/tribe/tribe_interactive.sh
 ```
 
+Pass `--multicore` to `prepare_cpphdl.sh`, `run_tribe.sh`, or
+`tribe_interactive.sh` to build or run cpphdl's four-core Tribe simulator. In
+interactive `top`, press `1` to display the separate `CPU0` through `CPU3`
+lines.
+
 This builds a separate Tribe image that starts `busybox sh -i`. Simulator stdin
 is connected to the NS16550A RX path and guest UART TX is printed directly to
 the terminal. The interactive profile implements BusyBox's constrained
@@ -31,11 +36,12 @@ the terminal. The interactive profile implements BusyBox's constrained
 `exit` to shut down cleanly, Ctrl+C to stop the simulator, or Ctrl+Z to suspend
 it. `TRIBE_INTERACTIVE_CYCLES` controls the safety limit.
 
-The preparation script removes `ENABLE_RV32IA`, `ENABLE_ISR`, and
-`ENABLE_MMU_TLB` from the test clone's `tribe/Config.h`. MikOS handles libc's
-occasional RV32A word operations in its illegal-instruction trap and uses only
-polling drivers on this board. `ENABLE_ZICSR` and `ENABLE_TRAPS` remain enabled
-because entering user mode and servicing BusyBox `ecall` instructions require
-them; disabling either would remove the mechanism that implements system calls.
-The minimal Tribe CSR model also excludes PMP, so this test emits
+For the default single-core build, the preparation script removes
+`ENABLE_RV32IA`, `ENABLE_ISR`, and `ENABLE_MMU_TLB` from the test clone's
+`tribe/Config.h`. The multicore build retains them because cpphdl's multicore
+target requires its atomic and cross-hart fence interfaces. MikOS uses polling
+drivers on this board. `ENABLE_ZICSR` and `ENABLE_TRAPS` remain enabled because
+entering user mode and servicing BusyBox `ecall` instructions require them;
+disabling either would remove the mechanism that implements system calls. The
+minimal single-core Tribe CSR model also excludes PMP, so that test emits
 `MIKOS:PMP_UNAVAILABLE`; the normal MikOS/QEMU build still programs PMP.

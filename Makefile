@@ -58,6 +58,17 @@ TRIBE_INTERACTIVE_OBJECTS := \
 	$(patsubst %.cpp,$(BUILD)/tribe-interactive/%.o,$(filter %.cpp,$(TRIBE_KERNEL_SOURCES))) \
 	$(patsubst %.S,$(BUILD)/tribe-interactive/%.o,$(filter %.S,$(TRIBE_KERNEL_SOURCES)))
 TRIBE_INTERACTIVE_DEPS := $(TRIBE_INTERACTIVE_OBJECTS:.o=.d)
+TRIBE_INTERACTIVE_MULTICORE_RV_FLAGS := $(TRIBE_INTERACTIVE_RV_FLAGS) \
+	-DMIKOS_TRIBE_MULTICORE
+TRIBE_INTERACTIVE_MULTICORE_ELF := \
+	$(BUILD)/mikos-tribe-interactive-multicore-rv32.elf
+TRIBE_INTERACTIVE_MULTICORE_MAP := \
+	$(BUILD)/mikos-tribe-interactive-multicore-rv32.map
+TRIBE_INTERACTIVE_MULTICORE_OBJECTS := \
+	$(patsubst %.cpp,$(BUILD)/tribe-interactive-multicore/%.o,$(filter %.cpp,$(TRIBE_KERNEL_SOURCES))) \
+	$(patsubst %.S,$(BUILD)/tribe-interactive-multicore/%.o,$(filter %.S,$(TRIBE_KERNEL_SOURCES)))
+TRIBE_INTERACTIVE_MULTICORE_DEPS := \
+	$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS:.o=.d)
 
 # The current RV32 acceptance image embeds its user-space test workloads. Their
 # source acquisition and build rules live with the BusyBox tests, not here.
@@ -70,7 +81,8 @@ NET_PEER := $(BUILD)/tests/qemu/net_peer
 ETHGIG_TAP := $(BUILD)/tests/qemu/ethgig_tap
 TRIBE_NET_PEER := $(BUILD)/tests/tribe/net_peer
 
-.PHONY: all test kernel tribe-kernel tribe-interactive-kernel inspect busybox \
+.PHONY: all test kernel tribe-kernel tribe-interactive-kernel \
+	tribe-interactive-multicore-kernel inspect busybox \
 	stress-ng run qemu-test qemu-net-test qemu-ssh-top tribe-prepare tribe-test \
 	tribe-interactive ethgig-tap clean
 
@@ -84,6 +96,8 @@ kernel: $(KERNEL_ELF)
 tribe-kernel: $(TRIBE_KERNEL_ELF)
 
 tribe-interactive-kernel: $(TRIBE_INTERACTIVE_ELF)
+
+tribe-interactive-multicore-kernel: $(TRIBE_INTERACTIVE_MULTICORE_ELF)
 
 inspect: $(KERNEL_ELF)
 	tests/kernel/inspect_kernel.sh
@@ -125,6 +139,15 @@ $(BUILD)/tribe-interactive/%.o: %.S
 	@mkdir -p $(@D)
 	$(CXX) $(TRIBE_INTERACTIVE_RV_FLAGS) -x assembler-with-cpp -c $< -o $@
 
+$(BUILD)/tribe-interactive-multicore/%.o: %.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(TRIBE_INTERACTIVE_MULTICORE_RV_FLAGS) -c $< -o $@
+
+$(BUILD)/tribe-interactive-multicore/%.o: %.S
+	@mkdir -p $(@D)
+	$(CXX) $(TRIBE_INTERACTIVE_MULTICORE_RV_FLAGS) \
+		-x assembler-with-cpp -c $< -o $@
+
 $(KERNEL_ELF): $(KERNEL_OBJECTS) $(BUSYBOX_BLOB) $(STRESS_NG_BLOB) \
 		kernel/arch/riscv32/linker.ld
 	$(LD) -m elf32lriscv -nostdlib --gc-sections \
@@ -149,6 +172,16 @@ $(TRIBE_INTERACTIVE_ELF): $(TRIBE_INTERACTIVE_OBJECTS) $(BUSYBOX_BLOB) \
 		$(TRIBE_INTERACTIVE_OBJECTS) $(BUSYBOX_BLOB)
 	$(LLVM_READELF) -h -l $@ > \
 		$(BUILD)/mikos-tribe-interactive-rv32.headers.txt
+
+$(TRIBE_INTERACTIVE_MULTICORE_ELF): \
+		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) $(BUSYBOX_BLOB) \
+		kernel/arch/riscv32/linker.ld
+	$(LD) -m elf32lriscv -nostdlib --gc-sections \
+		-T kernel/arch/riscv32/linker.ld \
+		-Map $(TRIBE_INTERACTIVE_MULTICORE_MAP) -o $@ \
+		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) $(BUSYBOX_BLOB)
+	$(LLVM_READELF) -h -l $@ > \
+		$(BUILD)/mikos-tribe-interactive-multicore-rv32.headers.txt
 
 run: $(KERNEL_ELF) $(QEMU)
 	tests/qemu/run.sh
@@ -200,8 +233,14 @@ clean:
 		$(TRIBE_INTERACTIVE_OBJECTS) $(TRIBE_INTERACTIVE_DEPS) \
 		$(TRIBE_INTERACTIVE_ELF) $(TRIBE_INTERACTIVE_MAP) \
 		$(BUILD)/mikos-tribe-interactive-rv32.headers.txt \
+		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) \
+		$(TRIBE_INTERACTIVE_MULTICORE_DEPS) \
+		$(TRIBE_INTERACTIVE_MULTICORE_ELF) \
+		$(TRIBE_INTERACTIVE_MULTICORE_MAP) \
+		$(BUILD)/mikos-tribe-interactive-multicore-rv32.headers.txt \
 		$(BUILD)/mikos-rv32.headers.txt $(BUILD)/mikos-rv32.sections.txt \
 		$(BUILD)/mikos-rv32.undefined.txt $(NET_PEER) $(ETHGIG_TAP)
 	@rm -f $(TRIBE_NET_PEER)
 
--include $(KERNEL_DEPS) $(TRIBE_KERNEL_DEPS) $(TRIBE_INTERACTIVE_DEPS)
+-include $(KERNEL_DEPS) $(TRIBE_KERNEL_DEPS) $(TRIBE_INTERACTIVE_DEPS) \
+	$(TRIBE_INTERACTIVE_MULTICORE_DEPS)

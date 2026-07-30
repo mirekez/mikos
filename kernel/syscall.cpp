@@ -299,9 +299,18 @@ void reset_descriptors() {
 }
 
 [[nodiscard]] const char* node_contents(Node node) {
+#ifdef MIKOS_TRIBE_MULTICORE
+  static constexpr const char cpu[] =
+      "cpu  400 0 400 40000 0 0 0 0\n"
+      "cpu0 100 0 100 10000 0 0 0 0\n"
+      "cpu1 100 0 100 10000 0 0 0 0\n"
+      "cpu2 100 0 100 10000 0 0 0 0\n"
+      "cpu3 100 0 100 10000 0 0 0 0\n";
+#else
   static constexpr const char cpu[] =
       "cpu  100 0 100 10000 0 0 0 0\n"
       "cpu0 100 0 100 10000 0 0 0 0\n";
+#endif
   static constexpr const char memory[] =
       "MemTotal:       16384 kB\n"
       "MemFree:         4096 kB\n"

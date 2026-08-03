@@ -1,4 +1,4 @@
-#include <mikos/drivers/virtio_net.hpp>
+#include <drivers/net/virtio_net.hpp>
 
 namespace mikos::drivers::net {
 namespace {

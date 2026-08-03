@@ -14,7 +14,7 @@ RV_FLAGS := --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 \
 	-fno-asynchronous-unwind-tables -fno-threadsafe-statics \
 	-fno-use-cxa-atexit -fno-stack-protector -fdata-sections \
 	-ffunction-sections -Wall -Wextra -Werror -O2 -g \
-	-I$(ROOT)/include -MMD -MP
+	-I$(ROOT) -I$(ROOT)/include -MMD -MP
 
 KERNEL_ELF := $(BUILD)/mikos-rv32.elf
 KERNEL_MAP := $(BUILD)/mikos-rv32.map
@@ -22,8 +22,12 @@ KERNEL_SOURCES := \
 	kernel/main.cpp \
 	kernel/runtime.cpp \
 	kernel/syscall.cpp \
+	kernel/pseudo_filesystem.cpp \
 	drivers/uart/ns16550a.cpp \
 	drivers/net/virtio_mmio.cpp \
+	drivers/storage/virtio_block.cpp \
+	drivers/storage/root_device.cpp \
+	drivers/fs/root.cpp \
 	network/stack.cpp \
 	kernel/arch/riscv32/timer.cpp \
 	kernel/arch/riscv32/entry.S \
@@ -40,9 +44,12 @@ TRIBE_KERNEL_SOURCES := \
 	kernel/main.cpp \
 	kernel/runtime.cpp \
 	kernel/syscall.cpp \
+	kernel/pseudo_filesystem.cpp \
 	drivers/uart/ns16550a.cpp \
 	drivers/net/tribe_ethgig.cpp \
 	drivers/storage/tribe_sd.cpp \
+	drivers/storage/root_device.cpp \
+	drivers/fs/root.cpp \
 	network/stack.cpp \
 	kernel/arch/riscv32/timer.cpp \
 	kernel/arch/riscv32/entry.S \
@@ -70,11 +77,9 @@ TRIBE_INTERACTIVE_MULTICORE_OBJECTS := \
 TRIBE_INTERACTIVE_MULTICORE_DEPS := \
 	$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS:.o=.d)
 
-# The current RV32 acceptance image embeds its user-space test workloads. Their
-# source acquisition and build rules live with the BusyBox tests, not here.
+# BusyBox and stress-ng live in one ext4 root image shared by QEMU and Tribe.
 BUSYBOX_TEST_BUILD := $(BUILD)/tests/busybox
-BUSYBOX_BLOB := $(BUSYBOX_TEST_BUILD)/busybox_blob.o
-STRESS_NG_BLOB := $(BUSYBOX_TEST_BUILD)/stress_ng_blob.o
+ROOTFS_IMAGE := $(BUSYBOX_TEST_BUILD)/rootfs.ext4
 
 QEMU := $(BUILD)/qemu/qemu-system-riscv32
 NET_PEER := $(BUILD)/tests/qemu/net_peer
@@ -84,20 +89,22 @@ TRIBE_NET_PEER := $(BUILD)/tests/tribe/net_peer
 .PHONY: all test kernel tribe-kernel tribe-interactive-kernel \
 	tribe-interactive-multicore-kernel inspect busybox \
 	stress-ng run qemu-test qemu-net-test qemu-ssh-top tribe-prepare tribe-test \
-	tribe-interactive ethgig-tap clean
+	tribe-interactive tribe-interactive-ping-test \
+	tribe-interactive-tcp-test tribe-interactive-process-test ethgig-tap clean
 
 all: test kernel
 
 test:
 	$(MAKE) -C tests test
 
-kernel: $(KERNEL_ELF)
+kernel: $(ROOTFS_IMAGE) $(KERNEL_ELF)
 
-tribe-kernel: $(TRIBE_KERNEL_ELF)
+tribe-kernel: $(ROOTFS_IMAGE) $(TRIBE_KERNEL_ELF)
 
-tribe-interactive-kernel: $(TRIBE_INTERACTIVE_ELF)
+tribe-interactive-kernel: $(ROOTFS_IMAGE) $(TRIBE_INTERACTIVE_ELF)
 
-tribe-interactive-multicore-kernel: $(TRIBE_INTERACTIVE_MULTICORE_ELF)
+tribe-interactive-multicore-kernel: $(ROOTFS_IMAGE) \
+	$(TRIBE_INTERACTIVE_MULTICORE_ELF)
 
 inspect: $(KERNEL_ELF)
 	tests/kernel/inspect_kernel.sh
@@ -108,12 +115,12 @@ busybox:
 stress-ng:
 	$(MAKE) -C tests/busybox stress-ng
 
-$(BUSYBOX_BLOB) $(STRESS_NG_BLOB) &: tests/busybox/Makefile \
+$(ROOTFS_IMAGE): tests/busybox/Makefile \
 		tests/busybox/config/busybox.config \
 		tests/busybox/download_busybox.sh \
 		tests/busybox/build_busybox.sh \
 		tests/busybox/patches/stress-ng-mikos.patch
-	$(MAKE) -C tests/busybox payloads
+	$(MAKE) -C tests/busybox rootfs
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
@@ -148,58 +155,68 @@ $(BUILD)/tribe-interactive-multicore/%.o: %.S
 	$(CXX) $(TRIBE_INTERACTIVE_MULTICORE_RV_FLAGS) \
 		-x assembler-with-cpp -c $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_OBJECTS) $(BUSYBOX_BLOB) $(STRESS_NG_BLOB) \
+$(KERNEL_ELF): $(KERNEL_OBJECTS) \
 		kernel/arch/riscv32/linker.ld
 	$(LD) -m elf32lriscv -nostdlib --gc-sections \
 		-T kernel/arch/riscv32/linker.ld \
-		-Map $(KERNEL_MAP) -o $@ $(KERNEL_OBJECTS) $(BUSYBOX_BLOB) \
-		$(STRESS_NG_BLOB)
+		-Map $(KERNEL_MAP) -o $@ $(KERNEL_OBJECTS)
 	$(LLVM_READELF) -h -l $@ > $(BUILD)/mikos-rv32.headers.txt
 
-$(TRIBE_KERNEL_ELF): $(TRIBE_KERNEL_OBJECTS) $(BUSYBOX_BLOB) \
+$(TRIBE_KERNEL_ELF): $(TRIBE_KERNEL_OBJECTS) \
 		kernel/arch/riscv32/linker.ld
 	$(LD) -m elf32lriscv -nostdlib --gc-sections \
 		-T kernel/arch/riscv32/linker.ld \
-		-Map $(TRIBE_KERNEL_MAP) -o $@ $(TRIBE_KERNEL_OBJECTS) \
-		$(BUSYBOX_BLOB)
+		-Map $(TRIBE_KERNEL_MAP) -o $@ $(TRIBE_KERNEL_OBJECTS)
 	$(LLVM_READELF) -h -l $@ > $(BUILD)/mikos-tribe-rv32.headers.txt
 
-$(TRIBE_INTERACTIVE_ELF): $(TRIBE_INTERACTIVE_OBJECTS) $(BUSYBOX_BLOB) \
+$(TRIBE_INTERACTIVE_ELF): $(TRIBE_INTERACTIVE_OBJECTS) \
 		kernel/arch/riscv32/linker.ld
 	$(LD) -m elf32lriscv -nostdlib --gc-sections \
 		-T kernel/arch/riscv32/linker.ld \
 		-Map $(TRIBE_INTERACTIVE_MAP) -o $@ \
-		$(TRIBE_INTERACTIVE_OBJECTS) $(BUSYBOX_BLOB)
+		$(TRIBE_INTERACTIVE_OBJECTS)
 	$(LLVM_READELF) -h -l $@ > \
 		$(BUILD)/mikos-tribe-interactive-rv32.headers.txt
 
 $(TRIBE_INTERACTIVE_MULTICORE_ELF): \
-		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) $(BUSYBOX_BLOB) \
+		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) \
 		kernel/arch/riscv32/linker.ld
 	$(LD) -m elf32lriscv -nostdlib --gc-sections \
 		-T kernel/arch/riscv32/linker.ld \
 		-Map $(TRIBE_INTERACTIVE_MULTICORE_MAP) -o $@ \
-		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) $(BUSYBOX_BLOB)
+		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS)
 	$(LLVM_READELF) -h -l $@ > \
 		$(BUILD)/mikos-tribe-interactive-multicore-rv32.headers.txt
 
-run: $(KERNEL_ELF) $(QEMU)
+run: $(ROOTFS_IMAGE) $(KERNEL_ELF) $(QEMU)
 	tests/qemu/run.sh
 
-qemu-test: inspect $(QEMU)
+qemu-test: $(ROOTFS_IMAGE) inspect $(QEMU)
 	tests/qemu/run_qemu.sh
 
-qemu-net-test: inspect $(NET_PEER) $(QEMU)
+qemu-net-test: $(ROOTFS_IMAGE) inspect $(NET_PEER) $(QEMU)
 	tests/qemu/run_qemu_net.sh
 
 tribe-prepare:
 	tests/tribe/prepare_cpphdl.sh
 
-tribe-test: tribe-prepare $(TRIBE_KERNEL_ELF) $(TRIBE_NET_PEER)
+tribe-test: tribe-prepare $(ROOTFS_IMAGE) $(TRIBE_KERNEL_ELF) $(TRIBE_NET_PEER)
 	tests/tribe/run_tribe.sh
 
-tribe-interactive: $(TRIBE_INTERACTIVE_ELF)
+tribe-interactive: $(ROOTFS_IMAGE) $(TRIBE_INTERACTIVE_ELF)
 	tests/tribe/tribe_interactive.sh
+
+tribe-interactive-ping-test: $(ROOTFS_IMAGE) \
+		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
+	tests/tribe/run_interactive_ping.sh --multicore
+
+tribe-interactive-tcp-test: $(ROOTFS_IMAGE) \
+		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
+	tests/tribe/run_interactive_tcp.sh --multicore
+
+tribe-interactive-process-test: $(ROOTFS_IMAGE) \
+		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
+	tests/tribe/run_interactive_process.sh --multicore
 
 qemu-ssh-top: ethgig-tap
 	tests/qemu/run_qemu_ssh.sh

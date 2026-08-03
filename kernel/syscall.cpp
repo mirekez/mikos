@@ -1,7 +1,14 @@
 #include <mikos/arch.hpp>
-#include <mikos/drivers/uart.hpp>
+#include <drivers/fs/root.hpp>
+#include <kernel/pseudo_filesystem.hpp>
+#include <drivers/uart/uart.hpp>
+#include <kernel/path.hpp>
 #include <mikos/kernel.hpp>
 #include <mikos/abi/riscv32.hpp>
+#include <mikos/abi/socket.hpp>
+#include <mikos/process/pipe.hpp>
+#include <mikos/process/signal.hpp>
+#include <mikos/process/pty.hpp>
 
 extern "C" void* memset(void*, int, mikos::usize);
 extern "C" void* memcpy(void*, const void*, mikos::usize);
@@ -12,6 +19,7 @@ namespace {
 using abi::riscv32::Errno;
 using abi::riscv32::Syscall;
 using abi::riscv32::error;
+using PseudoFilesystem = pseudo_fs::Filesystem;
 
 struct [[gnu::packed]] Iovec32 {
   u32 base;
@@ -59,19 +67,70 @@ struct SuspendedParent {
   u32 mmap_size{};
   u32 stack_size{};
   u32 child_status{};
-  bool cwd_proc{};
+  u32 child_pid{};
+  u32 child_process_group{};
+  u32 parent_pid{};
+  u32 process_group{};
+  u32 session{};
+  process_model::SignalState signals{};
+  u32 file_creation_mask{};
+  char current_directory[256]{};
+  char executable_path[256]{};
   bool active{};
   bool memory_saved{};
   bool child_waitable{};
 };
 
 SuspendedParent parent{};
+struct WaitableChild {
+  u32 pid{};
+  u32 parent_pid{};
+  u32 process_group{};
+  u32 status{};
+  bool used{};
+};
+
+WaitableChild waitable_children[8]{};
+u32 file_creation_mask{0022};
+u32 child_tid_address{};
+process_model::SignalState signals{};
 inline constexpr u32 parent_backup_capacity = 4 * 1024 * 1024;
 [[gnu::section(".noinit")]] alignas(16)
 u8 parent_backup[parent_backup_capacity];
 
-[[nodiscard]] bool user_string_is(u32 address, const char* expected);
+[[maybe_unused, nodiscard]] bool user_string_is(u32 address,
+                                                const char* expected);
 void reset_descriptors();
+[[nodiscard]] bool save_parent_descriptors();
+void restore_parent_descriptors();
+void discard_parent_descriptors();
+
+[[nodiscard]] bool waitable_space() {
+  for (const auto& child : waitable_children) {
+    if (!child.used) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void publish_child_exit(u32 pid, u32 parent_pid, u32 process_group,
+                        u32 status) {
+  for (auto& child : waitable_children) {
+    if (!child.used) {
+      child = {pid, parent_pid, process_group, status, true};
+      parent.child_waitable = true;
+      return;
+    }
+  }
+}
+
+void refresh_child_waitable() {
+  parent.child_waitable = false;
+  for (const auto& child : waitable_children) {
+    parent.child_waitable = parent.child_waitable || child.used;
+  }
+}
 
 [[nodiscard]] bool save_parent_memory() {
   if (parent.memory_saved) {
@@ -106,6 +165,13 @@ void reset_descriptors();
 }
 
 void restore_parent(TrapFrame& frame, u32 status) {
+  const u32 child_process_group = process.process_group;
+  if (process.image != 0) {
+    // Both payloads occupy the same flat user address range. stress-ng has
+    // overwritten BusyBox's read-only segments, so restore the complete
+    // shell image before applying the parent's saved writable state.
+    restore_busybox_image();
+  }
   if (parent.memory_saved) {
     u32 cursor = 0;
     memcpy(reinterpret_cast<void*>(parent.mutable_begin),
@@ -118,43 +184,87 @@ void restore_parent(TrapFrame& frame, u32 status) {
            parent.stack_size);
   }
   frame = parent.frame;
-  frame.x[10] = 2;
+  frame.x[10] = parent.child_pid;
   frame.mepc += 4;
   process.brk = parent.brk;
   process.mmap_cursor = parent.mmap_cursor;
   process.mutable_begin = parent.mutable_begin;
-  process.pid = 1;
+  process.pid = parent.parent_pid;
+  process.parent_pid = 0;
+  process.process_group = parent.process_group;
+  process.session = parent.session;
+  signals = parent.signals;
   process.image = 0;
-  process.cwd_proc = parent.cwd_proc;
+  file_creation_mask = parent.file_creation_mask;
+  memcpy(process.current_directory, parent.current_directory,
+         sizeof(process.current_directory));
+  memcpy(process.executable_path, parent.executable_path,
+         sizeof(process.executable_path));
   process.image_replaced = true;
   parent.child_status = status;
-  parent.child_waitable = true;
+  parent.child_process_group = child_process_group;
+  publish_child_exit(parent.child_pid, parent.parent_pid,
+                     child_process_group, status);
   parent.active = false;
   parent.memory_saved = false;
-  reset_descriptors();
+  restore_parent_descriptors();
 }
 
-[[nodiscard]] i32 clone(TrapFrame& frame, u32 flags, u32 stack) {
+[[nodiscard]] i32 clone(TrapFrame& frame, u32 flags, u32 stack,
+                        u32 child_tid) {
   constexpr u32 signal_mask = 0xff;
   constexpr u32 sigchld = 17;
   constexpr u32 clone_vm = 0x100;
   constexpr u32 clone_vfork = 0x4000;
-  constexpr u32 supported = clone_vm | clone_vfork | sigchld;
-  if ((flags & ~signal_mask) != (supported & ~signal_mask) ||
-      (flags & signal_mask) != sigchld || parent.active ||
-      !user_memory.contains(stack, 1)) {
+  constexpr u32 clone_child_cleartid = 0x00200000;
+  constexpr u32 clone_child_settid = 0x01000000;
+  const u32 behavior = flags & ~signal_mask;
+  constexpr u32 fork_bookkeeping =
+      clone_child_cleartid | clone_child_settid;
+  const bool ordinary_fork = (behavior & ~fork_bookkeeping) == 0;
+  const bool vfork = behavior == (clone_vm | clone_vfork);
+  const u32 child_stack = stack == 0 ? frame.x[2] : stack;
+  if ((!ordinary_fork && !vfork) || (flags & signal_mask) != sigchld ||
+      parent.active || !user_memory.contains(child_stack, 1) ||
+      !waitable_space() ||
+      (((flags & (clone_child_settid | clone_child_cleartid)) != 0) &&
+       (!user_memory.contains(child_tid, sizeof(u32)) ||
+        !user_memory.aligned(child_tid, alignof(u32))))) {
     return error(Errno::invalid_argument);
+  }
+  if (!save_parent_descriptors()) {
+    return error(Errno::no_memory);
   }
   parent.frame = frame;
   parent.brk = process.brk;
   parent.mmap_cursor = process.mmap_cursor;
   parent.mutable_begin = process.mutable_begin;
-  parent.cwd_proc = process.cwd_proc;
-  parent.stack_begin = align_down(stack, static_cast<u32>(16));
+  parent.file_creation_mask = file_creation_mask;
+  memcpy(parent.current_directory, process.current_directory,
+         sizeof(parent.current_directory));
+  memcpy(parent.executable_path, process.executable_path,
+         sizeof(parent.executable_path));
+  parent.stack_begin = align_down(child_stack, static_cast<u32>(16));
+  parent.parent_pid = process.pid;
+  parent.process_group = process.process_group;
+  parent.session = process.session;
+  parent.signals = signals;
+  static u32 next_pid = 2;
+  parent.child_pid = next_pid++;
   parent.active = true;
   parent.memory_saved = false;
-  parent.child_waitable = false;
-  process.pid = 2;
+  if (!save_parent_memory()) {
+    parent.active = false;
+    discard_parent_descriptors();
+    return error(Errno::no_memory);
+  }
+  process.pid = parent.child_pid;
+  process.parent_pid = parent.parent_pid;
+  child_tid_address =
+      (flags & clone_child_cleartid) != 0 ? child_tid : 0;
+  if ((flags & clone_child_settid) != 0) {
+    *reinterpret_cast<u32*>(child_tid) = process.pid;
+  }
   return 0;
 }
 
@@ -174,31 +284,152 @@ void restore_parent(TrapFrame& frame, u32 status) {
   return false;
 }
 
-enum class Node : u8 {
-  none,
-  root_directory,
-  proc_directory,
-  cpu_stat,
-  meminfo,
-  loadavg,
-  pid1_directory,
-  pid2_directory,
-  pid1_stat,
-  pid2_stat,
-  pid1_cmdline,
-  pid2_cmdline,
+struct Node {
+  enum class Kind : u8 {
+    none,
+    standard_input,
+    standard_output,
+    filesystem,
+    pseudo,
+    network_socket,
+    pipe,
+    pty,
+  };
+
+  static constexpr Kind none = Kind::none;
+  static constexpr Kind standard_input = Kind::standard_input;
+  static constexpr Kind standard_output = Kind::standard_output;
+  static constexpr Kind filesystem = Kind::filesystem;
+  static constexpr Kind pseudo = Kind::pseudo;
+  static constexpr Kind network_socket = Kind::network_socket;
+  static constexpr Kind pipe = Kind::pipe;
+  static constexpr Kind pty = Kind::pty;
+
+  Kind kind{Kind::none};
+  drivers::fs::root::Node file{};
+  PseudoFilesystem::Node pseudo_node{PseudoFilesystem::Node::none};
+
+  constexpr Node() = default;
+  constexpr Node(Kind value) : kind(value) {}
+  constexpr Node(const drivers::fs::root::Node& value)
+      : kind(Kind::filesystem), file(value) {}
+  constexpr Node(PseudoFilesystem::Node value)
+      : kind(Kind::pseudo), pseudo_node(value) {}
+  [[nodiscard]] constexpr operator Kind() const { return kind; }
 };
 
 struct Descriptor {
   Node node{};
   u32 offset{};
+  u32 flags{};
+  u8 socket{network::invalid_socket};
+  process_model::PipeHandle pipe{};
+  process_model::PipeEnd pipe_end{process_model::PipeEnd::read};
+  process_model::PtyHandle pty{};
+  process_model::PtyEnd pty_end{process_model::PtyEnd::master};
+  char path[path::capacity]{};
 };
 
 Descriptor descriptors[13]{};
+Descriptor standard_redirects[3]{};
+Descriptor parent_descriptors[13]{};
+Descriptor parent_standard_redirects[3]{};
+process_model::PipeTable<4> pipes{};
+process_model::PtyTable<4> ptys{};
+
+[[nodiscard]] bool retain_descriptor(const Descriptor& descriptor) {
+  if (descriptor.node == Node::network_socket) {
+    return network::socket_retain(descriptor.socket) ==
+           network::SocketResult::success;
+  }
+  if (descriptor.node == Node::pipe) {
+    return pipes.retain(descriptor.pipe, descriptor.pipe_end) ==
+           process_model::PipeStatus::success;
+  }
+  if (descriptor.node == Node::pty) {
+    return ptys.retain(descriptor.pty, descriptor.pty_end) ==
+           process_model::PtyStatus::success;
+  }
+  return true;
+}
+
+void release_descriptor(Descriptor& descriptor) {
+  if (descriptor.node == Node::network_socket) {
+    static_cast<void>(network::socket_close(descriptor.socket));
+  } else if (descriptor.node == Node::pipe) {
+    static_cast<void>(pipes.release(descriptor.pipe, descriptor.pipe_end));
+  } else if (descriptor.node == Node::pty) {
+    static_cast<void>(ptys.release(descriptor.pty, descriptor.pty_end));
+  }
+  descriptor = {};
+}
 
 void reset_descriptors() {
   for (auto& descriptor : descriptors) {
-    descriptor = {};
+    release_descriptor(descriptor);
+  }
+  for (auto& descriptor : standard_redirects) {
+    release_descriptor(descriptor);
+  }
+}
+
+[[nodiscard]] bool save_parent_descriptors() {
+  for (auto& descriptor : parent_descriptors) {
+    release_descriptor(descriptor);
+  }
+  for (auto& descriptor : parent_standard_redirects) {
+    release_descriptor(descriptor);
+  }
+  u32 copied = 0;
+  for (; copied < 13; ++copied) {
+    if (!retain_descriptor(descriptors[copied])) {
+      break;
+    }
+    parent_descriptors[copied] = descriptors[copied];
+  }
+  if (copied != 13) {
+    for (u32 i = 0; i < copied; ++i) {
+      release_descriptor(parent_descriptors[i]);
+    }
+    return false;
+  }
+  copied = 0;
+  for (; copied < 3; ++copied) {
+    if (!retain_descriptor(standard_redirects[copied])) {
+      break;
+    }
+    parent_standard_redirects[copied] = standard_redirects[copied];
+  }
+  if (copied != 3) {
+    for (auto& descriptor : parent_descriptors) {
+      release_descriptor(descriptor);
+    }
+    for (u32 i = 0; i < copied; ++i) {
+      release_descriptor(parent_standard_redirects[i]);
+    }
+    return false;
+  }
+  return true;
+}
+
+void restore_parent_descriptors() {
+  reset_descriptors();
+  for (u32 i = 0; i < 13; ++i) {
+    descriptors[i] = parent_descriptors[i];
+    parent_descriptors[i] = {};
+  }
+  for (u32 i = 0; i < 3; ++i) {
+    standard_redirects[i] = parent_standard_redirects[i];
+    parent_standard_redirects[i] = {};
+  }
+}
+
+void discard_parent_descriptors() {
+  for (auto& descriptor : parent_descriptors) {
+    release_descriptor(descriptor);
+  }
+  for (auto& descriptor : parent_standard_redirects) {
+    release_descriptor(descriptor);
   }
 }
 
@@ -221,68 +452,215 @@ void reset_descriptors() {
   return size;
 }
 
-[[nodiscard]] Node path_node(u32 address) {
-  char path[64]{};
-  if (!copy_user_string(address, path, sizeof(path))) {
+[[nodiscard]] bool canonicalize_path(u32 address, const char* base,
+                                     char* output, u32 capacity) {
+  char user_path[path::capacity]{};
+  return copy_user_string(address, user_path, sizeof(user_path)) &&
+         path::canonicalize(base, user_path, output, capacity);
+}
+
+[[nodiscard]] Node path_node_from(u32 address, const char* base,
+                                  char* canonical = nullptr) {
+  char local[256]{};
+  char* path = canonical == nullptr ? local : canonical;
+  if (!canonicalize_path(address, base, path, 256)) {
     return Node::none;
   }
-  if (text_is(path, "/")) {
-    return Node::root_directory;
+  const auto pseudo_node = PseudoFilesystem::lookup(path);
+  if (pseudo_node != PseudoFilesystem::Node::none) {
+    return Node{pseudo_node};
   }
-  if (text_is(path, ".")) {
-    return process.cwd_proc ? Node::proc_directory : Node::root_directory;
+  const auto result = drivers::fs::root::lookup(path);
+  return result ? Node{result.value} : Node{Node::none};
+}
+
+[[nodiscard]] Node path_node(u32 address, char* canonical = nullptr) {
+  return path_node_from(address, process.current_directory, canonical);
+}
+
+[[nodiscard]] bool directory(Node node);
+[[nodiscard]] u32 node_size(Node node);
+
+[[nodiscard]] Node path_node_at(u32 descriptor, u32 address,
+                                char* canonical = nullptr) {
+  constexpr u32 at_current_working_directory = static_cast<u32>(-100);
+  char raw[path::capacity]{};
+  if (!copy_user_string(address, raw, sizeof(raw))) {
+    return Node::none;
   }
-  if (text_is(path, "/proc") || text_is(path, "/proc/") ||
-      text_is(path, "./proc")) {
-    return Node::proc_directory;
+  if (raw[0] == '/' || descriptor == at_current_working_directory) {
+    return path_node(address, canonical);
   }
-  if (text_is(path, "/proc/1") || text_is(path, "/proc/1/")) {
-    return Node::pid1_directory;
+  if (descriptor < 3 || descriptor >= 16) {
+    return Node::none;
   }
-  if (text_is(path, "/proc/2") || text_is(path, "/proc/2/")) {
-    return Node::pid2_directory;
+  const auto& slot = descriptors[descriptor - 3];
+  if (!directory(slot.node)) {
+    return Node::none;
   }
-  if ((process.cwd_proc && text_is(path, "stat")) ||
-      text_is(path, "/proc/stat")) {
-    return Node::cpu_stat;
-  }
-  if ((process.cwd_proc && text_is(path, "meminfo")) ||
-      text_is(path, "/proc/meminfo")) {
-    return Node::meminfo;
-  }
-  if ((process.cwd_proc && text_is(path, "loadavg")) ||
-      text_is(path, "/proc/loadavg")) {
-    return Node::loadavg;
-  }
-  if (text_is(path, "/proc/1/stat")) {
-    return Node::pid1_stat;
-  }
-  if (text_is(path, "/proc/2/stat")) {
-    return Node::pid2_stat;
-  }
-  if (text_is(path, "/proc/1/cmdline")) {
-    return Node::pid1_cmdline;
-  }
-  if (text_is(path, "/proc/2/cmdline")) {
-    return Node::pid2_cmdline;
-  }
-  return Node::none;
+  return path_node_from(address, slot.path, canonical);
 }
 
 [[nodiscard]] bool directory(Node node) {
-  return node == Node::root_directory || node == Node::proc_directory ||
-         node == Node::pid1_directory || node == Node::pid2_directory;
+  return (node == Node::filesystem && node.file.directory()) ||
+         (node == Node::pseudo &&
+          PseudoFilesystem::directory(node.pseudo_node));
 }
 
-[[maybe_unused, nodiscard]] i32 openat(u32 path) {
-  const Node node = path_node(path);
+[[nodiscard]] i32 filesystem_error(drivers::fs::Error value) {
+  using drivers::fs::Error;
+  switch (value) {
+    case Error::none:
+      return 0;
+    case Error::not_found:
+      return error(Errno::no_entry);
+    case Error::not_directory:
+      return error(Errno::not_directory);
+    case Error::already_exists:
+      return error(Errno::file_exists);
+    case Error::no_space:
+      return error(Errno::no_space);
+    case Error::invalid_argument:
+      return error(Errno::invalid_argument);
+    case Error::unsupported:
+      return error(Errno::read_only_filesystem);
+    default:
+      return error(Errno::io);
+  }
+}
+
+[[nodiscard]] i32 mkdirat(u32 directory_descriptor, u32 address, u32 mode) {
+  constexpr u32 at_current_working_directory = static_cast<u32>(-100);
+  char raw[path::capacity]{};
+  if (!copy_user_string(address, raw, sizeof(raw))) {
+    return error(Errno::bad_address);
+  }
+  const char* base = process.current_directory;
+  if (raw[0] != '/' &&
+      directory_descriptor != at_current_working_directory) {
+    if (directory_descriptor < 3 || directory_descriptor >= 16 ||
+        descriptors[directory_descriptor - 3].node == Node::none) {
+      return error(Errno::bad_file_descriptor);
+    }
+    const auto& slot = descriptors[directory_descriptor - 3];
+    if (!directory(slot.node)) {
+      return error(Errno::not_directory);
+    }
+    base = slot.path;
+  }
+  char canonical[path::capacity]{};
+  if (!path::canonicalize(base, raw, canonical, sizeof(canonical))) {
+    return error(Errno::invalid_argument);
+  }
+  if (PseudoFilesystem::mounted(canonical)) {
+    return error(Errno::read_only_filesystem);
+  }
+  return filesystem_error(drivers::fs::root::mkdir(
+      canonical,
+      static_cast<u16>((mode & 07777) & ~file_creation_mask)));
+}
+
+[[nodiscard]] i32 umask(u32 mask) {
+  const u32 previous = file_creation_mask;
+  file_creation_mask = mask & 0777;
+  return static_cast<i32>(previous);
+}
+
+[[maybe_unused, nodiscard]] i32 openat(u32 directory_descriptor, u32 path,
+                                      u32 flags) {
+  constexpr u32 access_mode = 3;
+  constexpr u32 create = 0x40;
+  constexpr u32 exclusive = 0x80;
+  constexpr u32 truncate = 0x200;
+  constexpr u32 append = 0x400;
+  char canonical[path::capacity]{};
+  Node node = path_node_at(directory_descriptor, path, canonical);
+  bool pty_path = text_is(canonical, "/dev/ptmx");
+  bool pty_slave = false;
+  u8 pty_number = 0;
+  constexpr const char* pts_prefix = "/dev/pts/";
+  if (!pty_path) {
+    u32 index = 0;
+    while (pts_prefix[index] != '\0' &&
+           canonical[index] == pts_prefix[index]) {
+      ++index;
+    }
+    if (pts_prefix[index] == '\0' && canonical[index] >= '0' &&
+        canonical[index] <= '3' && canonical[index + 1] == '\0') {
+      pty_path = true;
+      pty_slave = true;
+      pty_number = static_cast<u8>(canonical[index] - '0');
+    }
+  }
+  if (pty_path) {
+    u32 descriptor = 3;
+    while (descriptor < 16 &&
+           descriptors[descriptor - 3].node != Node::none) {
+      ++descriptor;
+    }
+    if (descriptor == 16) {
+      return error(Errno::no_memory);
+    }
+    const auto opened = pty_slave ? ptys.open_slave(pty_number)
+                                  : ptys.open_master();
+    if (opened.status != process_model::PtyStatus::success) {
+      return opened.status == process_model::PtyStatus::no_space
+                 ? error(Errno::no_memory)
+                 : (opened.status == process_model::PtyStatus::locked
+                        ? error(Errno::access_denied)
+                        : error(Errno::no_entry));
+    }
+    auto& slot = descriptors[descriptor - 3];
+    slot.node = Node::pty;
+    slot.flags = flags;
+    slot.pty = opened.handle;
+    slot.pty_end = pty_slave ? process_model::PtyEnd::slave
+                             : process_model::PtyEnd::master;
+    memcpy(slot.path, canonical, sizeof(canonical));
+    return static_cast<i32>(descriptor);
+  }
+  if (node == Node::none && (flags & create) != 0) {
+    if (PseudoFilesystem::mounted(canonical)) {
+      return error(Errno::read_only_filesystem);
+    }
+    if (drivers::fs::root::create(canonical, nullptr, 0) !=
+        drivers::fs::Error::none) {
+      return error(Errno::io);
+    }
+    const auto created = drivers::fs::root::lookup(canonical);
+    if (created) {
+      node = Node{created.value};
+    }
+  } else if (node != Node::none && (flags & create) != 0 &&
+             (flags & exclusive) != 0) {
+    return error(Errno::access_denied);
+  }
   if (node == Node::none) {
     return error(Errno::no_entry);
+  }
+  constexpr u32 require_directory = 0x10000;
+  if ((flags & require_directory) != 0 && !directory(node)) {
+    return error(Errno::not_directory);
+  }
+  if ((flags & truncate) != 0) {
+    if (node == Node::pseudo) {
+      return error(Errno::read_only_filesystem);
+    }
+    if (node != Node::filesystem || directory(node)) {
+      return error(Errno::is_directory);
+    }
+    if (drivers::fs::root::truncate(node.file, 0) !=
+        drivers::fs::Error::none) {
+      return error(Errno::io);
+    }
   }
   for (u32 descriptor = 3; descriptor < 16; ++descriptor) {
     auto& slot = descriptors[descriptor - 3];
     if (slot.node == Node::none) {
-      slot = Descriptor{node, 0};
+      slot.node = node;
+      slot.offset = (flags & append) != 0 ? node_size(node) : 0;
+      slot.flags = flags & (access_mode | append);
+      memcpy(slot.path, canonical, sizeof(canonical));
       return static_cast<i32>(descriptor);
     }
   }
@@ -290,89 +668,662 @@ void reset_descriptors() {
 }
 
 [[maybe_unused, nodiscard]] i32 close(u32 descriptor) {
+  if (descriptor < 3) {
+    release_descriptor(standard_redirects[descriptor]);
+    return 0;
+  }
   if (descriptor < 3 || descriptor >= 16 ||
       descriptors[descriptor - 3].node == Node::none) {
     return error(Errno::bad_file_descriptor);
   }
-  descriptors[descriptor - 3] = {};
+  auto& slot = descriptors[descriptor - 3];
+  release_descriptor(slot);
   return 0;
 }
 
-[[nodiscard]] const char* node_contents(Node node) {
-#ifdef MIKOS_TRIBE_MULTICORE
-  static constexpr const char cpu[] =
-      "cpu  400 0 400 40000 0 0 0 0\n"
-      "cpu0 100 0 100 10000 0 0 0 0\n"
-      "cpu1 100 0 100 10000 0 0 0 0\n"
-      "cpu2 100 0 100 10000 0 0 0 0\n"
-      "cpu3 100 0 100 10000 0 0 0 0\n";
-#else
-  static constexpr const char cpu[] =
-      "cpu  100 0 100 10000 0 0 0 0\n"
-      "cpu0 100 0 100 10000 0 0 0 0\n";
-#endif
-  static constexpr const char memory[] =
-      "MemTotal:       16384 kB\n"
-      "MemFree:         4096 kB\n"
-      "MemShared:          0 kB\n"
-      "Buffers:          128 kB\n"
-      "Cached:          2048 kB\n"
-      "SReclaimable:       0 kB\n"
-      "Shmem:              0 kB\n"
-      "SwapTotal:          0 kB\n"
-      "SwapFree:           0 kB\n";
-  static constexpr const char load[] = "0.00 0.00 0.00 1/2 2\n";
-  static constexpr const char shell_stat[] =
-      "1 (sh) S 0 1 1 0 0 0 0 0 0 0 1 1 0 0 20 0 1 0 1 2500000 128 "
-      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
-  static constexpr const char top_stat[] =
-      "2 (top) R 1 2 2 0 0 0 0 0 0 0 2 1 0 0 20 0 1 0 1 2600000 144 "
-      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
-  static constexpr const char shell_command[] = "sh\0";
-  static constexpr const char top_command[] = "top\0";
-  switch (node) {
-    case Node::cpu_stat:
-      return cpu;
-    case Node::meminfo:
-      return memory;
-    case Node::loadavg:
-      return load;
-    case Node::pid1_stat:
-      return shell_stat;
-    case Node::pid2_stat:
-      return top_stat;
-    case Node::pid1_cmdline:
-      return shell_command;
-    case Node::pid2_cmdline:
-      return top_command;
-    default:
-      return nullptr;
+[[nodiscard]] Descriptor* descriptor_slot(u32 descriptor) {
+  if (descriptor < 3) {
+    return standard_redirects[descriptor].node == Node::none
+               ? nullptr
+               : &standard_redirects[descriptor];
   }
+  return descriptor < 16 ? &descriptors[descriptor - 3] : nullptr;
+}
+
+[[nodiscard]] bool descriptor_open(u32 descriptor) {
+  return descriptor < 3 ||
+         (descriptor < 16 &&
+          descriptors[descriptor - 3].node != Node::none);
+}
+
+[[nodiscard]] bool descriptor_read_ready(u32 descriptor) {
+  if (descriptor == 0 && standard_redirects[0].node == Node::none) {
+    return drivers::uart::ready();
+  }
+  const Descriptor* slot = descriptor_slot(descriptor);
+  if (slot == nullptr) {
+    return false;
+  }
+  if (slot->node == Node::network_socket) {
+    return network::socket_readable(slot->socket);
+  }
+  if (slot->node == Node::pipe) {
+    return slot->pipe_end == process_model::PipeEnd::read &&
+           pipes.readable(slot->pipe);
+  }
+  if (slot->node == Node::pty) {
+    return ptys.readable(slot->pty, slot->pty_end);
+  }
+  if (slot->node == Node::standard_input) {
+    return drivers::uart::ready();
+  }
+  return (slot->node == Node::filesystem || slot->node == Node::pseudo) &&
+         !directory(slot->node);
+}
+
+[[nodiscard]] bool descriptor_write_ready(u32 descriptor) {
+  if ((descriptor == 1 || descriptor == 2) &&
+      standard_redirects[descriptor].node == Node::none) {
+    return true;
+  }
+  const Descriptor* slot = descriptor_slot(descriptor);
+  if (slot == nullptr) {
+    return false;
+  }
+  if (slot->node == Node::network_socket) {
+    return network::socket_writable(slot->socket);
+  }
+  if (slot->node == Node::pipe) {
+    return slot->pipe_end == process_model::PipeEnd::write &&
+           pipes.writable(slot->pipe);
+  }
+  if (slot->node == Node::pty) {
+    return ptys.writable(slot->pty, slot->pty_end);
+  }
+  if (slot->node == Node::standard_output) {
+    return true;
+  }
+  return slot->node == Node::filesystem && !directory(slot->node) &&
+         (slot->flags & 3) != 0;
+}
+
+[[nodiscard]] bool descriptor_error_ready(u32 descriptor) {
+  const Descriptor* slot = descriptor_slot(descriptor);
+  if (slot != nullptr && slot->node == Node::pipe) {
+    return pipes.hung_up(slot->pipe, slot->pipe_end);
+  }
+  if (slot != nullptr && slot->node == Node::pty) {
+    return ptys.readable(slot->pty, slot->pty_end) &&
+           !ptys.writable(slot->pty, slot->pty_end);
+  }
+  if (slot == nullptr || slot->node != Node::network_socket) {
+    return false;
+  }
+  const auto* socket = network::socket_slot(slot->socket);
+  return socket != nullptr && socket->state == network::SocketState::reset;
+}
+
+[[nodiscard]] i32 socket(u32 domain, u32 type, u32 protocol) {
+  using abi::socket::ValidationResult;
+  switch (abi::socket::validate(domain, type, protocol)) {
+    case ValidationResult::address_family_not_supported:
+      return error(Errno::address_family_not_supported);
+    case ValidationResult::socket_type_not_supported:
+      return error(Errno::operation_not_supported);
+    case ValidationResult::protocol_not_supported:
+      return error(Errno::protocol_not_supported);
+    case ValidationResult::success:
+      break;
+  }
+  const auto opened = network::socket_open(abi::socket::type(type));
+  if (opened.result != network::SocketResult::success) {
+    return error(Errno::no_memory);
+  }
+  for (u32 descriptor = 3; descriptor < 16; ++descriptor) {
+    auto& slot = descriptors[descriptor - 3];
+    if (slot.node == Node::none) {
+      slot.node = Node::network_socket;
+      slot.flags = type & abi::socket::sock_nonblock;
+      slot.socket = opened.handle;
+      return static_cast<i32>(descriptor);
+    }
+  }
+  static_cast<void>(network::socket_close(opened.handle));
+  return error(Errno::no_memory);
+}
+
+[[nodiscard]] i32 socket_error(network::SocketResult result) {
+  using network::SocketResult;
+  switch (result) {
+    case SocketResult::success:
+    case SocketResult::end_of_file:
+      return 0;
+    case SocketResult::bad_handle:
+      return error(Errno::bad_file_descriptor);
+    case SocketResult::wrong_type:
+      return error(Errno::operation_not_supported);
+    case SocketResult::invalid_argument:
+      return error(Errno::invalid_argument);
+    case SocketResult::address_in_use:
+      return error(Errno::address_in_use);
+    case SocketResult::not_bound:
+    case SocketResult::not_listening:
+      return error(Errno::invalid_argument);
+    case SocketResult::would_block:
+      return error(Errno::try_again);
+    case SocketResult::not_connected:
+      return error(Errno::not_connected);
+    case SocketResult::no_space:
+      return error(Errno::no_memory);
+    case SocketResult::reset:
+      return error(Errno::io);
+  }
+  return error(Errno::io);
+}
+
+[[nodiscard]] Descriptor* network_descriptor(u32 descriptor) {
+  Descriptor* value = descriptor_slot(descriptor);
+  return value != nullptr && value->node == Node::network_socket ? value
+                                                                 : nullptr;
+}
+
+[[nodiscard]] bool read_sockaddr(u32 address, u32 size,
+                                 network::Endpoint& endpoint) {
+  if (size < sizeof(abi::socket::SockaddrIn) ||
+      !user_memory.contains(address, sizeof(abi::socket::SockaddrIn))) {
+    return false;
+  }
+  abi::socket::SockaddrIn value{};
+  memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+  if (value.family != abi::socket::af_inet) {
+    return false;
+  }
+  endpoint.port = net16(value.port);
+  copy_octets(endpoint.address.octet, value.address);
+  return true;
+}
+
+[[nodiscard]] bool sockaddr_output_valid(u32 address, u32 length_address) {
+  if (address == 0) {
+    return true;
+  }
+  return length_address != 0 &&
+         user_memory.contains(length_address, sizeof(u32)) &&
+         user_memory.contains(address, sizeof(abi::socket::SockaddrIn));
+}
+
+[[nodiscard]] i32 write_sockaddr(network::Endpoint endpoint, u32 address,
+                                 u32 length_address) {
+  if (address == 0) {
+    return 0;
+  }
+  if (!sockaddr_output_valid(address, length_address)) {
+    return error(Errno::bad_address);
+  }
+  const u32 capacity = *reinterpret_cast<const u32*>(length_address);
+  if (capacity < sizeof(abi::socket::SockaddrIn)) {
+    return error(Errno::invalid_argument);
+  }
+  abi::socket::SockaddrIn value{};
+  value.family = abi::socket::af_inet;
+  value.port = net16(endpoint.port);
+  copy_octets(value.address, endpoint.address.octet);
+  memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+  *reinterpret_cast<u32*>(length_address) = sizeof(value);
+  return 0;
+}
+
+[[nodiscard]] i32 bind(u32 descriptor, u32 address, u32 size) {
+  auto* slot = network_descriptor(descriptor);
+  if (slot == nullptr) {
+    return error(Errno::bad_file_descriptor);
+  }
+  network::Endpoint endpoint{};
+  if (!read_sockaddr(address, size, endpoint)) {
+    return error(Errno::invalid_argument);
+  }
+  return socket_error(network::socket_bind(slot->socket, endpoint));
+}
+
+[[nodiscard]] i32 listen(u32 descriptor, u32 backlog) {
+  auto* slot = network_descriptor(descriptor);
+  if (slot == nullptr) {
+    return error(Errno::bad_file_descriptor);
+  }
+  const auto result = network::socket_listen(slot->socket, backlog);
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  if (result == network::SocketResult::success) {
+    const auto* socket = network::socket_slot(slot->socket);
+    write_text("MIKOS:TCP_LISTEN ");
+    write_u32(socket == nullptr ? 0 : socket->local.port);
+    write_text("\n");
+  }
+#endif
+  return socket_error(result);
+}
+
+[[nodiscard]] i32 accept(u32 descriptor, u32 address, u32 length_address,
+                         u32 flags) {
+  constexpr u32 supported_flags = abi::socket::sock_nonblock |
+                                  abi::socket::sock_cloexec;
+  if ((flags & ~supported_flags) != 0) {
+    return error(Errno::invalid_argument);
+  }
+  auto* listening = network_descriptor(descriptor);
+  if (listening == nullptr) {
+    return error(Errno::bad_file_descriptor);
+  }
+  if (!sockaddr_output_valid(address, length_address)) {
+    return error(Errno::bad_address);
+  }
+  u32 accepted_descriptor = 3;
+  while (accepted_descriptor < 16 &&
+         descriptors[accepted_descriptor - 3].node != Node::none) {
+    ++accepted_descriptor;
+  }
+  if (accepted_descriptor == 16) {
+    return error(Errno::no_memory);
+  }
+  network::AcceptResult accepted{};
+  for (;;) {
+    accepted = network::socket_accept(listening->socket);
+    if (accepted.result != network::SocketResult::would_block) {
+      break;
+    }
+    if ((listening->flags & abi::socket::sock_nonblock) != 0 ||
+        (flags & abi::socket::sock_nonblock) != 0) {
+      return error(Errno::try_again);
+    }
+    network::poll();
+  }
+  if (accepted.result != network::SocketResult::success) {
+    return socket_error(accepted.result);
+  }
+  const i32 address_result =
+      write_sockaddr(accepted.peer, address, length_address);
+  if (address_result != 0) {
+    static_cast<void>(network::socket_close(accepted.handle));
+    return address_result;
+  }
+  auto& result = descriptors[accepted_descriptor - 3];
+  result.node = Node::network_socket;
+  result.flags = flags & abi::socket::sock_nonblock;
+  result.socket = accepted.handle;
+  return static_cast<i32>(accepted_descriptor);
+}
+
+[[nodiscard]] i32 socket_name(u32 descriptor, u32 address,
+                              u32 length_address, bool peer) {
+  auto* slot = network_descriptor(descriptor);
+  if (slot == nullptr) {
+    return error(Errno::bad_file_descriptor);
+  }
+  const auto* socket = network::socket_slot(slot->socket);
+  if (socket == nullptr) {
+    return error(Errno::bad_file_descriptor);
+  }
+  if (peer && socket->state != network::SocketState::established &&
+      socket->state != network::SocketState::close_wait &&
+      socket->state != network::SocketState::reset) {
+    return error(Errno::not_connected);
+  }
+  return write_sockaddr(peer ? socket->remote : socket->local, address,
+                        length_address);
+}
+
+[[nodiscard]] i32 setsockopt(u32 descriptor, u32 value_address,
+                             u32 value_size) {
+  if (network_descriptor(descriptor) == nullptr) {
+    return error(Errno::bad_file_descriptor);
+  }
+  if (value_size != 0 &&
+      !user_memory.contains(value_address, value_size)) {
+    return error(Errno::bad_address);
+  }
+  // The bounded stack has no tunable buffers. SO_REUSEADDR, TCP_NODELAY,
+  // IP_TOS, keepalive, and similar Dropbear hints are accepted as no-ops.
+  return 0;
+}
+
+[[nodiscard]] i32 shutdown_socket(u32 descriptor, u32 how) {
+  auto* slot = network_descriptor(descriptor);
+  return slot == nullptr
+             ? error(Errno::bad_file_descriptor)
+             : socket_error(network::socket_shutdown(slot->socket, how));
+}
+
+[[nodiscard]] i32 duplicate_to(u32 old_descriptor, u32 new_descriptor,
+                               u32 flags) {
+  if (flags != 0 || old_descriptor >= 16 || new_descriptor >= 16 ||
+      old_descriptor == new_descriptor) {
+    return error(Errno::invalid_argument);
+  }
+  Descriptor source{};
+  if (old_descriptor == 0) {
+    source.node = Node::standard_input;
+  } else if (old_descriptor == 1 || old_descriptor == 2) {
+    source.node = Node::standard_output;
+  } else if (descriptors[old_descriptor - 3].node != Node::none) {
+    source = descriptors[old_descriptor - 3];
+  } else {
+    return error(Errno::bad_file_descriptor);
+  }
+  if (new_descriptor < 3) {
+    if (source.node == Node::network_socket &&
+        network::socket_retain(source.socket) !=
+            network::SocketResult::success) {
+      return error(Errno::bad_file_descriptor);
+    }
+    if (source.node == Node::pipe &&
+        pipes.retain(source.pipe, source.pipe_end) !=
+            process_model::PipeStatus::success) {
+      if (source.node == Node::network_socket) {
+        static_cast<void>(network::socket_close(source.socket));
+      }
+      return error(Errno::bad_file_descriptor);
+    }
+    if (source.node == Node::pty &&
+        ptys.retain(source.pty, source.pty_end) !=
+            process_model::PtyStatus::success) {
+      return error(Errno::bad_file_descriptor);
+    }
+    release_descriptor(standard_redirects[new_descriptor]);
+    standard_redirects[new_descriptor] = source;
+  } else {
+    if (source.node == Node::network_socket &&
+        network::socket_retain(source.socket) !=
+            network::SocketResult::success) {
+      return error(Errno::bad_file_descriptor);
+    }
+    if (source.node == Node::pipe &&
+        pipes.retain(source.pipe, source.pipe_end) !=
+            process_model::PipeStatus::success) {
+      if (source.node == Node::network_socket) {
+        static_cast<void>(network::socket_close(source.socket));
+      }
+      return error(Errno::bad_file_descriptor);
+    }
+    if (source.node == Node::pty &&
+        ptys.retain(source.pty, source.pty_end) !=
+            process_model::PtyStatus::success) {
+      return error(Errno::bad_file_descriptor);
+    }
+    release_descriptor(descriptors[new_descriptor - 3]);
+    descriptors[new_descriptor - 3] = source;
+  }
+  return static_cast<i32>(new_descriptor);
+}
+
+[[nodiscard]] i32 pipe2(u32 address, u32 flags) {
+  constexpr u32 nonblock = 0x800;
+  constexpr u32 cloexec = 0x80000;
+  if ((flags & ~(nonblock | cloexec)) != 0) {
+    return error(Errno::invalid_argument);
+  }
+  if (!user_memory.contains(address, 2 * sizeof(u32)) ||
+      !user_memory.aligned(address, alignof(u32))) {
+    return error(Errno::bad_address);
+  }
+  u32 slots[2]{};
+  u32 found = 0;
+  for (u32 descriptor = 3; descriptor < 16 && found != 2; ++descriptor) {
+    if (descriptors[descriptor - 3].node == Node::none) {
+      slots[found++] = descriptor;
+    }
+  }
+  if (found != 2) {
+    return error(Errno::no_memory);
+  }
+  const auto created = pipes.create();
+  if (created.status != process_model::PipeStatus::success) {
+    return error(Errno::no_memory);
+  }
+  auto& reader = descriptors[slots[0] - 3];
+  reader.node = Node::pipe;
+  reader.flags = flags;
+  reader.pipe = created.handle;
+  reader.pipe_end = process_model::PipeEnd::read;
+  auto& writer = descriptors[slots[1] - 3];
+  writer.node = Node::pipe;
+  writer.flags = flags;
+  writer.pipe = created.handle;
+  writer.pipe_end = process_model::PipeEnd::write;
+  auto* output = reinterpret_cast<u32*>(address);
+  output[0] = slots[0];
+  output[1] = slots[1];
+  return 0;
+}
+
+[[nodiscard]] i32 fcntl(u32 descriptor, u32 command, u32 argument) {
+  constexpr u32 duplicate = 0;
+  constexpr u32 get_descriptor_flags = 1;
+  constexpr u32 set_descriptor_flags = 2;
+  constexpr u32 get_status_flags = 3;
+  constexpr u32 set_status_flags = 4;
+  constexpr u32 duplicate_cloexec = 1030;
+  if (command == get_descriptor_flags || command == set_descriptor_flags) {
+    return descriptor_open(descriptor) ? 0
+                                       : error(Errno::bad_file_descriptor);
+  }
+  if (command == get_status_flags) {
+    if (descriptor < 3) {
+      return descriptor == 0 ? 0 : 1;
+    }
+    return descriptor < 16 && descriptors[descriptor - 3].node != Node::none
+               ? static_cast<i32>(descriptors[descriptor - 3].flags)
+               : error(Errno::bad_file_descriptor);
+  }
+  if (command == set_status_flags) {
+    if (descriptor < 3) {
+      return 0;
+    }
+    if (descriptor >= 16 || descriptors[descriptor - 3].node == Node::none) {
+      return error(Errno::bad_file_descriptor);
+    }
+    descriptors[descriptor - 3].flags = argument;
+    return 0;
+  }
+  if (command != duplicate && command != duplicate_cloexec) {
+    return error(Errno::invalid_argument);
+  }
+  if (!descriptor_open(descriptor)) {
+    return error(Errno::bad_file_descriptor);
+  }
+  for (u32 target = argument < 3 ? 3 : argument; target < 16; ++target) {
+    if (descriptors[target - 3].node == Node::none) {
+      return duplicate_to(descriptor, target, 0);
+    }
+  }
+  return error(Errno::no_memory);
+}
+
+[[nodiscard]] i32 unlinkat(u32 directory_descriptor, u32 path_address,
+                           u32 flags) {
+  if (flags != 0) {
+    return error(Errno::invalid_argument);
+  }
+  char canonical[path::capacity]{};
+  const Node node =
+      path_node_at(directory_descriptor, path_address, canonical);
+  if (node == Node::none) {
+    return error(Errno::no_entry);
+  }
+  if (node == Node::pseudo) {
+    return error(Errno::read_only_filesystem);
+  }
+  return drivers::fs::root::remove(canonical) == drivers::fs::Error::none
+             ? 0
+             : error(Errno::io);
+}
+
+[[nodiscard]] i32 renameat(u32 old_directory, u32 old_path,
+                           u32 new_directory, u32 new_path) {
+  char source[path::capacity]{};
+  char destination[path::capacity]{};
+  const Node source_node = path_node_at(old_directory, old_path, source);
+  if (source_node == Node::none) {
+    return error(Errno::no_entry);
+  }
+  if (source_node == Node::pseudo) {
+    return error(Errno::read_only_filesystem);
+  }
+  char raw[path::capacity]{};
+  if (!copy_user_string(new_path, raw, sizeof(raw))) {
+    return error(Errno::bad_address);
+  }
+  const char* base = process.current_directory;
+  if (raw[0] != '/' &&
+      new_directory != static_cast<u32>(-100)) {
+    if (new_directory < 3 || new_directory >= 16 ||
+        !directory(descriptors[new_directory - 3].node)) {
+      return error(Errno::bad_file_descriptor);
+    }
+    base = descriptors[new_directory - 3].path;
+  }
+  if (!path::canonicalize(base, raw, destination, sizeof(destination))) {
+    return error(Errno::invalid_argument);
+  }
+  if (PseudoFilesystem::mounted(destination)) {
+    return error(Errno::read_only_filesystem);
+  }
+  return drivers::fs::root::move(source, destination) ==
+                 drivers::fs::Error::none
+             ? 0
+             : error(Errno::io);
+}
+
+[[nodiscard]] i32 ftruncate(u32 descriptor, u32 size) {
+  if (descriptor < 3 || descriptor >= 16) {
+    return error(Errno::bad_file_descriptor);
+  }
+  auto& slot = descriptors[descriptor - 3];
+  if (slot.node != Node::filesystem || (slot.flags & 3) == 0) {
+    return error(Errno::bad_file_descriptor);
+  }
+  return drivers::fs::root::truncate(slot.node.file, size) ==
+                 drivers::fs::Error::none
+             ? 0
+             : error(Errno::io);
+}
+
+[[nodiscard]] i32 truncate_path(u32 path_address, u32 size) {
+  char canonical[path::capacity]{};
+  Node node = path_node(path_address, canonical);
+  if (node == Node::none) {
+    return error(Errno::no_entry);
+  }
+  if (node == Node::pseudo) {
+    return error(Errno::read_only_filesystem);
+  }
+  if (node != Node::filesystem || directory(node)) {
+    return error(Errno::is_directory);
+  }
+  return drivers::fs::root::truncate(node.file, size) ==
+                 drivers::fs::Error::none
+             ? 0
+             : error(Errno::io);
+}
+
+[[nodiscard]] const char* node_contents(Node node) {
+  if (node == Node::pseudo &&
+      node.pseudo_node == PseudoFilesystem::Node::proc_net_tcp) {
+    return network::tcp_table();
+  }
+  return node == Node::pseudo
+             ? PseudoFilesystem::contents(node.pseudo_node)
+             : nullptr;
 }
 
 [[nodiscard]] u32 node_size(Node node) {
-  if (node == Node::pid1_cmdline) {
-    return 3;
+  if (node == Node::filesystem) {
+    return node.file.size > 0xffffffffu
+               ? 0xffffffffu
+               : static_cast<u32>(node.file.size);
   }
-  if (node == Node::pid2_cmdline) {
-    return 4;
+  if (node == Node::pseudo) {
+    if (node.pseudo_node == PseudoFilesystem::Node::proc_net_tcp) {
+      return text_size(network::tcp_table());
+    }
+    return PseudoFilesystem::size(node.pseudo_node);
   }
   const char* contents = node_contents(node);
   return contents == nullptr ? 0 : text_size(contents);
 }
 
 [[nodiscard]] i32 read_virtual(u32 descriptor, u32 address, u32 size) {
-  if (descriptor < 3 || descriptor >= 16) {
+  Descriptor* selected = descriptor_slot(descriptor);
+  if (selected == nullptr) {
     return error(Errno::bad_file_descriptor);
   }
-  auto& slot = descriptors[descriptor - 3];
-  const char* contents = node_contents(slot.node);
-  if (contents == nullptr) {
-    return directory(slot.node) ? error(Errno::bad_file_descriptor)
-                                : error(Errno::bad_file_descriptor);
+  auto& slot = *selected;
+  if (directory(slot.node)) {
+    return error(Errno::is_directory);
   }
   if (!user_memory.contains(address, size)) {
     return error(Errno::bad_address);
+  }
+  if (slot.node == Node::network_socket) {
+    if (size == 0) {
+      return 0;
+    }
+    for (;;) {
+      const auto result = network::socket_read(
+          slot.socket, reinterpret_cast<u8*>(address), size);
+      if (result.result == network::SocketResult::success) {
+        return static_cast<i32>(result.size);
+      }
+      if (result.result == network::SocketResult::end_of_file) {
+        return 0;
+      }
+      if (result.result != network::SocketResult::would_block) {
+        return socket_error(result.result);
+      }
+      if ((slot.flags & abi::socket::sock_nonblock) != 0) {
+        return error(Errno::try_again);
+      }
+      network::poll();
+    }
+  }
+  if (slot.node == Node::pipe) {
+    if (slot.pipe_end != process_model::PipeEnd::read) {
+      return error(Errno::bad_file_descriptor);
+    }
+    for (;;) {
+      const auto result = pipes.read(
+          slot.pipe, reinterpret_cast<u8*>(address), size);
+      if (result.status == process_model::PipeStatus::success) {
+        return static_cast<i32>(result.size);
+      }
+      if (result.status == process_model::PipeStatus::end_of_file) {
+        return 0;
+      }
+      if (result.status != process_model::PipeStatus::would_block) {
+        return error(Errno::bad_file_descriptor);
+      }
+      constexpr u32 nonblock = 0x800;
+      if ((slot.flags & nonblock) != 0) {
+        return error(Errno::try_again);
+      }
+      // The process scheduler phase will park and replay this syscall. Returning
+      // EAGAIN here is the bounded interim behavior and avoids a kernel spin.
+      return error(Errno::try_again);
+    }
+  }
+  if (slot.node == Node::pty) {
+    const auto result =
+        ptys.read(slot.pty, slot.pty_end, reinterpret_cast<u8*>(address), size);
+    switch (result.status) {
+      case process_model::PtyStatus::success:
+        return static_cast<i32>(result.size);
+      case process_model::PtyStatus::end_of_file:
+        return 0;
+      case process_model::PtyStatus::would_block:
+        return error(Errno::try_again);
+      case process_model::PtyStatus::io_error:
+        return error(Errno::io);
+      default:
+        return error(Errno::bad_file_descriptor);
+    }
   }
   const u32 available = node_size(slot.node);
   if (slot.offset >= available) {
@@ -382,7 +1333,20 @@ void reset_descriptors() {
   if (count > size) {
     count = size;
   }
-  memcpy(reinterpret_cast<void*>(address), contents + slot.offset, count);
+  if (slot.node == Node::filesystem) {
+    const auto result = drivers::fs::root::read(
+        slot.node.file, slot.offset, reinterpret_cast<u8*>(address), count);
+    if (!result) {
+      return error(Errno::io);
+    }
+    count = result.value;
+  } else {
+    const char* contents = node_contents(slot.node);
+    if (contents == nullptr) {
+      return error(Errno::bad_file_descriptor);
+    }
+    memcpy(reinterpret_cast<void*>(address), contents + slot.offset, count);
+  }
   slot.offset += count;
   return static_cast<i32>(count);
 }
@@ -405,6 +1369,59 @@ void reset_descriptors() {
   return static_cast<i32>(record_size);
 }
 
+struct Ext4DirectoryState {
+  u32 address;
+  u32 capacity;
+  u32 start;
+  u32 cursor;
+  u32 next;
+  u32 total;
+  bool root;
+  bool full;
+};
+
+[[nodiscard]] bool emit_ext4_directory_entry(
+    void* context, const drivers::fs::root::Entry& entry) {
+  auto& state = *static_cast<Ext4DirectoryState*>(context);
+  const u32 index = state.cursor++;
+  if (index < state.start) {
+    return true;
+  }
+  if (state.root &&
+      (entry.name.equals("proc") || entry.name.equals("sys"))) {
+    state.next = index + 1;
+    return true;
+  }
+  constexpr u8 unknown_type = 0;
+  constexpr u8 directory_type = 4;
+  constexpr u8 regular_type = 8;
+  constexpr u8 symbolic_link_type = 10;
+  u8 type = unknown_type;
+  switch (entry.node.type) {
+    case drivers::fs::root::Type::directory:
+      type = directory_type;
+      break;
+    case drivers::fs::root::Type::regular:
+      type = regular_type;
+      break;
+    case drivers::fs::root::Type::symbolic_link:
+      type = symbolic_link_type;
+      break;
+    case drivers::fs::root::Type::other:
+      break;
+  }
+  const i32 result = emit_dirent(
+      state.address + state.total, state.capacity - state.total,
+      entry.node.inode, index + 1, type, entry.name.data);
+  if (result == 0) {
+    state.full = true;
+    return false;
+  }
+  state.total += static_cast<u32>(result);
+  state.next = index + 1;
+  return true;
+}
+
 [[maybe_unused, nodiscard]] i32 getdents64(u32 descriptor, u32 address,
                                           u32 size) {
   if (descriptor < 3 || descriptor >= 16 ||
@@ -416,19 +1433,66 @@ void reset_descriptors() {
     return error(Errno::bad_file_descriptor);
   }
   constexpr u8 directory_type = 4;
-  constexpr const char* root_entries[] = {".", "..", "proc"};
-  constexpr const char* proc_entries[] = {".", "..", "1", "2"};
-  const char* const* entries = root_entries;
-  u32 entry_count = 3;
-  if (slot.node == Node::proc_directory) {
-    entries = proc_entries;
-    entry_count = 4;
-  }
+  constexpr u8 regular_type = 8;
+  constexpr u32 overlay_start = 0xfffffff0u;
+  constexpr u32 end_of_directory = 0xffffffffu;
   u32 total = 0;
+  if (slot.node == Node::filesystem) {
+    if (slot.offset == end_of_directory) {
+      return 0;
+    }
+    const bool root = text_is(slot.path, "/");
+    if (slot.offset < overlay_start) {
+      Ext4DirectoryState state{address, size, slot.offset, 0, slot.offset,
+                               0, root, false};
+      const auto result = drivers::fs::root::for_each(
+          slot.node.file, &state, emit_ext4_directory_entry);
+      if (result != drivers::fs::Error::none) {
+        return error(Errno::io);
+      }
+      slot.offset = state.next;
+      total = state.total;
+      if (state.full) {
+        return static_cast<i32>(total);
+      }
+      slot.offset = root ? overlay_start : end_of_directory;
+    }
+    if (root) {
+      static constexpr struct {
+        const char* name;
+        PseudoFilesystem::Node node;
+      } overlays[] = {{"proc", PseudoFilesystem::Node::proc},
+                      {"sys", PseudoFilesystem::Node::sys}};
+      while (slot.offset - overlay_start < 2) {
+        const u32 index = slot.offset - overlay_start;
+        const i32 emitted = emit_dirent(
+            address + total, size - total,
+            PseudoFilesystem::inode(overlays[index].node), slot.offset + 1,
+            directory_type, overlays[index].name);
+        if (emitted == 0) {
+          break;
+        }
+        total += static_cast<u32>(emitted);
+        ++slot.offset;
+      }
+      if (slot.offset - overlay_start == 2) {
+        slot.offset = end_of_directory;
+      }
+    }
+    return static_cast<i32>(total);
+  }
+
+  const u32 entry_count =
+      PseudoFilesystem::entry_count(slot.node.pseudo_node);
   while (slot.offset < entry_count) {
-    const i32 result = emit_dirent(
-        address + total, size - total, slot.offset + 1, slot.offset + 1,
-        directory_type, entries[slot.offset]);
+    const auto entry =
+        PseudoFilesystem::entry(slot.node.pseudo_node, slot.offset);
+    const u8 type = entry.type == PseudoFilesystem::Type::directory
+                        ? directory_type
+                        : regular_type;
+    const i32 result = emit_dirent(address + total, size - total,
+                                   PseudoFilesystem::inode(entry.node),
+                                   slot.offset + 1, type, entry.name);
     if (result == 0) {
       break;
     }
@@ -465,13 +1529,25 @@ static_assert(sizeof(Stat64) == 128);
   constexpr u32 directory_mode = 0040000 | 0755;
   constexpr u32 regular_mode = 0100000 | 0444;
   constexpr u32 character_mode = 0020000 | 0666;
-  value.inode = static_cast<u32>(node);
-  value.mode = node == Node::none
+  constexpr u32 fifo_mode = 0010000 | 0666;
+  value.inode =
+      node == Node::filesystem
+          ? node.file.inode
+          : (node == Node::pseudo
+                 ? PseudoFilesystem::inode(node.pseudo_node)
+                 : static_cast<u32>(node.kind));
+  value.mode = node == Node::none || node == Node::pty
                    ? character_mode
-                   : (directory(node) ? directory_mode : regular_mode);
+                   : (node == Node::pipe
+                          ? fifo_mode
+                          : (node == Node::filesystem
+                                 ? node.file.mode
+                                 : (directory(node) ? directory_mode
+                                                    : regular_mode)));
   value.links = directory(node) ? 2 : 1;
   value.size = node_size(node);
   value.block_size = 4096;
+  value.blocks = (value.size + 511) / 512;
   memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
   return 0;
 }
@@ -480,7 +1556,7 @@ static_assert(sizeof(Stat64) == 128);
   if (descriptor < 3) {
     return write_stat(Node::none, address);
   }
-  if (descriptor >= 16) {
+  if (descriptor >= 16 || descriptors[descriptor - 3].node == Node::none) {
     return error(Errno::bad_file_descriptor);
   }
   return write_stat(descriptors[descriptor - 3].node, address);
@@ -517,19 +1593,30 @@ static_assert(sizeof(Statx) == 256);
   value.mask = 0x7ff;
   value.block_size = 4096;
   value.links = directory(node) ? 2 : 1;
-  value.mode = directory(node) ? directory_mode : regular_mode;
-  value.inode = static_cast<u32>(node);
+  value.mode = node == Node::filesystem
+                   ? node.file.mode
+                   : (directory(node) ? directory_mode : regular_mode);
+  value.inode =
+      node == Node::filesystem
+          ? node.file.inode
+          : (node == Node::pseudo
+                 ? PseudoFilesystem::inode(node.pseudo_node)
+                 : static_cast<u32>(node.kind));
   value.size = node_size(node);
+  value.blocks = (value.size + 511) / 512;
   memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
   return 0;
 }
 
-[[maybe_unused, nodiscard]] i32 readlinkat(u32 path, u32 address, u32 size) {
-  if (!user_string_is(path, "/proc/self/exe")) {
+[[maybe_unused, nodiscard]] i32 readlinkat(u32 directory_descriptor, u32 path,
+                                          u32 address, u32 size) {
+  char canonical[256]{};
+  static_cast<void>(path_node_at(directory_descriptor, path, canonical));
+  if (!text_is(canonical, "/proc/self/exe")) {
     return error(Errno::no_entry);
   }
-  constexpr char target[] = "/busybox";
-  constexpr u32 target_size = sizeof(target) - 1;
+  const char* target = process.executable_path;
+  const u32 target_size = text_size(target);
   const u32 count = size < target_size ? size : target_size;
   if (!user_memory.contains(address, count)) {
     return error(Errno::bad_address);
@@ -538,34 +1625,70 @@ static_assert(sizeof(Statx) == 256);
   return static_cast<i32>(count);
 }
 
-[[maybe_unused, nodiscard]] i32 ppoll64(u32 address, u32 count,
-                                       u32 timeout_address) {
+[[maybe_unused, nodiscard]] i32 ppoll(u32 address, u32 count,
+                                     u32 timeout_address, bool time64) {
   if (count > 16 ||
       !user_memory.contains(address, count * sizeof(Pollfd32))) {
     return error(Errno::bad_address);
   }
   u64 deadline = ~u64{0};
   if (timeout_address != 0) {
-    if (!user_memory.contains(timeout_address, sizeof(Timespec64))) {
-      return error(Errno::bad_address);
-    }
-    const auto timeout =
-        *reinterpret_cast<const Timespec64*>(timeout_address);
     constexpr u64 ticks_per_second = 10'000'000;
-    const u64 duration = timeout.seconds * ticks_per_second +
-                         static_cast<u32>(timeout.nanoseconds) / 100;
-    deadline = arch::time_ticks() + duration;
+    if (time64) {
+      if (!user_memory.contains(timeout_address, sizeof(Timespec64))) {
+        return error(Errno::bad_address);
+      }
+      const auto timeout =
+          *reinterpret_cast<const Timespec64*>(timeout_address);
+      deadline = arch::time_ticks() + timeout.seconds * ticks_per_second +
+                 static_cast<u32>(timeout.nanoseconds) / 100;
+    } else {
+      if (!user_memory.contains(timeout_address, sizeof(Timespec32))) {
+        return error(Errno::bad_address);
+      }
+      const auto timeout =
+          *reinterpret_cast<const Timespec32*>(timeout_address);
+      if (timeout.seconds < 0 || timeout.nanoseconds < 0) {
+        return error(Errno::invalid_argument);
+      }
+      deadline = arch::time_ticks() +
+                 static_cast<u32>(timeout.seconds) * ticks_per_second +
+                 static_cast<u32>(timeout.nanoseconds) / 100;
+    }
   }
-  auto* descriptors = reinterpret_cast<Pollfd32*>(address);
+  auto* poll_descriptors = reinterpret_cast<Pollfd32*>(address);
   for (;;) {
+    network::poll();
     i32 ready_count = 0;
     for (u32 i = 0; i < count; ++i) {
-      descriptors[i].returned_events = 0;
+      poll_descriptors[i].returned_events = 0;
       constexpr u16 poll_input = 1;
-      if (descriptors[i].descriptor == 0 &&
-          (descriptors[i].events & poll_input) != 0 &&
-          drivers::uart::ready()) {
-        descriptors[i].returned_events = poll_input;
+      constexpr u16 poll_output = 4;
+      constexpr u16 poll_error = 8;
+      constexpr u16 poll_invalid = 0x20;
+      const i32 descriptor = poll_descriptors[i].descriptor;
+      if (descriptor < 0) {
+        continue;
+      }
+      if (descriptor >= 16 ||
+          (descriptor_slot(static_cast<u32>(descriptor)) == nullptr &&
+           descriptor != 0 && descriptor != 1 && descriptor != 2)) {
+        poll_descriptors[i].returned_events = poll_invalid;
+      } else {
+        const u32 value = static_cast<u32>(descriptor);
+        if ((poll_descriptors[i].events & poll_input) != 0 &&
+            descriptor_read_ready(value)) {
+          poll_descriptors[i].returned_events |= poll_input;
+        }
+        if ((poll_descriptors[i].events & poll_output) != 0 &&
+            descriptor_write_ready(value)) {
+          poll_descriptors[i].returned_events |= poll_output;
+        }
+        if (descriptor_error_ready(value)) {
+          poll_descriptors[i].returned_events |= poll_error;
+        }
+      }
+      if (poll_descriptors[i].returned_events != 0) {
         ++ready_count;
       }
     }
@@ -575,24 +1698,130 @@ static_assert(sizeof(Statx) == 256);
   }
 }
 
+[[maybe_unused, nodiscard]] i32 pselect6(u32 count, u32 read_address,
+                                        u32 write_address, u32 error_address,
+                                        u32 timeout_address, bool time64) {
+  if (count > 16) {
+    return error(Errno::invalid_argument);
+  }
+  constexpr u32 set_size = sizeof(u32);
+  const u32 addresses[]{read_address, write_address, error_address};
+  for (u32 address : addresses) {
+    if (address != 0 && !user_memory.contains(address, set_size)) {
+      return error(Errno::bad_address);
+    }
+  }
+  const u32 requested_read =
+      read_address == 0 ? 0 : *reinterpret_cast<const u32*>(read_address);
+  const u32 requested_write =
+      write_address == 0 ? 0 : *reinterpret_cast<const u32*>(write_address);
+  const u32 requested_error =
+      error_address == 0 ? 0 : *reinterpret_cast<const u32*>(error_address);
+  u64 deadline = ~u64{0};
+  if (timeout_address != 0) {
+    constexpr u64 ticks_per_second = 10'000'000;
+    if (time64) {
+      if (!user_memory.contains(timeout_address, sizeof(Timespec64))) {
+        return error(Errno::bad_address);
+      }
+      const auto timeout =
+          *reinterpret_cast<const Timespec64*>(timeout_address);
+      deadline = arch::time_ticks() + timeout.seconds * ticks_per_second +
+                 static_cast<u32>(timeout.nanoseconds) / 100;
+    } else {
+      if (!user_memory.contains(timeout_address, sizeof(Timespec32))) {
+        return error(Errno::bad_address);
+      }
+      const auto timeout =
+          *reinterpret_cast<const Timespec32*>(timeout_address);
+      if (timeout.seconds < 0 || timeout.nanoseconds < 0) {
+        return error(Errno::invalid_argument);
+      }
+      deadline = arch::time_ticks() +
+                 static_cast<u32>(timeout.seconds) * ticks_per_second +
+                 static_cast<u32>(timeout.nanoseconds) / 100;
+    }
+  }
+  for (;;) {
+    network::poll();
+    u32 ready_read = 0;
+    u32 ready_write = 0;
+    u32 ready_error = 0;
+    i32 ready_count = 0;
+    for (u32 descriptor = 0; descriptor < count; ++descriptor) {
+      const u32 bit = 1u << descriptor;
+      bool ready = false;
+      if ((requested_read & bit) != 0) {
+        if (descriptor_read_ready(descriptor)) {
+          ready_read |= bit;
+          ready = true;
+        }
+      }
+      if ((requested_write & bit) != 0 &&
+          descriptor_write_ready(descriptor)) {
+        ready_write |= bit;
+        ready = true;
+      }
+      if ((requested_error & bit) != 0 &&
+          descriptor_error_ready(descriptor)) {
+        ready_error |= bit;
+        ready = true;
+      }
+      if (ready) {
+        ++ready_count;
+      }
+    }
+    if (ready_count != 0 || arch::time_ticks() >= deadline) {
+      if (read_address != 0) {
+        *reinterpret_cast<u32*>(read_address) = ready_read;
+      }
+      if (write_address != 0) {
+        *reinterpret_cast<u32*>(write_address) = ready_write;
+      }
+      if (error_address != 0) {
+        *reinterpret_cast<u32*>(error_address) = ready_error;
+      }
+      return ready_count;
+    }
+  }
+}
+
 [[maybe_unused, nodiscard]] i32 chdir(u32 path) {
-  const Node node = path_node(path);
-  if (node == Node::root_directory) {
-    process.cwd_proc = false;
-    return 0;
+  char canonical[256]{};
+  const Node node = path_node(path, canonical);
+  if (node == Node::none) {
+    return error(Errno::no_entry);
   }
-  if (node == Node::proc_directory) {
-    process.cwd_proc = true;
-    return 0;
+  if (!directory(node)) {
+    return error(Errno::not_directory);
   }
-  return node == Node::none ? error(Errno::no_entry)
-                            : error(Errno::invalid_argument);
+  memcpy(process.current_directory, canonical, sizeof(canonical));
+  return 0;
 }
 
 [[nodiscard]] i32 execve(TrapFrame& frame, u32 path, u32 argv) {
-  if (!parent.active || !user_string_is(path, "/proc/self/exe") ||
-      !user_memory.aligned(argv, alignof(u32))) {
+  char canonical[256]{};
+  Node node = path_node(path, canonical);
+  if (text_is(canonical, "/proc/self/exe")) {
+    u32 index = 0;
+    while (index != sizeof(canonical) - 1 &&
+           process.executable_path[index] != '\0') {
+      canonical[index] = process.executable_path[index];
+      ++index;
+    }
+    canonical[index] = '\0';
+    const auto executable = drivers::fs::root::lookup(canonical);
+    node = executable ? Node{executable.value} : Node{Node::none};
+  }
+  if (!parent.active || !user_memory.aligned(argv, alignof(u32))) {
+    return error(Errno::invalid_argument);
+  }
+  if (node == Node::none || node != Node::filesystem ||
+      node.file.type != drivers::fs::root::Type::regular) {
     return error(Errno::no_entry);
+  }
+  if ((node.file.mode & 0111) == 0) {
+    return error(Errno::access_denied);
   }
   constexpr u32 max_arguments = 16;
   constexpr u32 max_argument_size = 128;
@@ -614,25 +1843,47 @@ static_assert(sizeof(Statx) == 256);
     }
     arguments[count] = argument_storage[count];
   }
-  if (count == 0 || count == max_arguments || !save_parent_memory() ||
-      !replace_with_busybox(frame, arguments, count)) {
+  if (count == 0 || count == max_arguments || !save_parent_memory()) {
     return error(Errno::no_memory);
+  }
+  if (!replace_with_executable(frame, canonical, arguments, count)) {
+    return error(Errno::exec_format);
   }
   return 0;
 }
 
+[[nodiscard]] WaitableChild* waitable_for_wait4(u32 pid) {
+  const i32 selector = static_cast<i32>(pid);
+  for (auto& child : waitable_children) {
+    if (!child.used || child.parent_pid != process.pid) {
+      continue;
+    }
+    if (selector == -1 ||
+        (selector > 0 && child.pid == static_cast<u32>(selector)) ||
+        (selector == 0 && child.process_group == process.process_group) ||
+        (selector < -1 &&
+         child.process_group == static_cast<u32>(-selector))) {
+      return &child;
+    }
+  }
+  return nullptr;
+}
+
 [[nodiscard]] i32 wait4(u32 pid, u32 status) {
-  if (!parent.child_waitable || (pid != ~u32{0} && pid != 2)) {
-    return error(Errno::invalid_argument);
+  auto* child = waitable_for_wait4(pid);
+  if (child == nullptr) {
+    return error(Errno::no_child);
   }
   if (status != 0) {
     if (!user_memory.contains(status, sizeof(u32))) {
       return error(Errno::bad_address);
     }
-    *reinterpret_cast<u32*>(status) = parent.child_status << 8;
+    *reinterpret_cast<u32*>(status) = child->status << 8;
   }
-  parent.child_waitable = false;
-  return 2;
+  const u32 result = child->pid;
+  *child = {};
+  refresh_child_waitable();
+  return static_cast<i32>(result);
 }
 
 struct [[gnu::packed]] ChildSiginfo {
@@ -649,12 +1900,35 @@ struct [[gnu::packed]] ChildSiginfo {
 
 static_assert(sizeof(ChildSiginfo) == 128);
 
-[[nodiscard]] i32 waitid(u32 which, u32 pid, u32 address) {
+[[nodiscard]] i32 waitid(u32 which, u32 pid, u32 address, u32 options) {
   constexpr u32 all_children = 0;
   constexpr u32 specific_pid = 1;
-  if ((which != all_children && which != specific_pid) ||
-      (which == specific_pid && pid != 2) || !parent.child_waitable) {
+  constexpr u32 process_group = 2;
+  constexpr u32 no_hang = 1;
+  constexpr u32 nowait = 0x01000000;
+  if (which != all_children && which != specific_pid &&
+      which != process_group) {
     return error(Errno::invalid_argument);
+  }
+  WaitableChild* selected = nullptr;
+  for (auto& child : waitable_children) {
+    if (child.used && child.parent_pid == process.pid &&
+        (which == all_children ||
+         (which == specific_pid && child.pid == pid) ||
+         (which == process_group &&
+          child.process_group ==
+              (pid == 0 ? process.process_group : pid)))) {
+      selected = &child;
+      break;
+    }
+  }
+  if (selected == nullptr) {
+    if ((options & no_hang) != 0 &&
+        user_memory.contains(address, sizeof(ChildSiginfo))) {
+      memset(reinterpret_cast<void*>(address), 0, sizeof(ChildSiginfo));
+      return 0;
+    }
+    return error(Errno::no_child);
   }
   if (!user_memory.contains(address, sizeof(ChildSiginfo))) {
     return error(Errno::bad_address);
@@ -664,19 +1938,174 @@ static_assert(sizeof(ChildSiginfo) == 128);
   const ChildSiginfo information{sigchld,
                                  0,
                                  child_exited,
-                                 2,
+                                 static_cast<i32>(selected->pid),
                                  0,
-                                 static_cast<i32>(parent.child_status),
+                                 static_cast<i32>(selected->status),
                                  0,
                                  0,
                                  {}};
   memcpy(reinterpret_cast<void*>(address), &information,
          sizeof(information));
-  parent.child_waitable = false;
+  if ((options & nowait) == 0) {
+    *selected = {};
+    refresh_child_waitable();
+  }
   return 0;
 }
 
-#ifdef MIKOS_TRIBE_INTERACTIVE
+struct [[gnu::packed]] SignalAction32 {
+  u32 handler;
+  u32 flags;
+  u32 restorer;
+  u64 mask;
+};
+
+static_assert(sizeof(SignalAction32) == 20);
+
+[[nodiscard]] i32 rt_sigaction(u32 signal, u32 action_address,
+                               u32 old_address, u32 set_size) {
+  if (set_size != sizeof(u64) || signal > process_model::signal_max) {
+    return error(Errno::invalid_argument);
+  }
+  const auto number = static_cast<u8>(signal);
+  if (old_address != 0) {
+    if (!user_memory.contains(old_address, sizeof(SignalAction32))) {
+      return error(Errno::bad_address);
+    }
+    const auto old = signals.action(number);
+    const SignalAction32 output{old.handler, old.flags, old.restorer,
+                                old.mask};
+    memcpy(reinterpret_cast<void*>(old_address), &output, sizeof(output));
+  }
+  if (action_address == 0) {
+    return 0;
+  }
+  if (!user_memory.contains(action_address, sizeof(SignalAction32))) {
+    return error(Errno::bad_address);
+  }
+  SignalAction32 input{};
+  memcpy(&input, reinterpret_cast<const void*>(action_address), sizeof(input));
+  const process_model::SignalAction action{input.handler, input.flags,
+                                            input.restorer, input.mask};
+  switch (signals.set_action(number, action)) {
+    case process_model::SignalStatus::success:
+      return 0;
+    case process_model::SignalStatus::uncatchable:
+    case process_model::SignalStatus::invalid_signal:
+    case process_model::SignalStatus::invalid_operation:
+      return error(Errno::invalid_argument);
+  }
+  return error(Errno::invalid_argument);
+}
+
+[[nodiscard]] i32 rt_sigprocmask(u32 operation, u32 set_address,
+                                 u32 old_address, u32 set_size) {
+  if (set_size != sizeof(u64)) {
+    return error(Errno::invalid_argument);
+  }
+  if (old_address != 0) {
+    if (!user_memory.contains(old_address, sizeof(u64))) {
+      return error(Errno::bad_address);
+    }
+    *reinterpret_cast<u64*>(old_address) = signals.blocked();
+  }
+  if (set_address == 0) {
+    return 0;
+  }
+  if (!user_memory.contains(set_address, sizeof(u64))) {
+    return error(Errno::bad_address);
+  }
+  process_model::SignalMaskOperation selected{};
+  switch (operation) {
+    case 0:
+      selected = process_model::SignalMaskOperation::block;
+      break;
+    case 1:
+      selected = process_model::SignalMaskOperation::unblock;
+      break;
+    case 2:
+      selected = process_model::SignalMaskOperation::set;
+      break;
+    default:
+      return error(Errno::invalid_argument);
+  }
+  return signals.change_mask(selected,
+                             *reinterpret_cast<const u64*>(set_address)) ==
+                 process_model::SignalStatus::success
+             ? 0
+             : error(Errno::invalid_argument);
+}
+
+[[nodiscard]] i32 send_signal(u32 pid, u32 signal) {
+  if (signal > process_model::signal_max) {
+    return error(Errno::invalid_argument);
+  }
+  const bool current = pid == 0 || pid == process.pid || pid == ~u32{0};
+  const bool suspended_parent =
+      parent.active && pid == parent.parent_pid;
+  if (!current && !suspended_parent) {
+    return error(Errno::no_entry);
+  }
+  if (signal == 0) {
+    return 0;
+  }
+  auto& destination = suspended_parent ? parent.signals : signals;
+  return destination.queue(static_cast<u8>(signal)) ==
+                 process_model::SignalStatus::success
+             ? 0
+             : error(Errno::invalid_argument);
+}
+
+[[nodiscard]] i32 setpgid(u32 pid, u32 group) {
+  for (auto& child : waitable_children) {
+    if (child.used && child.parent_pid == process.pid && child.pid == pid) {
+      child.process_group = group == 0 ? pid : group;
+      if (pid == parent.child_pid) {
+        parent.child_process_group = child.process_group;
+      }
+      return 0;
+    }
+  }
+  if (pid != 0 && pid != process.pid) {
+    return error(Errno::no_entry);
+  }
+  const u32 selected = group == 0 ? process.pid : group;
+  if (process.session == process.pid) {
+    return error(Errno::access_denied);
+  }
+  if (selected != process.pid && selected != process.process_group &&
+      !(parent.active && selected == parent.process_group &&
+        process.session == parent.session)) {
+    return error(Errno::access_denied);
+  }
+  process.process_group = selected;
+  return 0;
+}
+
+[[nodiscard]] i32 getpgid(u32 pid, bool session) {
+  if (pid == 0 || pid == process.pid) {
+    return static_cast<i32>(session ? process.session : process.process_group);
+  }
+  if (parent.active && pid == parent.parent_pid) {
+    return static_cast<i32>(session ? parent.session : parent.process_group);
+  }
+  for (const auto& child : waitable_children) {
+    if (child.used && child.parent_pid == process.pid && child.pid == pid) {
+      return static_cast<i32>(session ? parent.session : child.process_group);
+    }
+  }
+  return error(Errno::no_entry);
+}
+
+[[nodiscard]] i32 setsid() {
+  if (process.process_group == process.pid) {
+    return error(Errno::access_denied);
+  }
+  process.process_group = process.pid;
+  process.session = process.pid;
+  return static_cast<i32>(process.pid);
+}
+
 struct [[gnu::packed]] Termios32 {
   u32 input_flags;
   u32 output_flags;
@@ -692,7 +2121,9 @@ struct [[gnu::packed]] Winsize {
   u16 horizontal_pixels;
   u16 vertical_pixels;
 };
-#endif
+
+static_assert(sizeof(Termios32) == sizeof(process_model::TermiosState));
+static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
 
 [[nodiscard]] TickTime tick_time() {
   constexpr u32 ticks_per_second = 10'000'000;
@@ -718,7 +2149,8 @@ struct [[gnu::packed]] Winsize {
                   remainder * 100};
 }
 
-[[nodiscard]] bool user_string_is(u32 address, const char* expected) {
+[[maybe_unused, nodiscard]] bool user_string_is(u32 address,
+                                                const char* expected) {
   for (u32 i = 0; i < 64; ++i) {
     if (address > user_end - i || !user_memory.contains(address + i, 1)) {
       return false;
@@ -819,14 +2251,89 @@ struct [[gnu::packed]] Winsize {
 }
 
 [[nodiscard]] i32 write(u32 descriptor, u32 address, u32 size) {
-  if (descriptor != 1 && descriptor != 2) {
-    return error(Errno::bad_file_descriptor);
-  }
   if (!user_memory.contains(address, size)) {
     return error(Errno::bad_address);
   }
-  uart_write(reinterpret_cast<const char*>(address), size);
-  return static_cast<i32>(size);
+  if ((descriptor == 1 || descriptor == 2) &&
+      standard_redirects[descriptor].node == Node::none) {
+    uart_write(reinterpret_cast<const char*>(address), size);
+    return static_cast<i32>(size);
+  }
+  Descriptor* selected = descriptor_slot(descriptor);
+  if (selected == nullptr) {
+    return error(Errno::bad_file_descriptor);
+  }
+  auto& slot = *selected;
+  if (slot.node == Node::standard_output) {
+    uart_write(reinterpret_cast<const char*>(address), size);
+    return static_cast<i32>(size);
+  }
+  if (slot.node == Node::network_socket) {
+    if (size == 0) {
+      return 0;
+    }
+    const auto result = network::socket_write(
+        slot.socket, reinterpret_cast<const u8*>(address), size);
+    return result.result == network::SocketResult::success
+               ? static_cast<i32>(result.size)
+               : socket_error(result.result);
+  }
+  if (slot.node == Node::pipe) {
+    if (slot.pipe_end != process_model::PipeEnd::write) {
+      return error(Errno::bad_file_descriptor);
+    }
+    const auto result = pipes.write(
+        slot.pipe, reinterpret_cast<const u8*>(address), size);
+    if (result.status == process_model::PipeStatus::success) {
+      return static_cast<i32>(result.size);
+    }
+    if (result.status == process_model::PipeStatus::broken_pipe) {
+      return error(Errno::broken_pipe);
+    }
+    if (result.status == process_model::PipeStatus::would_block) {
+      constexpr u32 nonblock = 0x800;
+      if ((slot.flags & nonblock) != 0) {
+        return error(Errno::try_again);
+      }
+      // The syscall is retried by the process-scheduler phase once a reader
+      // wakes this writer. Do not busy-loop a full pipe in the current phase.
+      return error(Errno::try_again);
+    }
+    return error(Errno::bad_file_descriptor);
+  }
+  if (slot.node == Node::pty) {
+    const auto result = ptys.write(slot.pty, slot.pty_end,
+                                   reinterpret_cast<const u8*>(address), size);
+    switch (result.status) {
+      case process_model::PtyStatus::success:
+        return static_cast<i32>(result.size);
+      case process_model::PtyStatus::would_block:
+        return error(Errno::try_again);
+      case process_model::PtyStatus::end_of_file:
+      case process_model::PtyStatus::io_error:
+        return error(Errno::io);
+      default:
+        return error(Errno::bad_file_descriptor);
+    }
+  }
+  if (slot.node == Node::pseudo &&
+      slot.node.pseudo_node == PseudoFilesystem::Node::dev_null) {
+    return static_cast<i32>(size);
+  }
+  if (slot.node != Node::filesystem || directory(slot.node) ||
+      (slot.flags & 3) == 0) {
+    return error(Errno::bad_file_descriptor);
+  }
+  if ((slot.flags & 0x400) != 0) {
+    slot.offset = node_size(slot.node);
+  }
+  const auto result = drivers::fs::root::write(
+      slot.node.file, slot.offset, reinterpret_cast<const u8*>(address), size);
+  if (!result) {
+    return error(Errno::io);
+  }
+  slot.offset += result.value;
+  return static_cast<i32>(result.value);
 }
 
 [[nodiscard]] i32 writev(u32 descriptor, u32 address, u32 count) {
@@ -851,7 +2358,9 @@ struct [[gnu::packed]] Winsize {
 }
 
 [[nodiscard]] i32 read(u32 descriptor, u32 address, u32 size) {
-  if (descriptor >= 3) {
+  if (descriptor >= 3 ||
+      (descriptor < 3 &&
+       standard_redirects[descriptor].node != Node::none)) {
     return read_virtual(descriptor, address, size);
   }
   if (descriptor != 0) {
@@ -865,6 +2374,7 @@ struct [[gnu::packed]] Winsize {
   }
   u8 data{};
   while (!drivers::uart::receive(data)) {
+    network::poll();
   }
 #ifdef MIKOS_TRIBE_INTERACTIVE
   auto echo_input = [](u8 value) {
@@ -891,14 +2401,12 @@ struct [[gnu::packed]] Winsize {
 }
 
 [[nodiscard]] i32 getcwd(u32 address, u32 size) {
-  const u32 required = process.cwd_proc ? 6 : 2;
+  const char* path = process.current_directory;
+  const u32 required = text_size(path) + 1;
   if (size < required || !user_memory.contains(address, size)) {
     return error(Errno::bad_address);
   }
-  auto* output = reinterpret_cast<char*>(address);
-  constexpr char root[] = "/";
-  constexpr char proc[] = "/proc";
-  memcpy(output, process.cwd_proc ? proc : root, required);
+  memcpy(reinterpret_cast<void*>(address), path, required);
   return static_cast<i32>(required);
 }
 
@@ -943,6 +2451,161 @@ struct [[gnu::packed]] Winsize {
   return error(Errno::not_a_tty);
 }
 #endif
+
+[[nodiscard]] i32 pty_ioctl(Descriptor& slot, u32 request, u32 address) {
+  constexpr u32 tcgets = 0x5401;
+  constexpr u32 tcsets = 0x5402;
+  constexpr u32 tcsetsw = 0x5403;
+  constexpr u32 tcsetsf = 0x5404;
+  constexpr u32 tiocsctty = 0x540e;
+  constexpr u32 tiocgpgrp = 0x540f;
+  constexpr u32 tiocspgrp = 0x5410;
+  constexpr u32 tiocgwinsz = 0x5413;
+  constexpr u32 tiocswinsz = 0x5414;
+  constexpr u32 tiocnotty = 0x5422;
+  constexpr u32 tiocgptn = 0x80045430;
+  constexpr u32 tiocsptlck = 0x40045431;
+  if (request == tiocgptn) {
+    if (slot.pty_end != process_model::PtyEnd::master ||
+        !user_memory.contains(address, sizeof(u32))) {
+      return error(Errno::bad_address);
+    }
+    *reinterpret_cast<u32*>(address) = slot.pty.slot;
+    return 0;
+  }
+  if (request == tiocsptlck) {
+    if (slot.pty_end != process_model::PtyEnd::master ||
+        !user_memory.contains(address, sizeof(i32))) {
+      return error(Errno::bad_address);
+    }
+    return ptys.set_locked(slot.pty,
+                           *reinterpret_cast<const i32*>(address) != 0) ==
+                   process_model::PtyStatus::success
+               ? 0
+               : error(Errno::bad_file_descriptor);
+  }
+  if (request == tcgets) {
+    const auto* state = ptys.termios(slot.pty);
+    if (state == nullptr ||
+        !user_memory.contains(address, sizeof(Termios32))) {
+      return error(Errno::bad_address);
+    }
+    memcpy(reinterpret_cast<void*>(address), state, sizeof(Termios32));
+    return 0;
+  }
+  if (request == tcsets || request == tcsetsw || request == tcsetsf) {
+    if (!user_memory.contains(address, sizeof(Termios32))) {
+      return error(Errno::bad_address);
+    }
+    process_model::TermiosState state{};
+    memcpy(&state, reinterpret_cast<const void*>(address), sizeof(state));
+    return ptys.set_termios(slot.pty, state) ==
+                   process_model::PtyStatus::success
+               ? 0
+               : error(Errno::bad_file_descriptor);
+  }
+  if (request == tiocgwinsz) {
+    const auto* window = ptys.window(slot.pty);
+    if (window == nullptr ||
+        !user_memory.contains(address, sizeof(Winsize))) {
+      return error(Errno::bad_address);
+    }
+    memcpy(reinterpret_cast<void*>(address), window, sizeof(Winsize));
+    return 0;
+  }
+  if (request == tiocswinsz) {
+    if (!user_memory.contains(address, sizeof(Winsize))) {
+      return error(Errno::bad_address);
+    }
+    process_model::WindowSize window{};
+    memcpy(&window, reinterpret_cast<const void*>(address), sizeof(window));
+    bool changed = false;
+    const auto result = ptys.set_window(slot.pty, window, &changed);
+    if (changed && ptys.foreground_group(slot.pty) != 0) {
+      static_cast<void>(signals.queue(process_model::signal_window_change));
+    }
+    return result == process_model::PtyStatus::success
+               ? 0
+               : error(Errno::bad_file_descriptor);
+  }
+  if (request == tiocsctty) {
+    if (slot.pty_end != process_model::PtyEnd::slave) {
+      return error(Errno::not_a_tty);
+    }
+    return ptys.acquire_controlling_terminal(
+               slot.pty, process.pid, process.process_group, process.session,
+               address != 0) == process_model::PtyStatus::success
+               ? 0
+               : error(Errno::access_denied);
+  }
+  if (request == tiocnotty) {
+    return ptys.detach(slot.pty, process.session) ==
+                   process_model::PtyStatus::success
+               ? 0
+               : error(Errno::access_denied);
+  }
+  if (request == tiocgpgrp) {
+    if (!user_memory.contains(address, sizeof(u32))) {
+      return error(Errno::bad_address);
+    }
+    *reinterpret_cast<u32*>(address) = ptys.foreground_group(slot.pty);
+    return 0;
+  }
+  if (request == tiocspgrp) {
+    if (!user_memory.contains(address, sizeof(u32))) {
+      return error(Errno::bad_address);
+    }
+    return ptys.set_foreground_group(
+               slot.pty, process.session,
+               *reinterpret_cast<const u32*>(address)) ==
+                   process_model::PtyStatus::success
+               ? 0
+               : error(Errno::access_denied);
+  }
+  return error(Errno::not_a_tty);
+}
+
+[[nodiscard]] i32 network_ioctl(u32 descriptor, u32 request, u32 address) {
+  if (descriptor < 3 || descriptor >= 16 ||
+      descriptors[descriptor - 3].node == Node::none) {
+    return error(Errno::bad_file_descriptor);
+  }
+  if (descriptors[descriptor - 3].node != Node::network_socket) {
+    return error(Errno::not_a_tty);
+  }
+  if (!user_memory.contains(address, sizeof(network::Ifreq32))) {
+    return error(Errno::bad_address);
+  }
+  network::Ifreq32 interface_request{};
+  memcpy(&interface_request, reinterpret_cast<const void*>(address),
+         sizeof(interface_request));
+  switch (network::interface_ioctl(request, interface_request)) {
+    case network::InterfaceControlResult::success:
+      memcpy(reinterpret_cast<void*>(address), &interface_request,
+             sizeof(interface_request));
+      return 0;
+    case network::InterfaceControlResult::no_device:
+      return error(Errno::no_device);
+    case network::InterfaceControlResult::invalid_argument:
+      return error(Errno::invalid_argument);
+    case network::InterfaceControlResult::unsupported:
+      return error(Errno::operation_not_supported);
+  }
+  return error(Errno::operation_not_supported);
+}
+
+[[nodiscard]] i32 ioctl(u32 descriptor, u32 request, u32 address) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  if (descriptor <= 2 && standard_redirects[descriptor].node == Node::none) {
+    return uart_ioctl(descriptor, request, address);
+  }
+#endif
+  if (auto* slot = descriptor_slot(descriptor);
+      slot != nullptr && slot->node == Node::pty) {
+    return pty_ioctl(*slot, request, address);
+  }
+  return network_ioctl(descriptor, request, address);
+}
 
 [[nodiscard]] i32 getrandom(u32 address, u32 size) {
   if (!user_memory.contains(address, size)) {
@@ -1001,6 +2664,34 @@ struct [[gnu::packed]] Winsize {
   return user_memory.contains(address, size) ? 0 : error(Errno::no_memory);
 }
 
+[[nodiscard]] i32 futex(u32 address, u32 operation, u32 expected) {
+  if (!user_memory.contains(address, sizeof(u32)) ||
+      !user_memory.aligned(address, alignof(u32))) {
+    return error(Errno::bad_address);
+  }
+  constexpr u32 command_mask = 0x7f;
+  constexpr u32 wait = 0;
+  constexpr u32 wake = 1;
+  constexpr u32 wait_bitset = 9;
+  constexpr u32 wake_bitset = 10;
+  switch (operation & command_mask) {
+    case wait:
+    case wait_bitset:
+      if (*reinterpret_cast<const u32*>(address) != expected) {
+        return error(Errno::try_again);
+      }
+      // The flat profile has one running thread. A successful spurious wake
+      // is permitted by Linux's futex contract and avoids blocking forever
+      // when libc probes its synchronization machinery.
+      return 0;
+    case wake:
+    case wake_bitset:
+      return 0;
+    default:
+      return error(Errno::no_syscall);
+  }
+}
+
 [[nodiscard]] i32 unknown(u32 number) {
 #ifndef MIKOS_TRIBE_INTERACTIVE
   write_text("MIKOS:ENOSYS ");
@@ -1033,60 +2724,91 @@ i32 dispatch_syscall(TrapFrame& frame) {
   const u32 a1 = frame.x[11];
   const u32 a2 = frame.x[12];
   const u32 a3 = frame.x[13];
-#ifdef MIKOS_TRIBE_INTERACTIVE
   const u32 a4 = frame.x[14];
-#endif
   switch (static_cast<Syscall>(number)) {
     case Syscall::getcwd:
       return getcwd(a0, a1);
+    case Syscall::dup3:
+      return duplicate_to(a0, a1, a2);
+    case Syscall::fcntl:
+      return fcntl(a0, a1, a2);
+    case Syscall::mkdirat:
+      return mkdirat(a0, a1, a2);
+    case Syscall::unlinkat:
+      return unlinkat(a0, a1, a2);
+    case Syscall::renameat:
+      return renameat(a0, a1, a2, a3);
+    case Syscall::renameat2:
+      return a4 == 0 ? renameat(a0, a1, a2, a3)
+                     : error(Errno::invalid_argument);
+    case Syscall::truncate:
+      return truncate_path(a0, a1);
+    case Syscall::ftruncate:
+      return ftruncate(a0, a1);
     case Syscall::write:
       return write(a0, a1, a2);
     case Syscall::writev:
       return writev(a0, a1, a2);
+    case Syscall::pselect6:
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      return pselect6(a0, a1, a2, a3, a4, false);
+#else
+      return unknown(number);
+#endif
+    case Syscall::ppoll:
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      return ppoll(a0, a1, a2, false);
+#else
+      return unknown(number);
+#endif
+    case Syscall::sync:
+      return drivers::fs::root::sync() == drivers::fs::Error::none
+                 ? 0
+                 : error(Errno::io);
+    case Syscall::fsync:
+    case Syscall::fdatasync:
+      if (a0 < 3 || a0 >= 16 ||
+          descriptors[a0 - 3].node == Node::none) {
+        return error(Errno::bad_file_descriptor);
+      }
+      return drivers::fs::root::sync() == drivers::fs::Error::none
+                 ? 0
+                 : error(Errno::io);
     case Syscall::read:
       return read(a0, a1, a2);
     case Syscall::chdir:
-#ifdef MIKOS_TRIBE_INTERACTIVE
       return chdir(a0);
-#else
-      return unknown(number);
-#endif
     case Syscall::faccessat:
-      return user_string_is(a1, ".") ? 0 : error(Errno::no_entry);
+      return path_node_at(a0, a1) == Node::none ? error(Errno::no_entry) : 0;
     case Syscall::openat:
-#ifdef MIKOS_TRIBE_INTERACTIVE
-      return openat(a1);
-#else
-      return error(Errno::no_entry);
-#endif
+      return openat(a0, a1, a2);
     case Syscall::close:
-#ifdef MIKOS_TRIBE_INTERACTIVE
       return close(a0);
-#else
-      return unknown(number);
-#endif
+    case Syscall::pipe2:
+      return pipe2(a0, a1);
     case Syscall::getdents64:
-#ifdef MIKOS_TRIBE_INTERACTIVE
       return getdents64(a0, a1, a2);
-#else
-      return unknown(number);
-#endif
     case Syscall::lseek:
-#ifdef MIKOS_TRIBE_INTERACTIVE
       if (a0 < 3 || a0 >= 16 ||
           descriptors[a0 - 3].node == Node::none) {
         return error(Errno::bad_file_descriptor);
       }
       descriptors[a0 - 3].offset = a1;
       return static_cast<i32>(a1);
-#else
-      return unknown(number);
-#endif
     case Syscall::exit:
     case Syscall::exit_group:
       if (parent.active) {
+        const u32 restored_child_pid = parent.child_pid;
+        if (child_tid_address != 0 &&
+            user_memory.contains(child_tid_address, sizeof(u32))) {
+          *reinterpret_cast<u32*>(child_tid_address) = 0;
+        }
+        child_tid_address = 0;
         restore_parent(frame, a0);
-        return 2;
+        // The trap handler stores the dispatch result in the restored a0.
+        // Returning a constant here made every fork after PID 2 appear to its
+        // parent as PID 2 even though waitid correctly reported the real PID.
+        return static_cast<i32>(restored_child_pid);
       }
       if (process.image == 0) {
         write_text("MIKOS:BUSYBOX_EXIT ");
@@ -1117,9 +2839,13 @@ i32 dispatch_syscall(TrapFrame& frame) {
       write_text("\n");
       shutdown(a0);
     case Syscall::waitid:
-      return waitid(a0, a1, a2);
+      return waitid(a0, a1, a2, a3);
     case Syscall::set_tid_address:
-      return 1;
+      child_tid_address = a0;
+      return static_cast<i32>(process.pid);
+    case Syscall::futex:
+    case Syscall::futex_time64:
+      return futex(a0, a1, a2);
     case Syscall::set_robust_list:
       return 0;
     case Syscall::rseq:
@@ -1128,7 +2854,9 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::gettid:
       return static_cast<i32>(process.pid);
     case Syscall::getppid:
-      return process.pid == 1 ? 0 : 1;
+      return parent.active && process.pid == parent.child_pid
+                 ? static_cast<i32>(parent.parent_pid)
+                 : 0;
     case Syscall::getuid:
     case Syscall::geteuid:
     case Syscall::getgid:
@@ -1143,7 +2871,7 @@ i32 dispatch_syscall(TrapFrame& frame) {
       }
       return static_cast<i32>(process.brk);
     case Syscall::clone:
-      return clone(frame, a0, a1);
+      return clone(frame, a0, a1, a4);
     case Syscall::execve:
       return execve(frame, a0, a1);
     case Syscall::wait4:
@@ -1156,14 +2884,13 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::riscv_hwprobe:
       return error(Errno::no_syscall);
     case Syscall::statx:
-#ifdef MIKOS_TRIBE_INTERACTIVE
       if (user_string_is(a1, "") && a0 >= 3 && a0 < 16) {
+        if (descriptors[a0 - 3].node == Node::none) {
+          return error(Errno::bad_file_descriptor);
+        }
         return write_statx(descriptors[a0 - 3].node, a4);
       }
-      return write_statx(path_node(a1), a4);
-#else
-      return unknown(number);
-#endif
+      return write_statx(path_node_at(a0, a1), a4);
     case Syscall::getrandom:
       return getrandom(a0, a1);
     case Syscall::clock_gettime32:
@@ -1178,7 +2905,13 @@ i32 dispatch_syscall(TrapFrame& frame) {
 #endif
     case Syscall::ppoll64:
 #ifdef MIKOS_TRIBE_INTERACTIVE
-      return ppoll64(a0, a1, a2);
+      return ppoll(a0, a1, a2, true);
+#else
+      return unknown(number);
+#endif
+    case Syscall::pselect6_time64:
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      return pselect6(a0, a1, a2, a3, a4, true);
 #else
       return unknown(number);
 #endif
@@ -1186,10 +2919,30 @@ i32 dispatch_syscall(TrapFrame& frame) {
       return gettimeofday(a0);
     case Syscall::uname:
       return uname(a0);
+    case Syscall::umask:
+      return umask(a0);
     case Syscall::getcpu:
       return getcpu(a0, a1);
     case Syscall::sysinfo:
       return sysinfo(a0);
+    case Syscall::socket:
+      return socket(a0, a1, a2);
+    case Syscall::bind:
+      return bind(a0, a1, a2);
+    case Syscall::listen:
+      return listen(a0, a1);
+    case Syscall::accept:
+      return accept(a0, a1, a2, 0);
+    case Syscall::accept4:
+      return accept(a0, a1, a2, a3);
+    case Syscall::getsockname:
+      return socket_name(a0, a1, a2, false);
+    case Syscall::getpeername:
+      return socket_name(a0, a1, a2, true);
+    case Syscall::setsockopt:
+      return setsockopt(a0, a3, a4);
+    case Syscall::shutdown:
+      return shutdown_socket(a0, a1);
     case Syscall::getrusage:
       if (!user_memory.contains(a1, 72)) {
         return error(Errno::bad_address);
@@ -1212,40 +2965,41 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::prlimit64:
       return prlimit(a3);
     case Syscall::ioctl:
-#ifdef MIKOS_TRIBE_INTERACTIVE
-      return uart_ioctl(a0, a1, a2);
-#else
-      return error(Errno::not_a_tty);
-#endif
+      return ioctl(a0, a1, a2);
     case Syscall::rt_sigaction:
+      return rt_sigaction(a0, a1, a2, a3);
     case Syscall::rt_sigprocmask:
+      return rt_sigprocmask(a0, a1, a2, a3);
     case Syscall::sigaltstack:
       return 0;
+    case Syscall::kill:
+      return send_signal(a0, a1);
+    case Syscall::tgkill:
+      return a0 == process.pid ? send_signal(a1, a2)
+                               : error(Errno::no_entry);
+    case Syscall::rt_sigreturn:
+      return unknown(number);
+    case Syscall::setpgid:
+      return setpgid(a0, a1);
+    case Syscall::getpgid:
+      return getpgid(a0, false);
+    case Syscall::getsid:
+      return getpgid(a0, true);
+    case Syscall::setsid:
+      return setsid();
     case Syscall::statfs64:
       return unknown(number);
     case Syscall::readlinkat:
-#ifdef MIKOS_TRIBE_INTERACTIVE
-      return readlinkat(a1, a2, a3);
-#else
-      return unknown(number);
-#endif
+      return readlinkat(a0, a1, a2, a3);
     case Syscall::fstatat64: {
-#ifdef MIKOS_TRIBE_INTERACTIVE
       const Node node = user_string_is(a1, "") && a0 >= 3 && a0 < 16
                             ? descriptors[a0 - 3].node
-                            : path_node(a1);
+                            : path_node_at(a0, a1);
       return node == Node::none ? error(Errno::no_entry)
                                 : write_stat(node, a2);
-#else
-      return unknown(number);
-#endif
     }
     case Syscall::fstat64:
-#ifdef MIKOS_TRIBE_INTERACTIVE
       return fstat64(a0, a1);
-#else
-      return unknown(number);
-#endif
   }
   return unknown(number);
 }

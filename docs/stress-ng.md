@@ -1,7 +1,8 @@
 # RV32 stress-ng integration
 
-Mikos bundles BusyBox and a static RV32 stress-ng in the same kernel image. The
-boot acceptance test runs them sequentially in the single flat user region:
+Mikos stores BusyBox and a static RV32 stress-ng in one ext4 root image. The
+kernel mounts that image read-write and runs `/bin/busybox` and
+`/bin/stress-ng` sequentially in the single flat user region:
 
 ```text
 busybox echo MIKOS_BUSYBOX_OK
@@ -25,9 +26,17 @@ commit. The integration was developed against commit
 into `build/tests/busybox/stress-ng-source`, applies
 `tests/busybox/patches/stress-ng-mikos.patch` to the build copy, and creates a
 stripped, static RV32 Linux ELF linked at `0x81000000`. The upstream checkout
-remains unmodified. `make kernel` requests both test payloads, converts them to
-linkable binary objects, and embeds them in `mikos-rv32.elf` for the current
-acceptance image.
+remains unmodified. `make kernel` requests
+`build/tests/busybox/rootfs.ext4`; neither executable is converted to a linker
+object or embedded in `mikos-rv32.elf`.
+
+QEMU reads the image through a polling modern virtio-blk driver and Tribe reads
+the same sectors through its SD DMA controller. The interactive shell resolves
+ordinary absolute and relative paths through that ext4 volume and can execute
+static RV32 ELF files found there. When a child exits, BusyBox is restored from
+the ext4 file before the saved writable process state is applied. Launch a
+session with `tests/tribe/tribe_interactive.sh`; `cd /bin` followed by
+`./stress-ng ...` therefore follows the same path semantics as Linux.
 
 Run the complete acceptance path with:
 
@@ -39,15 +48,19 @@ make qemu-test
 
 ## Supported scope
 
-The `rv32-flat` profile has one process and intentionally provides no `fork`,
-filesystem, or general signal delivery. Normal stress-ng launches every worker
-with `fork`, so the build-only `STRESS_MIKOS` path runs the one requested worker
+The `rv32-flat` stress acceptance still runs one worker in place. The
+interactive profile now has a bounded serial fork/exec/wait adapter, but no
+concurrent runnable process scheduler, handler-frame signal delivery, or every
+Linux filesystem feature. Its root
+filesystem is a generic writable ext4 mount for the deliberately journal-free,
+metadata-checksum-free test format. Normal stress-ng launches every worker with
+`fork`, so the build-only `STRESS_MIKOS` path runs the one requested worker
 in-process while retaining upstream option parsing, setup, CPU stressor,
 verification, metrics, status accounting, and cleanup. It is enabled only for
 the Mikos build and does not alter stress-ng's normal launcher.
 
 This is a real CPU-stressor compatibility test, not a claim that the full
-stress-ng suite works. Stressors requiring processes, threads, filesystems,
-devices, networking, `/proc`, or signal delivery remain outside this POC's
-supported behavior. Unsupported discovery calls return Linux errors and remain
-visible as `MIKOS:ENOSYS` trace records.
+stress-ng suite works. Stressors requiring concurrent processes, threads,
+unimplemented filesystem/device behavior, or handler-frame signal delivery
+remain outside this POC's supported behavior. Unsupported discovery calls
+return Linux errors and remain visible as `MIKOS:ENOSYS` trace records.

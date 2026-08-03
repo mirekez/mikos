@@ -1,4 +1,4 @@
-#include <mikos/drivers/virtio.hpp>
+#include <drivers/net/virtio.hpp>
 
 #include <support/test.hpp>
 
@@ -19,6 +19,19 @@ int main() {
   MIKOS_CHECK(suite, accepted.low() == 1u << 5);
   MIKOS_CHECK(suite, accepted.high() == 1);
   MIKOS_CHECK(suite, !absent.contains(Feature::mac));
+
+  mikos::drivers::virtio::SplitQueue<4> queue;
+  queue.reset();
+  mikos::u8 first[4]{};
+  mikos::u8 second[8]{};
+  queue.describe(0, first, sizeof(first),
+                 mikos::drivers::virtio::Access::device_reads, 1);
+  queue.describe(1, second, sizeof(second),
+                 mikos::drivers::virtio::Access::device_writes);
+  MIKOS_CHECK(suite, queue.descriptor(0).flags == 1);
+  MIKOS_CHECK(suite, queue.descriptor(0).next == 1);
+  MIKOS_CHECK(suite, queue.descriptor(1).flags == 2);
+  MIKOS_CHECK(suite, queue.descriptor(1).next == 0);
 
   return suite.finish();
 }

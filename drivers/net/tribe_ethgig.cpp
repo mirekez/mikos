@@ -1,4 +1,4 @@
-#include <mikos/drivers/net.hpp>
+#include <drivers/net/net.hpp>
 
 namespace mikos::drivers::net {
 namespace {

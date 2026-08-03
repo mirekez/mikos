@@ -1,4 +1,4 @@
-#include <mikos/drivers/uart.hpp>
+#include <drivers/uart/uart.hpp>
 
 namespace mikos::drivers::uart {
 namespace {

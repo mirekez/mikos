@@ -60,6 +60,47 @@ extern "C" void* memset(void* destination, int value, mikos::usize size) {
   return destination;
 }
 
+namespace {
+
+[[nodiscard]] mikos::u64 divide_u64(mikos::u64 dividend,
+                                    mikos::u64 divisor,
+                                    mikos::u64* remainder) {
+  if (divisor == 0) {
+    for (;;) {
+      asm volatile("wfi");
+    }
+  }
+  mikos::u64 quotient = 0;
+  mikos::u64 current = 0;
+  for (mikos::u32 bit = 0; bit < 64; ++bit) {
+    current = (current << 1) | (dividend >> 63);
+    dividend <<= 1;
+    quotient <<= 1;
+    if (current >= divisor) {
+      current -= divisor;
+      quotient |= 1;
+    }
+  }
+  if (remainder != nullptr) {
+    *remainder = current;
+  }
+  return quotient;
+}
+
+}  // namespace
+
+extern "C" mikos::u64 __udivdi3(mikos::u64 dividend,
+                                  mikos::u64 divisor) {
+  return divide_u64(dividend, divisor, nullptr);
+}
+
+extern "C" mikos::u64 __umoddi3(mikos::u64 dividend,
+                                  mikos::u64 divisor) {
+  mikos::u64 remainder{};
+  static_cast<void>(divide_u64(dividend, divisor, &remainder));
+  return remainder;
+}
+
 extern "C" int memcmp(const void* left, const void* right, mikos::usize size) {
   const auto* a = static_cast<const mikos::u8*>(left);
   const auto* b = static_cast<const mikos::u8*>(right);

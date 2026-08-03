@@ -8,6 +8,7 @@ peer_socket="$runtime/peer.sock"
 log="$root/build/qemu-net-test.log"
 qemu="$root/build/qemu/qemu-system-riscv32"
 kernel="$root/build/mikos-rv32.elf"
+rootfs="$root/build/tests/busybox/rootfs.ext4"
 
 cleanup() {
   if [[ -n "${qemu_pid:-}" ]]; then
@@ -20,6 +21,8 @@ trap cleanup EXIT
 timeout 20 "$qemu" -machine virt -m 64M -bios none -nographic \
   -monitor none -serial stdio -no-reboot -kernel "$kernel" \
   -global virtio-mmio.force-legacy=false \
+  -drive if=none,format=raw,readonly=on,id=mikos-root,file="$rootfs" \
+  -device virtio-blk-device,drive=mikos-root \
   -netdev dgram,id=net0,local.type=unix,local.path="$qemu_socket",remote.type=unix,remote.path="$peer_socket" \
   -device virtio-net-device,netdev=net0,mac=52:54:00:12:34:56 \
   >"$log" 2>&1 &
@@ -44,7 +47,8 @@ fi
 wait "$qemu_pid"
 qemu_pid=""
 
-if ! rg -q '^MIKOS:NET_IP 10\.0\.2\.15$' "$log" ||
+if ! rg -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
+   ! rg -q '^MIKOS:NET_IP 10\.0\.2\.15$' "$log" ||
    ! rg -q '^MIKOS:NET_MAC 52:54:00:12:34:56$' "$log" ||
    ! rg -q '^MIKOS:ARP_REPLY$' "$log" ||
    ! rg -q '^MIKOS:ICMP_ECHO_REPLY$' "$log" ||

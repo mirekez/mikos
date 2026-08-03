@@ -79,6 +79,8 @@ done
 git -C "$source_tree" apply "$root/tests/tribe/patches/no-isr-csr-time.patch"
 git -C "$source_tree" apply \
   "$root/tests/tribe/patches/polling-dma-invalidate.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/preserve-host-control-frames.patch"
 
 "$toolchain/bin/cmake" -S "$source_tree" -B "$build_tree" \
   -G "Unix Makefiles" \

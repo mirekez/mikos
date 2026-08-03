@@ -19,6 +19,7 @@ enum class Status : u32 {
 
 enum class Feature : u8 {
   mac = 5,
+  block_flush = 9,
   version_1 = 32,
 };
 
@@ -118,9 +119,12 @@ class alignas(16) SplitQueue {
   }
 
   constexpr void describe(u16 id, const void* address, u32 length,
-                          Access access) {
+                          Access access, u16 next = Size) {
+    const u16 chain = next < Size ? 1u : 0u;
     descriptors_[id] = Descriptor{reinterpret_cast<usize>(address), length,
-                                  static_cast<u16>(access), 0};
+                                  static_cast<u16>(
+                                      static_cast<u16>(access) | chain),
+                                  static_cast<u16>(next < Size ? next : 0)};
   }
 
   template <typename Barrier>
@@ -154,6 +158,10 @@ class alignas(16) SplitQueue {
 
   [[nodiscard]] constexpr usize used_address() const {
     return reinterpret_cast<usize>(&used_);
+  }
+
+  [[nodiscard]] constexpr const Descriptor& descriptor(u16 id) const {
+    return descriptors_[id];
   }
 
  private:

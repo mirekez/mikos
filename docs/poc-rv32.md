@@ -1,10 +1,14 @@
 # RV32 BusyBox POC
 
-The first proof of concept intentionally has:
+The current proof of concept has:
 
-- one process that runs static BusyBox and stress-ng images in sequence;
-- no scheduler or context switch;
-- no filesystem, `fork`, or `exec`;
+- one materialized flat user image plus one bounded suspended-parent snapshot;
+- no runnable multi-process scheduler or arbitrary process context switch;
+- a writable ext4 boot volume for the gated no-journal/no-metadata-checksum
+  format;
+- ordinary glibc fork-shaped `clone`, vfork-shaped `clone`, `execve`, `pipe2`,
+  group-aware wait/reap, signal masks/actions, sessions/groups, and bounded PTY
+  mechanisms; the live adapter still serializes parent and child execution;
 - one flat physical user region from `0x81000000` to `0x82000000`;
 - M-mode kernel and U-mode application;
 - PMP denying U-mode access to the kernel and devices;
@@ -29,6 +33,7 @@ export PATH="$PWD/.conda/bin:$PATH"
 make test
 make busybox
 make stress-ng
+make -C tests/busybox rootfs
 make kernel
 make qemu-test
 ```
@@ -61,6 +66,15 @@ The QEMU test requires a nonzero preemption count and zero timer-contract
 violations. The timer handler only rearms the timer and changes bounded state;
 it performs no device work, allocation, formatting, logging, or blocking.
 
-After BusyBox exits, the kernel replaces its syscall trap frame and reloads the
-stress-ng ELF into the same flat user region. Details and limitations are in
-[stress-ng.md](stress-ng.md).
+After BusyBox exits, the kernel replaces its syscall trap frame and loads the
+stress-ng ELF from `/bin/stress-ng` in the attached ext4 image into the same
+flat user region. Details and limitations are in [stress-ng.md](stress-ng.md).
+
+The interactive Tribe profile additionally snapshots the parent's writable,
+anonymous, and stack regions before a child runs, retains inherited descriptor
+resources, reloads the parent's BusyBox text, and restores its saved regions on
+child exit. This is enough for bounded shell pipelines and proves parent/child
+data and fd-10 preservation. It is not concurrent fork: a child that blocks on
+a full pipe cannot yet yield to its suspended parent, and nested/background
+process ordering awaits the runnable process table described in
+[process-ipc-tty-plan.md](process-ipc-tty-plan.md).

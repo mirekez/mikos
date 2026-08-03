@@ -1,8 +1,6 @@
 #include <mikos/arch.hpp>
-#include <mikos/drivers/uart.hpp>
-#ifdef MIKOS_TRIBE
-#include <mikos/drivers/tribe_sd.hpp>
-#endif
+#include <drivers/fs/root.hpp>
+#include <drivers/uart/uart.hpp>
 #include <mikos/kernel.hpp>
 
 extern "C" void* memcpy(void*, const void*, mikos::usize);
@@ -64,48 +62,73 @@ struct Aux {
   u32 value;
 };
 
-[[nodiscard]] bool valid_elf(const ElfHeader& header, u32 blob_size) {
+[[nodiscard]] bool valid_elf(const ElfHeader& header, u32 file_size) {
   return header.ident[0] == 0x7f && header.ident[1] == 'E' &&
          header.ident[2] == 'L' && header.ident[3] == 'F' &&
          header.ident[4] == 1 && header.ident[5] == 1 && header.type == 2 &&
          header.machine == 243 &&
+         user_memory.contains(header.entry, 1) &&
          header.program_entry_size == sizeof(ProgramHeader) &&
-         header.program_offset <= blob_size &&
+         header.program_offset <= file_size &&
          header.program_count <=
-             (blob_size - header.program_offset) / sizeof(ProgramHeader);
+             (file_size - header.program_offset) / sizeof(ProgramHeader);
 }
 
-[[nodiscard]] Image load_image(const u8* blob, u32 blob_size,
-                               bool writable_only = false) {
-  const auto& header = *reinterpret_cast<const ElfHeader*>(blob);
-  if (!valid_elf(header, blob_size)) {
-    write_text("MIKOS:BAD_ELF\n");
-    shutdown(1);
+[[nodiscard]] bool read_file(const drivers::fs::root::Node& file, u32 offset,
+                             void* output, u32 size) {
+  const auto result = drivers::fs::root::read(
+      file, offset, reinterpret_cast<u8*>(output), size);
+  return result && result.value == size;
+}
+
+[[nodiscard]] bool load_image(const drivers::fs::root::Node& file,
+                              Image& image, bool writable_only = false) {
+  if (file.type != drivers::fs::root::Type::regular ||
+      file.size > 0xffffffffu) {
+    return false;
+  }
+  const u32 file_size = static_cast<u32>(file.size);
+  ElfHeader header{};
+  if (file_size < sizeof(header) ||
+      !read_file(file, 0, &header, sizeof(header)) ||
+      !valid_elf(header, file_size)) {
+    return false;
   }
 
   u32 image_end = user_begin;
   u32 mutable_begin = user_end;
-  const auto* programs = reinterpret_cast<const ProgramHeader*>(
-      blob + header.program_offset);
+  u32 program_headers = 0;
+  // Validate every loadable segment before overwriting the current image.
   for (u32 i = 0; i < header.program_count; ++i) {
-    const auto& segment = programs[i];
+    ProgramHeader segment{};
+    const u32 program_offset =
+        header.program_offset + i * sizeof(ProgramHeader);
+    if (!read_file(file, program_offset, &segment, sizeof(segment))) {
+      return false;
+    }
+    constexpr u32 interpreter = 3;
+    if (segment.type == interpreter) {
+      return false;
+    }
     if (segment.type != 1) {
       continue;
     }
     if (segment.file_size > segment.memory_size ||
-        segment.offset > blob_size ||
-        segment.file_size > blob_size - segment.offset ||
+        segment.offset > file_size ||
+        segment.file_size > file_size - segment.offset ||
         !user_memory.contains(segment.virtual_address, segment.memory_size)) {
-      write_text("MIKOS:BAD_SEGMENT\n");
-      shutdown(2);
+      return false;
+    }
+    const u32 program_table_size =
+        header.program_count * sizeof(ProgramHeader);
+    if (header.program_offset >= segment.offset &&
+        program_table_size <= segment.file_size &&
+        header.program_offset - segment.offset <=
+            segment.file_size - program_table_size) {
+      program_headers =
+          segment.virtual_address + header.program_offset - segment.offset;
     }
     constexpr u32 writable = 2;
-    if (!writable_only || (segment.flags & writable) != 0) {
-      auto* destination = reinterpret_cast<void*>(segment.virtual_address);
-      memcpy(destination, blob + segment.offset, segment.file_size);
-      memset(reinterpret_cast<u8*>(destination) + segment.file_size, 0,
-             segment.memory_size - segment.file_size);
-    }
     const u32 end = segment.virtual_address + segment.memory_size;
     if (end > image_end) {
       image_end = end;
@@ -116,32 +139,56 @@ struct Aux {
     }
   }
 
-  const u32 program_headers =
-      user_begin + header.program_offset;
-  return Image{header.entry,
-               program_headers,
-               header.program_count,
-               align_up(image_end, static_cast<u32>(4096)),
-               mutable_begin};
+  if (program_headers == 0) {
+    return false;
+  }
+
+  for (u32 i = 0; i < header.program_count; ++i) {
+    ProgramHeader segment{};
+    const u32 program_offset =
+        header.program_offset + i * sizeof(ProgramHeader);
+    if (!read_file(file, program_offset, &segment, sizeof(segment))) {
+      return false;
+    }
+    constexpr u32 load = 1;
+    constexpr u32 writable = 2;
+    if (segment.type != load ||
+        (writable_only && (segment.flags & writable) == 0)) {
+      continue;
+    }
+    auto* destination = reinterpret_cast<u8*>(segment.virtual_address);
+    if (!read_file(file, segment.offset, destination, segment.file_size)) {
+      return false;
+    }
+    memset(destination + segment.file_size, 0,
+           segment.memory_size - segment.file_size);
+  }
+  image = Image{header.entry,
+                program_headers,
+                header.program_count,
+                align_up(image_end, static_cast<u32>(4096)),
+                mutable_begin};
+  return true;
 }
 
-[[nodiscard]] Image load_busybox() {
-  const auto* blob = _binary_busybox_busybox_start;
-  return load_image(
-      blob, static_cast<u32>(_binary_busybox_busybox_end - blob));
+void copy_path(char* output, const char* input) {
+  u32 index = 0;
+  while (index != 255 && input[index] != '\0') {
+    output[index] = input[index];
+    ++index;
+  }
+  output[index] = '\0';
 }
 
-[[nodiscard]] Image restart_busybox() {
-  const auto* blob = _binary_busybox_busybox_start;
-  return load_image(
-      blob, static_cast<u32>(_binary_busybox_busybox_end - blob), true);
-}
-
-[[nodiscard]] Image load_stress_ng() {
-  const auto* blob = _binary_stress_ng_source_stress_ng_start;
-  return load_image(
-      blob,
-      static_cast<u32>(_binary_stress_ng_source_stress_ng_end - blob));
+[[nodiscard]] Image required_image(const char* path,
+                                   bool writable_only = false) {
+  const auto node = drivers::fs::root::lookup(path);
+  Image image{};
+  if (!node || !load_image(node.value, image, writable_only)) {
+    write_text("MIKOS:BAD_ELF\n");
+    shutdown(1);
+  }
+  return image;
 }
 
 [[nodiscard]] u32 copy_string_down(u32 cursor, const char* text) {
@@ -251,51 +298,64 @@ void disable_interrupt_controllers() {
 Process process{};
 Scheduler scheduler{};
 
-bool replace_with_busybox(TrapFrame& frame, const char* const* arguments,
-                          u32 argument_count) {
-  if (argument_count == 0 || argument_count > 16) {
+bool replace_with_executable(TrapFrame& frame, const char* path,
+                             const char* const* arguments,
+                             u32 argument_count) {
+  if (path == nullptr || argument_count == 0 || argument_count > 16) {
     return false;
   }
-  const auto image = restart_busybox();
+  const auto node = drivers::fs::root::lookup(path);
+  if (!node || node.value.type != drivers::fs::root::Type::regular ||
+      (node.value.mode & 0111) == 0) {
+    return false;
+  }
+  const auto busybox_node = drivers::fs::root::lookup("/bin/busybox");
+  const bool busybox = busybox_node &&
+                       busybox_node.value.inode == node.value.inode;
+  Image image{};
+  if (!load_image(node.value, image, busybox)) {
+    return false;
+  }
   process.brk = image.brk;
   process.mutable_begin = image.mutable_begin;
-  process.mmap_cursor = 0x81800000;
+  if (busybox) {
+    process.mmap_cursor = 0x81800000;
+  } else {
+    constexpr u32 heap_reserve = 512 * 1024;
+    if (process.brk > user_stack_top - heap_reserve) {
+      return false;
+    }
+    process.mmap_cursor = align_up(process.brk + heap_reserve,
+                                   static_cast<u32>(4096));
+  }
   const u32 stack = make_initial_stack(image, arguments, argument_count);
   for (auto& value : frame.x) {
     value = 0;
   }
   frame.x[2] = stack;
   frame.mepc = image.entry;
-  process.image = 0;
+  process.image = busybox ? 0 : 1;
+  copy_path(process.executable_path, path);
   process.image_replaced = true;
   return true;
 }
 
+void restore_busybox_image() {
+  static_cast<void>(required_image("/bin/busybox"));
+}
+
 void start_stress_ng(TrapFrame& frame) {
-  const auto image = load_stress_ng();
-  process.brk = image.brk;
-  process.mutable_begin = image.mutable_begin;
-  constexpr u32 heap_reserve = 512 * 1024;
-  if (process.brk > user_stack_top - heap_reserve) {
-    write_text("MIKOS:STRESS_NG_MEMORY_BAD\n");
-    shutdown(7);
-  }
-  process.mmap_cursor = align_up(process.brk + heap_reserve,
-                                 static_cast<u32>(4096));
   constexpr const char* arguments[] = {
       "stress-ng", "--cpu",        "1", "--cpu-method", "loop",
       "--cpu-ops", "4",            "--verify",
       "--metrics-brief",
   };
-  const u32 stack = make_initial_stack(
-      image, arguments, sizeof(arguments) / sizeof(arguments[0]));
-  for (auto& value : frame.x) {
-    value = 0;
+  if (!replace_with_executable(
+          frame, "/bin/stress-ng", arguments,
+          sizeof(arguments) / sizeof(arguments[0]))) {
+    write_text("MIKOS:STRESS_NG_ARGUMENTS_BAD\n");
+    shutdown(6);
   }
-  frame.x[2] = stack;
-  frame.mepc = image.entry;
-  process.image = 1;
-  process.image_replaced = true;
 }
 
 void uart_put(char value) {
@@ -361,33 +421,42 @@ extern "C" void kernel_main() {
     shutdown(3);
   }
   write_text("MIKOS:FLAT_DEVICE_IRQ_OFF\n");
+  const bool network_ready = network::initialize();
 #ifndef MIKOS_TRIBE_INTERACTIVE
-  static_cast<void>(network::boot_probe());
-#ifdef MIKOS_TRIBE
-  // Arm Ethernet before starting the comparatively slow bit-level SD model,
-  // so a host peer can retry packets while the rest of the boot continues.
-  alignas(4) u8 sd_block[drivers::tribe_sd::block_size]{};
-  constexpr char sd_marker[] = "MIKOS_SD_OK";
-  bool sd_ok = drivers::tribe_sd::initialize() &&
-               drivers::tribe_sd::read_block(0, sd_block);
-  for (u32 i = 0; sd_ok && i < sizeof(sd_marker) - 1; ++i) {
-    sd_ok = sd_block[i] == static_cast<u8>(sd_marker[i]);
+  if (network_ready) {
+    static_cast<void>(network::boot_probe());
   }
-  write_text(sd_ok ? "MIKOS:TRIBE_SD_OK\n" : "MIKOS:TRIBE_SD_FAIL\n");
-#endif
 #else
+  static_cast<void>(network_ready);
   write_text("MIKOS:TRIBE_INTERACTIVE\n");
 #endif
-  const auto image = load_busybox();
+  if (!drivers::fs::root::initialize()) {
+    write_text("MIKOS:EXT4_ROOT_FAIL\n");
+    shutdown(8);
+  }
+  write_text("MIKOS:EXT4_ROOT_OK\n");
+  const auto image = required_image("/bin/busybox");
   process.brk = image.brk;
   process.mutable_begin = image.mutable_begin;
   process.mmap_cursor = 0x81800000;
   process.pid = 1;
+  process.parent_pid = 0;
+  process.process_group = 1;
+  process.session = 1;
+  copy_path(process.current_directory, "/");
+  copy_path(process.executable_path, "/bin/busybox");
 #ifdef MIKOS_TRIBE_INTERACTIVE
   constexpr const char* arguments[] = {"busybox", "sh", "-i", "+m"};
 #else
   constexpr const char* arguments[] = {
-      "busybox", "echo", "MIKOS_BUSYBOX_OK"};
+      "busybox", "sh", "-c",
+      "echo MIKOS_WRITE_OK >/write-test; "
+      "cat /write-test; "
+      "mv /write-test /write-moved; "
+      "cat /write-moved; "
+      "rm /write-moved; "
+      "test ! -e /write-moved; "
+      "sync; echo MIKOS_BUSYBOX_OK"};
 #endif
   const u32 stack = make_initial_stack(
       image, arguments, sizeof(arguments) / sizeof(arguments[0]));
@@ -423,6 +492,9 @@ extern "C" void kernel_main() {
 extern "C" void trap_handler(mikos::TrapFrame* frame) {
   using namespace mikos;
   constexpr u32 user_ecall = 8;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  network::poll();
+#endif
 #ifdef MIKOS_TRIBE
   constexpr u32 illegal_instruction = 2;
   if (frame->mcause == illegal_instruction) {

@@ -31,7 +31,7 @@ kernel="$root/build/mikos-tribe-rv32.elf"
 peer="$root/build/tests/tribe/net_peer"
 log="$root/build/tribe-test.log"
 peer_log="$root/build/tribe-net-peer.log"
-cycles="${TRIBE_CYCLES:-30000000}"
+cycles="${TRIBE_CYCLES:-45000000}"
 default_wall_timeout=600
 if [[ "$simulator_name" == "tribe64_multicore" ]]; then
   default_wall_timeout=1800
@@ -39,7 +39,7 @@ fi
 wall_timeout="${TRIBE_TIMEOUT:-$default_wall_timeout}"
 runtime="$(mktemp -d /tmp/mikos-tribe.XXXXXX)"
 media_socket="$runtime/ethernet.sock"
-sd_image="$runtime/sd.img"
+sd_image="$root/build/tests/busybox/rootfs.ext4"
 
 cleanup() {
   if [[ -n "${peer_pid:-}" ]]; then
@@ -50,15 +50,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for required in "$simulator" "$kernel" "$peer"; do
+for required in "$simulator" "$kernel" "$peer" "$sd_image"; do
   if [[ ! -e "$required" ]]; then
     echo "missing test input: $required" >&2
     exit 1
   fi
 done
-
-printf 'MIKOS_SD_OK' >"$sd_image"
-truncate -s 1048576 "$sd_image"
 
 "$peer" "$media_socket" >"$peer_log" 2>&1 &
 peer_pid=$!
@@ -106,7 +103,7 @@ if [[ $simulator_status -ne 0 || $peer_status -ne 0 ]]; then
   exit 1
 fi
 
-if ! rg -q '^MIKOS:TRIBE_SD_OK$' "$log" ||
+if ! rg -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
    ! rg -q '^MIKOS:NET_IP 10\.0\.2\.15$' "$log" ||
    ! rg -q '^MIKOS:NET_MAC 02:00:00:00:00:02$' "$log" ||
    ! rg -q '^MIKOS:ARP_REPLY$' "$log" ||
@@ -122,4 +119,4 @@ if ! rg -q '^MIKOS:TRIBE_SD_OK$' "$log" ||
   exit 1
 fi
 
-echo "PASS: Tribe UART, SD, BusyBox, ARP, and IPv4 ICMP ping"
+echo "PASS: Tribe UART, ext4-root BusyBox, ARP, and IPv4 ICMP ping"

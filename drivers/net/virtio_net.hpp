@@ -1,7 +1,7 @@
 #pragma once
 
-#include <mikos/drivers/net.hpp>
-#include <mikos/drivers/virtio.hpp>
+#include <drivers/net/net.hpp>
+#include <drivers/net/virtio.hpp>
 
 extern "C" void* memcpy(void*, const void*, mikos::usize);
 extern "C" void* memset(void*, int, mikos::usize);

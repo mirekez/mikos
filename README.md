@@ -15,8 +15,9 @@ Start with:
 - [Regression and acceptance tests](tests/README.md)
 
 The current proof of concept boots on the supplied RV32 QEMU, enters a
-PMP-protected flat U-mode region, and runs bundled static BusyBox and stress-ng
-ELFs in sequence. BusyBox prints `MIKOS_BUSYBOX_OK`; stress-ng then runs a
+PMP-protected flat U-mode region, mounts an ext4 root image, and loads static
+BusyBox and stress-ng ELFs from `/bin` in sequence. BusyBox prints
+`MIKOS_BUSYBOX_OK`; stress-ng then runs a
 verified four-operation `cpu/loop` workload and reports its own metrics and
 success. A sole CLINT scheduling timer also demonstrably preempts an
 unmodified, non-cooperative U-mode loop before starting BusyBox; the PLIC and
@@ -44,14 +45,16 @@ make kernel
 ```
 
 The kernel target requests the pinned BusyBox and stress-ng acceptance
-payloads from `tests/busybox/`. The first build downloads BusyBox; an existing
-checkout can be selected with `BUSYBOX_REFERENCE=/path/to/busybox`. QEMU
-acceptance runners are under `tests/qemu/` and remain available through
-`make qemu-test` and `make qemu-net-test`.
+workloads from `tests/busybox/` and packages them as
+`build/tests/busybox/rootfs.ext4`; they are not linked into the kernel. The
+first build downloads BusyBox; an existing checkout can be selected with
+`BUSYBOX_REFERENCE=/path/to/busybox`. QEMU acceptance runners are under
+`tests/qemu/` and remain available through `make qemu-test` and
+`make qemu-net-test`.
 
-`make tribe-test` builds a pinned cpphdl Tribe simulator and runs the same
-BusyBox payload with Tribe UART, SD, and Ethernet drivers. Its rootless network
-peer verifies ARP and IPv4 ICMP echo replies; see `tests/tribe/README.md`.
+`make tribe-test` builds a pinned cpphdl Tribe simulator and attaches the same
+ext4 root image through the Tribe SD controller. Its rootless network peer
+verifies ARP and IPv4 ICMP echo replies; see `tests/tribe/README.md`.
 
 ## author
 

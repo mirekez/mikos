@@ -27,12 +27,13 @@ to preempt an uncooperative U-mode loop, and passes
 `busybox echo MIKOS_BUSYBOX_OK`. See `docs/poc-rv32.md` and
 `docs/adr/0001-scheduling-interrupt.md`.
 
-The first networking slice also passes deterministic host/guest ARP and ICMP
-exchanges using a polling-only modern virtio-net MMIO driver. Modern/legacy
-queues and the NIC data path are compile-time C++ types shared by the MMIO and
-PCI transports. The temporary boot probe is linked into the kernel only until
-user tasks and IPC can host the driver and stack as services. No TCP or socket
-work is added in kernel context. See `docs/network-poc.md`.
+The networking slice passes deterministic host/guest ARP and ICMP exchanges
+using a polling-only modern virtio-net MMIO driver and now includes a bounded
+passive IPv4 TCP/socket path for `SOCK_STREAM`, bind, listen, accept, stream
+I/O, readiness, and `/proc/net/tcp`. Modern/legacy queues and the NIC data path
+are compile-time C++ types shared by the MMIO and PCI transports. The temporary
+kernel stack remains only until user tasks and IPC can host it as a service.
+See `docs/network-poc.md` and `docs/tcp-stream-plan.md`.
 
 ## Immediate network vertical slice
 
@@ -42,10 +43,10 @@ The shortest tested route to the requested QEMU login is:
    RX, TX, fixed MAC/IP reporting, and an end-to-end ARP acceptance test.
 2. **Complete:** IPv4 validation/checksums and ICMP echo, with allocation and
    interrupts kept out of the data path.
-3. Add the minimum UDP/TCP state machines required by one server connection;
-   test them as pure host-side state machines before target integration.
-4. Add Linux socket descriptor calls and the small ioctl/netlink compatibility
-   view needed for BusyBox `ip addr` to display `10.0.2.15`.
+3. **Complete for passive IPv4:** add the minimum TCP state machine required by
+   bounded server connections and test it as a pure host-side state machine.
+4. **Complete for ioctl/passive sockets:** add Linux stream descriptor calls
+   and the ioctl compatibility view. Netlink for BusyBox `ip addr` remains.
 5. Run an existing small SSH server in user space. Do not put SSH framing,
    authentication, or cryptography in the kernel or invent a new SSH protocol
    implementation.
@@ -54,6 +55,12 @@ The shortest tested route to the requested QEMU login is:
 7. **Started:** IA-32 PCI discovery plus a polling legacy virtio-net transport
    is compile checked. Add the x86 boot target and rerun the same packet and
    remote-login tests there.
+
+The dependency-ordered process/IPC/terminal work and its rational regression
+matrix are maintained in
+[docs/process-ipc-tty-plan.md](docs/process-ipc-tty-plan.md).  The allocator
+remains deferred: this slice starts with bounded static tables and explicit
+capacity failures.
 
 Each gate keeps all previous `make test`, `make qemu-test`, and
 `make qemu-net-test` checks green. A serial IP marker or an ARP response is not
@@ -139,6 +146,17 @@ Deliverables:
 - protection-backend interface with initial RISC-V PMP implementation;
 - bounded kernel allocation policy.
 
+Deferred allocator/container follow-up (scheduled after the current TCP
+slice):
+
+- add a kernel-owned page arena distinct from the user `mmap` range;
+- implement size-class block lists that obtain and return page-sized chunks
+  through that arena, with targeted allocation/free and exhaustion metrics;
+- expose a conforming C++ allocator interface and validate it against a
+  freestanding associative-container implementation;
+- migrate fixed containers only where workload measurements justify dynamic
+  capacity; keep hard limits and deterministic failure paths.
+
 Tests written first:
 
 - property tests for overflow, alignment, split/merge, and overlap;
@@ -146,6 +164,8 @@ Tests written first:
 - allocation exhaustion and ownership-transition tests;
 - user pointer boundary tests;
 - target negative-access tests for kernel and neighboring user regions.
+- size-class reuse, alignment, fragmentation, double-free, invalid-free,
+  exhaustion, and chunk-return tests for the deferred block allocator.
 
 Exit gate:
 

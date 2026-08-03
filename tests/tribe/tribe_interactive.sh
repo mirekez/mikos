@@ -6,9 +6,10 @@ simulator_name="tribe64"
 kernel="$root/build/mikos-tribe-interactive-rv32.elf"
 kernel_target="tribe-interactive-kernel"
 cycles="${TRIBE_INTERACTIVE_CYCLES:-1000000000}"
+tap_socket="${TRIBE_ETH_TAP_SOCKET:-/tmp/tribe-ethgig.sock}"
 
 usage() {
-  echo "usage: $0 [--multicore]" >&2
+  echo "usage: $0 [--multicore] [--tap-socket PATH]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -17,6 +18,15 @@ while [[ $# -gt 0 ]]; do
       simulator_name="tribe64_multicore"
       kernel="$root/build/mikos-tribe-interactive-multicore-rv32.elf"
       kernel_target="tribe-interactive-multicore-kernel"
+      ;;
+    --tap-socket)
+      if [[ $# -lt 2 ]]; then
+        usage
+        echo "--tap-socket requires a path" >&2
+        exit 2
+      fi
+      tap_socket="$2"
+      shift
       ;;
     -h|--help)
       usage
@@ -31,7 +41,14 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+if [[ ! -S "$tap_socket" ]]; then
+  echo "Tribe TAP bridge socket is missing: $tap_socket" >&2
+  echo "Start ethgig_tap for tap-tribe or pass --tap-socket PATH." >&2
+  exit 1
+fi
+
 simulator="$root/build/tests/tribe/cpphdl-build/$simulator_name/$simulator_name"
+rootfs="${TRIBE_INTERACTIVE_SD_IMAGE:-$root/build/tests/busybox/rootfs.ext4}"
 
 if [[ ! -x "$simulator" ]]; then
   echo "Tribe simulator is missing; preparing cpphdl..." >&2
@@ -57,5 +74,7 @@ exec "$simulator" --noveril \
   --start-mem-addr 0x80000000 \
   --ram-size 8388608 \
   --boot-priv m \
+  --sd-image "$rootfs" \
   --uart-stdin \
+  --eth-tap-socket "$tap_socket" \
   --expected-output-contains 'MIKOS:EXIT 0'

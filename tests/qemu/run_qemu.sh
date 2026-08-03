@@ -5,10 +5,17 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 log="$root/build/qemu-test.log"
 qemu="$root/build/qemu/qemu-system-riscv32"
 kernel="$root/build/mikos-rv32.elf"
+rootfs="$root/build/tests/busybox/rootfs.ext4"
+writable_rootfs="$root/build/qemu-test-rootfs.ext4"
+
+cp --reflink=auto "$rootfs" "$writable_rootfs"
 
 set +e
 timeout 30 "$qemu" -machine virt -m 64M -bios none -nographic \
-  -monitor none -serial stdio -no-reboot -kernel "$kernel" >"$log" 2>&1
+  -monitor none -serial stdio -no-reboot -kernel "$kernel" \
+  -global virtio-mmio.force-legacy=false \
+  -drive if=none,format=raw,readonly=off,id=mikos-root,file="$writable_rootfs" \
+  -device virtio-blk-device,drive=mikos-root >"$log" 2>&1
 status=$?
 set -e
 
@@ -18,9 +25,17 @@ if [[ $status -ne 0 ]]; then
   exit 1
 fi
 
-if ! rg -q '^MIKOS_BUSYBOX_OK$' "$log"; then
+if ! rg -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
+   ! rg -q '^MIKOS_BUSYBOX_OK$' "$log" ||
+   [[ $(rg -c '^MIKOS_WRITE_OK$' "$log") -ne 2 ]]; then
   sed -n '1,240p' "$log"
   echo "FAIL: BusyBox marker missing" >&2
+  exit 1
+fi
+
+if ! /usr/sbin/e2fsck -fn "$writable_rootfs" >"$root/build/qemu-e2fsck.log" 2>&1; then
+  cat "$root/build/qemu-e2fsck.log"
+  echo "FAIL: writable BusyBox run left an inconsistent ext4 image" >&2
   exit 1
 fi
 
@@ -68,4 +83,4 @@ if ! rg -q '^MIKOS:EXIT 0$' "$log"; then
   exit 1
 fi
 
-echo "PASS: RV32 BusyBox and stress-ng CPU verification"
+echo "PASS: RV32 writable ext4 BusyBox mutation, fsck, and stress-ng verification"

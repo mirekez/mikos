@@ -59,6 +59,8 @@ int main() {
   MIKOS_CHECK(suite,
               Filesystem::lookup("/proc/net/tcp") == Node::proc_net_tcp);
   MIKOS_CHECK(suite,
+              Filesystem::lookup("/proc/net/dev") == Node::proc_net_dev);
+  MIKOS_CHECK(suite,
               Filesystem::lookup("/proc/net/tcp6") == Node::proc_net_tcp6);
   MIKOS_CHECK(suite,
               Filesystem::lookup("/proc/net/udp") == Node::proc_net_udp);
@@ -76,11 +78,15 @@ int main() {
   MIKOS_CHECK(suite,
               has_entry(Node::proc_net, "tcp", Type::regular));
   MIKOS_CHECK(suite,
+              has_entry(Node::proc_net, "dev", Type::regular));
+  MIKOS_CHECK(suite,
               has_entry(Node::proc_net, "raw", Type::regular));
   MIKOS_CHECK(suite,
               contains(Filesystem::contents(Node::proc_net_tcp),
                        "local_address"));
   MIKOS_CHECK(suite, Filesystem::size(Node::proc_net_tcp) > 0);
+  MIKOS_CHECK(suite,
+              contains(Filesystem::contents(Node::proc_net_dev), "eth0:"));
 
   MIKOS_CHECK(suite, Filesystem::directory(Node::sys));
   MIKOS_CHECK(suite,

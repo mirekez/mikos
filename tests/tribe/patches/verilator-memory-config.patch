@@ -1,0 +1,22 @@
+diff --git a/tribe/main.cpp b/tribe/main.cpp
+index 875102e..1623f47 100644
+--- a/tribe/main.cpp
++++ b/tribe/main.cpp
+@@ -1909,7 +1909,15 @@ int main (int argc, char** argv)
+     if (!noveril) {
+         std::cout << "Building verilator simulation... =============================================================\n";
+-        std::string verilator_l2_width_define = "-DL2_AXI_WIDTH=" + std::to_string(TRIBE_L2_AXI_WIDTH);
+-        setenv("CPPHDL_VERILATOR_CFLAGS", verilator_l2_width_define.c_str(), 1);
++        std::string verilator_config_defines =
++            "-DL2_AXI_WIDTH=" + std::to_string(TRIBE_L2_AXI_WIDTH) +
++            " -DTRIBE_RAM_BYTES_CONFIG=" + std::to_string(TRIBE_RAM_BYTES) +
++            " -DTRIBE_IO_REGION_SIZE_CONFIG=" + std::to_string(TRIBE_IO_REGION_SIZE);
++#ifdef MULTICORE
++        // The generated top module has per-hart interrupt ports. Its C++
++        // driver must select the same wrapper layout as the HDL generator.
++        verilator_config_defines += " -DMULTICORE";
++#endif
++        setenv("CPPHDL_VERILATOR_CFLAGS", verilator_config_defines.c_str(), 1);
+         const auto source_root = tribe_source_root_dir();
+         auto start = std::chrono::high_resolution_clock::now();
+         if (!regenerate_tribe_sv(source_root)) {

@@ -1,0 +1,13 @@
+diff --git a/tribe/TribeTest.h b/tribe/TribeTest.h
+index d014d85..4d9ab0e 100644
+--- a/tribe/TribeTest.h
++++ b/tribe/TribeTest.h
+@@ -190,7 +190,7 @@ public:
+     SDController<clog2(MAX_RAM_SIZE),4,TRIBE_L2_AXI_WIDTH> sdcard;
+     SDCardVerifFrontend sdcard_verif;
+     EthGigDMA<clog2(MAX_RAM_SIZE),4,TRIBE_L2_AXI_WIDTH> ethgig_dma;
+-    EthGigMAC<256> ethgig_mac;
++    EthGigMAC<2048> ethgig_mac;
+     EthGigPCS<256> ethgig_pcs;
+     EthGigPHY ethgig_phy;
+     RGMIIVerifFrontend ethgig_verif;

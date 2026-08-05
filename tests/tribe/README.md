@@ -87,6 +87,24 @@ parent/child address-image restoration, and nonzero child-status reaping on
 the multicore Tribe profile. It does not claim that parent and child are both
 runnable; background ordering and blocking-pipe scheduling remain pending.
 
+`make tribe-interactive-ssh-test` configures the guest address, starts
+Dropbear with `-F` as a BusyBox background job, waits for the kernel TCP listen
+marker, verifies that `ifconfig -a` reports `eth0` at `192.168.76.2/24`, and
+then verifies a real host SSH connection through `accept` and the server
+identification write on the multicore Tribe profile. After accepting a
+connection, Dropbear remains resident across network waits so SSH packets do
+not trigger repeated SD-backed executable swaps; UART input can preempt it
+back to the interactive shell. BusyBox `ip address`
+still requires the unimplemented `AF_NETLINK`/rtnetlink interface; use
+`ifconfig -a` for interface inspection in this profile. Set
+`TRIBE_INTERACTIVE_SSH_REQUIRE_AUTH=1` for the extended Curve25519/Ed25519
+public-key authentication check; guest software crypto takes tens of minutes in
+the four-core cycle-accurate model. The test-only Dropbear build handles the
+accepted connection without forking because nested background fork is not
+implemented; remote command and PTY execution remain pending. The rootfs `rcS`
+uses the same explicit foreground-in-background invocation so a normal init
+boot owns and reports the service.
+
 Type `q` to leave `top`, `exit` to shut down cleanly, Ctrl+C to stop the
 simulator, or Ctrl+Z to suspend it. `TRIBE_INTERACTIVE_CYCLES` controls the
 safety limit.

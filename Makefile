@@ -90,7 +90,8 @@ TRIBE_NET_PEER := $(BUILD)/tests/tribe/net_peer
 	tribe-interactive-multicore-kernel inspect busybox \
 	stress-ng run qemu-test qemu-net-test qemu-ssh-top tribe-prepare tribe-test \
 	tribe-interactive tribe-interactive-ping-test \
-	tribe-interactive-tcp-test tribe-interactive-process-test ethgig-tap clean
+	tribe-interactive-tcp-test tribe-interactive-process-test \
+	tribe-interactive-ssh-test ethgig-tap clean
 
 all: test kernel
 
@@ -117,8 +118,21 @@ stress-ng:
 
 $(ROOTFS_IMAGE): tests/busybox/Makefile \
 		tests/busybox/config/busybox.config \
+		tests/busybox/config/dropbear_localoptions.h \
 		tests/busybox/download_busybox.sh \
 		tests/busybox/build_busybox.sh \
+		tests/busybox/download_dropbear.sh \
+		tests/busybox/build_dropbear.sh \
+		tests/busybox/patches/dropbear-mikos.patch \
+		tests/busybox/rootfs/etc/group \
+		tests/busybox/rootfs/etc/inittab \
+		tests/busybox/rootfs/etc/passwd \
+		tests/busybox/rootfs/etc/shells \
+		tests/busybox/rootfs/etc/init.d/rcS \
+		tests/busybox/rootfs/etc/dropbear/dropbear_ed25519_host_key.b64 \
+		tests/busybox/rootfs/root/.ssh/authorized_keys \
+		tests/busybox/set_rootfs_owners.sh \
+		tests/busybox/verify_rootfs.sh \
 		tests/busybox/patches/stress-ng-mikos.patch
 	$(MAKE) -C tests/busybox rootfs
 
@@ -217,6 +231,10 @@ tribe-interactive-tcp-test: $(ROOTFS_IMAGE) \
 tribe-interactive-process-test: $(ROOTFS_IMAGE) \
 		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
 	tests/tribe/run_interactive_process.sh --multicore
+
+tribe-interactive-ssh-test: $(ROOTFS_IMAGE) \
+		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
+	tests/tribe/run_interactive_ssh.sh --multicore
 
 qemu-ssh-top: ethgig-tap
 	tests/qemu/run_qemu_ssh.sh

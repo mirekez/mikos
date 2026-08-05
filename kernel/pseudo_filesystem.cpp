@@ -53,6 +53,7 @@ constexpr PathNode nodes[] = {
     {"/proc/1", Node::proc_pid1},
     {"/proc/2", Node::proc_pid2},
     {"/proc/net", Node::proc_net},
+    {"/proc/net/dev", Node::proc_net_dev},
     {"/proc/stat", Node::proc_stat},
     {"/proc/meminfo", Node::proc_meminfo},
     {"/proc/loadavg", Node::proc_loadavg},
@@ -117,6 +118,7 @@ constexpr Entry pid2_entries[] = {
 constexpr Entry net_entries[] = {
     {".", Node::proc_net, Type::directory},
     {"..", Node::proc, Type::directory},
+    {"dev", Node::proc_net_dev, Type::regular},
     {"tcp", Node::proc_net_tcp, Type::regular},
     {"tcp6", Node::proc_net_tcp6, Type::regular},
     {"udp", Node::proc_net_udp, Type::regular},
@@ -279,6 +281,13 @@ const char* Filesystem::contents(Node node) {
       "retrnsmt   uid  timeout inode\n";
   static constexpr const char unix_sockets[] =
       "Num       RefCount Protocol Flags    Type St Inode Path\n";
+  static constexpr const char network_devices[] =
+      "Inter-|   Receive                                                |"
+      "  Transmit\n"
+      " face |bytes    packets errs drop fifo frame compressed multicast|"
+      "bytes    packets errs drop fifo colls carrier compressed\n"
+      "  eth0:       0       0    0    0    0     0          0         0"
+      "        0       0    0    0    0     0       0          0\n";
   static constexpr const char osrelease[] = "0.1\n";
   static constexpr const char ostype[] = "Linux\n";
   static constexpr const char hostname[] = "mikos\n";
@@ -315,6 +324,8 @@ const char* Filesystem::contents(Node node) {
       return inet_sockets;
     case Node::proc_net_unix:
       return unix_sockets;
+    case Node::proc_net_dev:
+      return network_devices;
     case Node::sys_cpu_online:
     case Node::sys_cpu_present:
     case Node::sys_cpu_possible:

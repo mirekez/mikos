@@ -15,6 +15,7 @@ inline constexpr UserRange user_memory{user_begin, user_end};
 
 struct Process {
   u32 brk;
+  u32 mmap_begin;
   u32 mmap_cursor;
   u32 mutable_begin;
   u32 exit_code;
@@ -39,6 +40,7 @@ void write_u32(u32 value);
 i32 dispatch_syscall(TrapFrame& frame);
 void start_stress_ng(TrapFrame& frame);
 void restore_busybox_image();
+[[nodiscard]] bool restore_executable_image(const char* path);
 [[nodiscard]] bool replace_with_executable(TrapFrame& frame,
                                            const char* path,
                                            const char* const* arguments,

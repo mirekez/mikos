@@ -59,6 +59,11 @@ struct SocketSlot {
   u16 references{};
   u8 listener{invalid_socket};
   u8 backlog{};
+  // Keep one delayed duplicate ACK after the immediate ACK. This makes the
+  // polling-only Tribe transport robust when its single TX descriptor is busy
+  // at the instant inbound data is handled, without reaching TCP's three-DUPACK
+  // fast-retransmit threshold.
+  u8 acknowledgement_retries{};
   bool accepted{};
   bool send_closed{};
   u8 receive_buffer[socket_receive_capacity]{};

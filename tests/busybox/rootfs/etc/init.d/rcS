@@ -2,23 +2,31 @@
 
 busybox=/bin/busybox
 
-$busybox mount -t proc proc /proc 2>/dev/null || true
-$busybox mount -t sysfs sysfs /sys 2>/dev/null || true
-$busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-$busybox mount -t devpts devpts /dev/pts 2>/dev/null || true
+if [ "${1:-}" != mikos ]; then
+  $busybox mount -t proc proc /proc 2>/dev/null || true
+  $busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+  $busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+  $busybox mount -t devpts devpts /dev/pts 2>/dev/null || true
 
-$busybox mkdir -p /run /var/run /etc/dropbear /root/.ssh
-$busybox chmod 0700 /root /root/.ssh
-$busybox chmod 0600 /root/.ssh/authorized_keys
-
-# The current RV32 network proof uses this static test subnet. Ignore an
-# absent interface so the same filesystem remains usable in rootless tests.
-$busybox ifconfig eth0 192.168.76.2 netmask 255.255.255.0 up 2>/dev/null || true
-
-# -R creates a persistent host key on first use, -s disables password login,
-# and -E keeps diagnostics visible on the boot console.
-if /usr/sbin/dropbear -R -s -E -p 22; then
-  echo "MIKOS_SSH_READY 192.168.76.2:22"
-else
-  echo "MIKOS_SSH_FAILED" >&2
+  $busybox mkdir -p /run /var/run /etc/dropbear /root/.ssh
+  $busybox chmod 0700 /root /root/.ssh
+  $busybox chmod 0600 /root/.ssh/authorized_keys
 fi
+
+# The current RV32 network proof uses this static test subnet. MikOS exposes
+# /dev/null through its pseudo filesystem, so avoid a create-style shell
+# redirection on the immutable ext4 root.
+if [ "${1:-}" = mikos ]; then
+  echo MIKOS_SSH_NET_CONFIG_START
+  echo MIKOS_SSH_NET_CONFIG_DONE
+else
+  $busybox ifconfig eth0 192.168.76.2 netmask 255.255.255.0 up 2>/dev/null || true
+fi
+
+# The image carries a deterministic test-only Ed25519 host key. -s disables
+# password login, the no-syslog build logs to stderr, and -F lets init own the
+# background job rather than relying on daemonization.
+echo MIKOS_SSH_DROPBEAR_START
+/usr/sbin/dropbear -s -F \
+  -r /etc/dropbear/dropbear_ed25519_host_key -p 22 &
+echo "MIKOS_SSH_STARTING 192.168.76.2:22 pid=$!"

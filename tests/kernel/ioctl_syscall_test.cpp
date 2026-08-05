@@ -24,6 +24,9 @@ int main() {
   mikos::test::Suite suite{"kernel/ioctl_syscall"};
   using mikos::network::InterfaceControlResult;
 
+  MIKOS_CHECK(suite, sizeof(mikos::network::Ifconf32) == 8);
+  MIKOS_CHECK(suite, mikos::network::siocgifconf == 0x8912);
+
   mikos::network::InterfaceState state{};
   state.mac = {{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}};
 
@@ -32,6 +35,24 @@ int main() {
                          state, mikos::network::siocgifindex, request) ==
                          InterfaceControlResult::success);
   MIKOS_CHECK(suite, request.value.index == 1);
+
+  request = request_for_eth0();
+  MIKOS_CHECK(suite, mikos::network::apply_interface_ioctl(
+                         state, mikos::network::siocgifmetric, request) ==
+                         InterfaceControlResult::success);
+  MIKOS_CHECK(suite, request.value.metric == 0);
+
+  request = request_for_eth0();
+  MIKOS_CHECK(suite, mikos::network::apply_interface_ioctl(
+                         state, mikos::network::siocgifmtu, request) ==
+                         InterfaceControlResult::success);
+  MIKOS_CHECK(suite, request.value.mtu == 1500);
+
+  request = request_for_eth0();
+  MIKOS_CHECK(suite, mikos::network::apply_interface_ioctl(
+                         state, mikos::network::siocgiftxqlen, request) ==
+                         InterfaceControlResult::success);
+  MIKOS_CHECK(suite, request.value.queue_length == 1000);
 
   request = request_for_eth0();
   MIKOS_CHECK(suite, mikos::network::apply_interface_ioctl(

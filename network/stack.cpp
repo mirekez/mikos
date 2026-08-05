@@ -46,6 +46,7 @@ class BootstrapStack {
     if (!initialized_ || (state_.flags & interface_up) == 0) {
       return;
     }
+    flush_acknowledgements();
     drivers::net::Frame frame{};
     if (drivers::net::receive(frame)) {
       record(handle(frame));
@@ -125,6 +126,7 @@ class BootstrapStack {
         return written == 0 ? ReadResult{SocketResult::no_space, 0}
                             : ReadResult{SocketResult::success, written};
       }
+      value->acknowledgement_retries = 0;
       value->send_next += count;
       written += count;
     }
@@ -327,6 +329,26 @@ class BootstrapStack {
     return drivers::net::transmit(transmit_buffer_, headers + payload_size);
   }
 
+  void flush_acknowledgement(SocketSlot& socket) {
+    if (socket.acknowledgement_retries == 0 ||
+        (socket.state != SocketState::established &&
+         socket.state != SocketState::close_wait)) {
+      return;
+    }
+    if (send_segment(socket, tcp_ack, nullptr, 0, socket.send_next)) {
+      --socket.acknowledgement_retries;
+    }
+  }
+
+  void flush_acknowledgements() {
+    for (u8 handle = 0; handle < socket_capacity; ++handle) {
+      auto* socket = sockets_.slot(handle);
+      if (socket != nullptr) {
+        flush_acknowledgement(*socket);
+      }
+    }
+  }
+
   void handle_tcp(drivers::net::Frame frame) {
     TcpView view{};
     if (!parse_tcp(frame.data, frame.size, state_.address, view)) {
@@ -391,8 +413,11 @@ class BootstrapStack {
     if (view.payload_size != 0 || finish) {
       static_cast<void>(sockets_.receive(connection, sequence, view.payload,
                                          view.payload_size, finish));
-      static_cast<void>(send_segment(*value, tcp_ack, nullptr, 0,
-                                     value->send_next));
+      // Send immediately, then retain one delayed retry. A failed immediate TX
+      // therefore gets retried by poll(), while a successful one gets one safe
+      // duplicate ACK during a long userspace compute interval.
+      value->acknowledgement_retries = 2;
+      flush_acknowledgement(*value);
     }
   }
 

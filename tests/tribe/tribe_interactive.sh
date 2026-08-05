@@ -5,11 +5,16 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 simulator_name="tribe64"
 kernel="$root/build/mikos-tribe-interactive-rv32.elf"
 kernel_target="tribe-interactive-kernel"
-cycles="${TRIBE_INTERACTIVE_CYCLES:-1000000000}"
+cycles="${TRIBE_INTERACTIVE_CYCLES:-0}"
 tap_socket="${TRIBE_ETH_TAP_SOCKET:-/tmp/tribe-ethgig.sock}"
+tap_name="${TRIBE_INTERACTIVE_TAP:-tap-tribe}"
+host_address="${TRIBE_INTERACTIVE_HOST_ADDRESS:-192.168.76.1}"
+guest_address="${TRIBE_INTERACTIVE_GUEST_ADDRESS:-192.168.76.2}"
+use_verilator=0
+verilator_cores=1
 
 usage() {
-  echo "usage: $0 [--multicore] [--tap-socket PATH]" >&2
+  echo "usage: $0 [--multicore] [--verilator] [--tap-socket PATH]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -18,6 +23,10 @@ while [[ $# -gt 0 ]]; do
       simulator_name="tribe64_multicore"
       kernel="$root/build/mikos-tribe-interactive-multicore-rv32.elf"
       kernel_target="tribe-interactive-multicore-kernel"
+      verilator_cores=4
+      ;;
+    --verilator)
+      use_verilator=1
       ;;
     --tap-socket)
       if [[ $# -lt 2 ]]; then
@@ -46,6 +55,17 @@ if [[ ! -S "$tap_socket" ]]; then
   echo "Start ethgig_tap for tap-tribe or pass --tap-socket PATH." >&2
   exit 1
 fi
+if ! ip link show dev "$tap_name" >/dev/null 2>&1; then
+  echo "Host TAP interface is missing: $tap_name" >&2
+  echo "The socket exists, but SSH needs a TAP bridge for 192.168.76.0/24." >&2
+  exit 1
+fi
+if ! ip -4 -o address show dev "$tap_name" | \
+     rg -q "[[:space:]]${host_address}/24([[:space:]]|$)"; then
+  echo "Host TAP $tap_name does not own $host_address/24." >&2
+  echo "Configure the bridge address before starting MikOS." >&2
+  exit 1
+fi
 
 simulator="$root/build/tests/tribe/cpphdl-build/$simulator_name/$simulator_name"
 rootfs="${TRIBE_INTERACTIVE_SD_IMAGE:-$root/build/tests/busybox/rootfs.ext4}"
@@ -67,8 +87,26 @@ fi
 
 echo "Starting MikOS interactive BusyBox shell." >&2
 echo "Type 'exit' to stop MikOS; Ctrl+C stops the simulator; Ctrl+Z suspends it." >&2
+echo "Host link: $tap_name $host_address/24; guest: $guest_address/24." >&2
+echo "SSH after MIKOS_SSH_STARTING:" >&2
+echo "  ssh -i $root/build/mikos_ssh_key -o ConnectTimeout=600 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$guest_address" >&2
 
-exec "$simulator" --noveril \
+simulator_arguments=(--noveril)
+if [[ "$use_verilator" == 1 ]]; then
+  verilator_simulator="$(dirname "$simulator")/TribeTest_${verilator_cores}/obj_dir/VTribeTest"
+  if [[ ! -x "$verilator_simulator" || "$simulator" -nt "$verilator_simulator" ]]; then
+    echo "Building the faster Verilator model for interactive execution..." >&2
+    "$simulator" 1
+  fi
+  if [[ ! -x "$verilator_simulator" ]]; then
+    echo "Verilator model was not produced: $verilator_simulator" >&2
+    exit 1
+  fi
+  simulator="$verilator_simulator"
+  simulator_arguments=()
+fi
+
+exec "$simulator" "${simulator_arguments[@]}" \
   --program "$kernel" --elf \
   --cycles "$cycles" \
   --start-mem-addr 0x80000000 \

@@ -46,8 +46,13 @@ enter_user:
   csrr t0, mstatus
   li t1, ~(3 << 11)
   and t0, t0, t1
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  li t1, (1 << 7)
+  or t0, t0, t1
+#else
   li t1, ~(1 << 7)
   and t0, t0, t1
+#endif
   li t1, ~(1 << 3)
   and t0, t0, t1
   csrw mstatus, t0

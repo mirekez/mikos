@@ -60,6 +60,7 @@ struct TickTime {
 struct SuspendedParent {
   TrapFrame frame{};
   u32 brk{};
+  u32 mmap_begin{};
   u32 mmap_cursor{};
   u32 mutable_begin{};
   u32 stack_begin{};
@@ -72,6 +73,7 @@ struct SuspendedParent {
   u32 parent_pid{};
   u32 process_group{};
   u32 session{};
+  u32 image{};
   process_model::SignalState signals{};
   u32 file_creation_mask{};
   char current_directory[256]{};
@@ -98,12 +100,44 @@ inline constexpr u32 parent_backup_capacity = 4 * 1024 * 1024;
 [[gnu::section(".noinit")]] alignas(16)
 u8 parent_backup[parent_backup_capacity];
 
+enum class BackgroundWait : u8 { none, socket_read };
+
+struct ParkedBackground {
+  TrapFrame frame{};
+  u32 brk{};
+  u32 mmap_begin{};
+  u32 mmap_cursor{};
+  u32 mutable_begin{};
+  u32 stack_begin{};
+  u32 mutable_size{};
+  u32 mmap_size{};
+  u32 stack_size{};
+  u32 pid{};
+  u32 parent_pid{};
+  u32 process_group{};
+  u32 session{};
+  u32 image{};
+  process_model::SignalState signals{};
+  u32 file_creation_mask{};
+  char current_directory[256]{};
+  char executable_path[256]{};
+  u8 wait_socket{network::invalid_socket};
+  BackgroundWait wait{BackgroundWait::none};
+  bool used{};
+};
+
+ParkedBackground background{};
+[[gnu::section(".noinit")]] alignas(16)
+u8 background_backup[parent_backup_capacity];
+
 [[maybe_unused, nodiscard]] bool user_string_is(u32 address,
                                                 const char* expected);
 void reset_descriptors();
 [[nodiscard]] bool save_parent_descriptors();
 void restore_parent_descriptors();
 void discard_parent_descriptors();
+[[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket);
+[[nodiscard]] bool resume_background_if_ready(TrapFrame& frame);
 
 [[nodiscard]] bool waitable_space() {
   for (const auto& child : waitable_children) {
@@ -137,12 +171,12 @@ void refresh_child_waitable() {
     return true;
   }
   if (parent.mutable_begin > parent.brk ||
-      parent.mmap_cursor < 0x81800000 ||
+      parent.mmap_cursor < parent.mmap_begin ||
       parent.stack_begin > user_stack_top) {
     return false;
   }
   parent.mutable_size = parent.brk - parent.mutable_begin;
-  parent.mmap_size = parent.mmap_cursor - 0x81800000;
+  parent.mmap_size = parent.mmap_cursor - parent.mmap_begin;
   parent.stack_size = user_stack_top - parent.stack_begin;
   const u64 total = static_cast<u64>(parent.mutable_size) +
                     parent.mmap_size + parent.stack_size;
@@ -154,7 +188,8 @@ void refresh_child_waitable() {
          reinterpret_cast<const void*>(parent.mutable_begin),
          parent.mutable_size);
   cursor += parent.mutable_size;
-  memcpy(parent_backup + cursor, reinterpret_cast<const void*>(0x81800000),
+  memcpy(parent_backup + cursor,
+         reinterpret_cast<const void*>(parent.mmap_begin),
          parent.mmap_size);
   cursor += parent.mmap_size;
   memcpy(parent_backup + cursor,
@@ -164,29 +199,34 @@ void refresh_child_waitable() {
   return true;
 }
 
-void restore_parent(TrapFrame& frame, u32 status) {
+void resume_parent(TrapFrame& frame, u32 status, bool child_completed,
+                   bool return_from_clone) {
   const u32 child_process_group = process.process_group;
-  if (process.image != 0) {
-    // Both payloads occupy the same flat user address range. stress-ng has
-    // overwritten BusyBox's read-only segments, so restore the complete
-    // shell image before applying the parent's saved writable state.
-    restore_busybox_image();
+  // Flat-address-space payloads overlap. Reload the suspended executable's
+  // segments, then apply its private writable/mmap/stack snapshot.
+  if (process.image != parent.image &&
+      !restore_executable_image(parent.executable_path)) {
+    write_text("MIKOS:PROCESS_IMAGE_RESTORE_FAIL\n");
+    shutdown(9);
   }
   if (parent.memory_saved) {
     u32 cursor = 0;
     memcpy(reinterpret_cast<void*>(parent.mutable_begin),
            parent_backup + cursor, parent.mutable_size);
     cursor += parent.mutable_size;
-    memcpy(reinterpret_cast<void*>(0x81800000), parent_backup + cursor,
+    memcpy(reinterpret_cast<void*>(parent.mmap_begin), parent_backup + cursor,
            parent.mmap_size);
     cursor += parent.mmap_size;
     memcpy(reinterpret_cast<void*>(parent.stack_begin), parent_backup + cursor,
            parent.stack_size);
   }
   frame = parent.frame;
-  frame.x[10] = parent.child_pid;
-  frame.mepc += 4;
+  if (return_from_clone) {
+    frame.x[10] = parent.child_pid;
+    frame.mepc += 4;
+  }
   process.brk = parent.brk;
+  process.mmap_begin = parent.mmap_begin;
   process.mmap_cursor = parent.mmap_cursor;
   process.mutable_begin = parent.mutable_begin;
   process.pid = parent.parent_pid;
@@ -194,20 +234,26 @@ void restore_parent(TrapFrame& frame, u32 status) {
   process.process_group = parent.process_group;
   process.session = parent.session;
   signals = parent.signals;
-  process.image = 0;
+  process.image = parent.image;
   file_creation_mask = parent.file_creation_mask;
   memcpy(process.current_directory, parent.current_directory,
          sizeof(process.current_directory));
   memcpy(process.executable_path, parent.executable_path,
          sizeof(process.executable_path));
   process.image_replaced = true;
-  parent.child_status = status;
-  parent.child_process_group = child_process_group;
-  publish_child_exit(parent.child_pid, parent.parent_pid,
-                     child_process_group, status);
+  if (child_completed) {
+    parent.child_status = status;
+    parent.child_process_group = child_process_group;
+    publish_child_exit(parent.child_pid, parent.parent_pid,
+                       child_process_group, status);
+  }
   parent.active = false;
   parent.memory_saved = false;
   restore_parent_descriptors();
+}
+
+void restore_parent(TrapFrame& frame, u32 status) {
+  resume_parent(frame, status, true, true);
 }
 
 [[nodiscard]] i32 clone(TrapFrame& frame, u32 flags, u32 stack,
@@ -237,6 +283,7 @@ void restore_parent(TrapFrame& frame, u32 status) {
   }
   parent.frame = frame;
   parent.brk = process.brk;
+  parent.mmap_begin = process.mmap_begin;
   parent.mmap_cursor = process.mmap_cursor;
   parent.mutable_begin = process.mutable_begin;
   parent.file_creation_mask = file_creation_mask;
@@ -248,6 +295,7 @@ void restore_parent(TrapFrame& frame, u32 status) {
   parent.parent_pid = process.pid;
   parent.process_group = process.process_group;
   parent.session = process.session;
+  parent.image = process.image;
   parent.signals = signals;
   static u32 next_pid = 2;
   parent.child_pid = next_pid++;
@@ -334,6 +382,8 @@ Descriptor descriptors[13]{};
 Descriptor standard_redirects[3]{};
 Descriptor parent_descriptors[13]{};
 Descriptor parent_standard_redirects[3]{};
+Descriptor background_descriptors[13]{};
+Descriptor background_standard_redirects[3]{};
 process_model::PipeTable<4> pipes{};
 process_model::PtyTable<4> ptys{};
 
@@ -431,6 +481,224 @@ void discard_parent_descriptors() {
   for (auto& descriptor : parent_standard_redirects) {
     release_descriptor(descriptor);
   }
+}
+
+void move_active_descriptors(Descriptor* saved, Descriptor* saved_standard) {
+  for (u32 i = 0; i < 13; ++i) {
+    saved[i] = descriptors[i];
+    descriptors[i] = {};
+  }
+  for (u32 i = 0; i < 3; ++i) {
+    saved_standard[i] = standard_redirects[i];
+    standard_redirects[i] = {};
+  }
+}
+
+void move_saved_descriptors(Descriptor* saved, Descriptor* saved_standard) {
+  reset_descriptors();
+  for (u32 i = 0; i < 13; ++i) {
+    descriptors[i] = saved[i];
+    saved[i] = {};
+  }
+  for (u32 i = 0; i < 3; ++i) {
+    standard_redirects[i] = saved_standard[i];
+    saved_standard[i] = {};
+  }
+}
+
+[[nodiscard]] bool save_background_memory() {
+  background.mutable_size = background.brk - background.mutable_begin;
+  background.mmap_size = background.mmap_cursor - background.mmap_begin;
+  background.stack_size = user_stack_top - background.stack_begin;
+  const u64 total = static_cast<u64>(background.mutable_size) +
+                    background.mmap_size + background.stack_size;
+  if (background.mutable_begin > background.brk ||
+      background.mmap_cursor < background.mmap_begin ||
+      background.stack_begin > user_stack_top ||
+      total > parent_backup_capacity) {
+    return false;
+  }
+  u32 cursor = 0;
+  memcpy(background_backup + cursor,
+         reinterpret_cast<const void*>(background.mutable_begin),
+         background.mutable_size);
+  cursor += background.mutable_size;
+  memcpy(background_backup + cursor,
+         reinterpret_cast<const void*>(background.mmap_begin),
+         background.mmap_size);
+  cursor += background.mmap_size;
+  memcpy(background_backup + cursor,
+         reinterpret_cast<const void*>(background.stack_begin),
+         background.stack_size);
+  return true;
+}
+
+void capture_background(TrapFrame& frame, u8 wait_socket) {
+  background.frame = frame;
+  background.brk = process.brk;
+  background.mmap_begin = process.mmap_begin;
+  background.mmap_cursor = process.mmap_cursor;
+  background.mutable_begin = process.mutable_begin;
+  background.stack_begin = align_down(frame.x[2], static_cast<u32>(16));
+  background.pid = process.pid;
+  background.parent_pid = process.parent_pid;
+  background.process_group = process.process_group;
+  background.session = process.session;
+  background.image = process.image;
+  background.signals = signals;
+  background.file_creation_mask = file_creation_mask;
+  memcpy(background.current_directory, process.current_directory,
+         sizeof(background.current_directory));
+  memcpy(background.executable_path, process.executable_path,
+         sizeof(background.executable_path));
+  background.wait = BackgroundWait::socket_read;
+  background.wait_socket = wait_socket;
+  background.used = true;
+}
+
+[[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket) {
+  if (!parent.active) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    write_text("MIKOS:BACKGROUND_PARK_NO_PARENT\n");
+#endif
+    return false;
+  }
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  // Once a background service has accepted a connection, keep its image
+  // resident while it waits for the peer. Swapping back to the shell here
+  // would reload BusyBox from simulated SD, then reload the service for the
+  // very next SSH packet. UART input remains an explicit preemption point.
+  const auto* waiting = network::socket_slot(wait_socket);
+  if (waiting != nullptr &&
+      waiting->state != network::SocketState::listening) {
+    static bool reported_connection_hold = false;
+    if (!reported_connection_hold) {
+      reported_connection_hold = true;
+      write_text("MIKOS:BACKGROUND_CONNECTION_HOLD ");
+      write_u32(process.pid);
+      write_text("\n");
+    }
+    while (!network::socket_readable(wait_socket) &&
+           !drivers::uart::ready()) {
+      network::poll();
+    }
+    if (network::socket_readable(wait_socket)) {
+      return false;
+    }
+  }
+#endif
+  if (background.used && process.pid != background.pid) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    write_text("MIKOS:BACKGROUND_PARK_BUSY\n");
+#endif
+    return false;
+  }
+  capture_background(frame, wait_socket);
+  if (!save_background_memory()) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    write_text("MIKOS:BACKGROUND_PARK_TOO_LARGE mutable=");
+    write_u32(background.mutable_size);
+    write_text(" mmap=");
+    write_u32(background.mmap_size);
+    write_text(" stack=");
+    write_u32(background.stack_size);
+    write_text("\n");
+#endif
+    background.used = false;
+    return false;
+  }
+  move_active_descriptors(background_descriptors,
+                          background_standard_redirects);
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:BACKGROUND_PARK ");
+  write_u32(background.pid);
+  write_text("\n");
+#endif
+  // The first park returns from fork. Later parks replay the syscall that had
+  // blocked in the already-running service.
+  const bool first_park = parent.frame.x[17] ==
+                          static_cast<u32>(Syscall::clone);
+  resume_parent(frame, 0, false, first_park);
+  return true;
+}
+
+[[nodiscard]] bool background_ready() {
+  if (!background.used || background.wait != BackgroundWait::socket_read ||
+      background.wait_socket == network::invalid_socket) {
+    return false;
+  }
+  return network::socket_readable(background.wait_socket);
+}
+
+[[nodiscard]] bool resume_background_if_ready(TrapFrame& frame) {
+  if (!background_ready() || parent.active || !save_parent_descriptors()) {
+    return false;
+  }
+  parent.frame = frame;
+  parent.brk = process.brk;
+  parent.mmap_begin = process.mmap_begin;
+  parent.mmap_cursor = process.mmap_cursor;
+  parent.mutable_begin = process.mutable_begin;
+  parent.stack_begin = align_down(frame.x[2], static_cast<u32>(16));
+  parent.child_pid = background.pid;
+  parent.parent_pid = process.pid;
+  parent.process_group = process.process_group;
+  parent.session = process.session;
+  parent.image = process.image;
+  parent.signals = signals;
+  parent.file_creation_mask = file_creation_mask;
+  memcpy(parent.current_directory, process.current_directory,
+         sizeof(parent.current_directory));
+  memcpy(parent.executable_path, process.executable_path,
+         sizeof(parent.executable_path));
+  parent.active = true;
+  parent.memory_saved = false;
+  if (!save_parent_memory()) {
+    parent.active = false;
+    discard_parent_descriptors();
+    return false;
+  }
+  reset_descriptors();
+  if (!restore_executable_image(background.executable_path)) {
+    write_text("MIKOS:BACKGROUND_IMAGE_RESTORE_FAIL\n");
+    shutdown(9);
+  }
+  u32 cursor = 0;
+  memcpy(reinterpret_cast<void*>(background.mutable_begin),
+         background_backup + cursor, background.mutable_size);
+  cursor += background.mutable_size;
+  memcpy(reinterpret_cast<void*>(background.mmap_begin),
+         background_backup + cursor,
+         background.mmap_size);
+  cursor += background.mmap_size;
+  memcpy(reinterpret_cast<void*>(background.stack_begin),
+         background_backup + cursor, background.stack_size);
+  move_saved_descriptors(background_descriptors,
+                         background_standard_redirects);
+  frame = background.frame;
+  process.brk = background.brk;
+  process.mmap_begin = background.mmap_begin;
+  process.mmap_cursor = background.mmap_cursor;
+  process.mutable_begin = background.mutable_begin;
+  process.pid = background.pid;
+  process.parent_pid = background.parent_pid;
+  process.process_group = background.process_group;
+  process.session = background.session;
+  process.image = background.image;
+  signals = background.signals;
+  file_creation_mask = background.file_creation_mask;
+  memcpy(process.current_directory, background.current_directory,
+         sizeof(process.current_directory));
+  memcpy(process.executable_path, background.executable_path,
+         sizeof(process.executable_path));
+  process.image_replaced = true;
+  background.wait = BackgroundWait::none;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:BACKGROUND_RESUME ");
+  write_u32(background.pid);
+  write_text("\n");
+#endif
+  return true;
 }
 
 [[nodiscard]] bool text_is(const char* actual, const char* expected) {
@@ -677,6 +945,15 @@ void discard_parent_descriptors() {
     return error(Errno::bad_file_descriptor);
   }
   auto& slot = descriptors[descriptor - 3];
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  if (slot.node == Node::network_socket) {
+    write_text("MIKOS:TCP_CLOSE fd=");
+    write_u32(descriptor);
+    write_text(" handle=");
+    write_u32(slot.socket);
+    write_text("\n");
+  }
+#endif
   release_descriptor(slot);
   return 0;
 }
@@ -902,8 +1179,8 @@ void discard_parent_descriptors() {
   return socket_error(result);
 }
 
-[[nodiscard]] i32 accept(u32 descriptor, u32 address, u32 length_address,
-                         u32 flags) {
+[[nodiscard]] i32 accept(TrapFrame& frame, u32 descriptor, u32 address,
+                         u32 length_address, u32 flags) {
   constexpr u32 supported_flags = abi::socket::sock_nonblock |
                                   abi::socket::sock_cloexec;
   if ((flags & ~supported_flags) != 0) {
@@ -934,6 +1211,9 @@ void discard_parent_descriptors() {
         (flags & abi::socket::sock_nonblock) != 0) {
       return error(Errno::try_again);
     }
+    if (park_background(frame, listening->socket)) {
+      return static_cast<i32>(frame.x[10]);
+    }
     network::poll();
   }
   if (accepted.result != network::SocketResult::success) {
@@ -949,6 +1229,14 @@ void discard_parent_descriptors() {
   result.node = Node::network_socket;
   result.flags = flags & abi::socket::sock_nonblock;
   result.socket = accepted.handle;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:TCP_ACCEPT fd=");
+  write_u32(accepted_descriptor);
+  write_text(" buffered=");
+  const auto* accepted_socket = network::socket_slot(accepted.handle);
+  write_u32(accepted_socket == nullptr ? 0 : accepted_socket->receive_size);
+  write_text("\n");
+#endif
   return static_cast<i32>(accepted_descriptor);
 }
 
@@ -1250,7 +1538,8 @@ void discard_parent_descriptors() {
   return contents == nullptr ? 0 : text_size(contents);
 }
 
-[[nodiscard]] i32 read_virtual(u32 descriptor, u32 address, u32 size) {
+[[nodiscard]] i32 read_virtual(TrapFrame& frame, u32 descriptor, u32 address,
+                               u32 size) {
   Descriptor* selected = descriptor_slot(descriptor);
   if (selected == nullptr) {
     return error(Errno::bad_file_descriptor);
@@ -1270,6 +1559,25 @@ void discard_parent_descriptors() {
       const auto result = network::socket_read(
           slot.socket, reinterpret_cast<u8*>(address), size);
       if (result.result == network::SocketResult::success) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+        static u32 tcp_read_calls = 0;
+        ++tcp_read_calls;
+        if (tcp_read_calls == 1) {
+          write_text("MIKOS:TCP_READ ");
+          write_u32(result.size);
+          write_text("\n");
+        }
+        if ((tcp_read_calls % 8) == 0 || result.size > 1) {
+          write_text("MIKOS:TCP_READ_PROGRESS calls=");
+          write_u32(tcp_read_calls);
+          write_text(" size=");
+          write_u32(result.size);
+          write_text(" remaining=");
+          const auto* socket = network::socket_slot(slot.socket);
+          write_u32(socket == nullptr ? 0 : socket->receive_size);
+          write_text("\n");
+        }
+#endif
         return static_cast<i32>(result.size);
       }
       if (result.result == network::SocketResult::end_of_file) {
@@ -1280,6 +1588,9 @@ void discard_parent_descriptors() {
       }
       if ((slot.flags & abi::socket::sock_nonblock) != 0) {
         return error(Errno::try_again);
+      }
+      if (park_background(frame, slot.socket)) {
+        return static_cast<i32>(frame.x[10]);
       }
       network::poll();
     }
@@ -1625,7 +1936,7 @@ static_assert(sizeof(Statx) == 256);
   return static_cast<i32>(count);
 }
 
-[[maybe_unused, nodiscard]] i32 ppoll(u32 address, u32 count,
+[[maybe_unused, nodiscard]] i32 ppoll(TrapFrame& frame, u32 address, u32 count,
                                      u32 timeout_address, bool time64) {
   if (count > 16 ||
       !user_memory.contains(address, count * sizeof(Pollfd32))) {
@@ -1695,10 +2006,34 @@ static_assert(sizeof(Statx) == 256);
     if (ready_count != 0 || arch::time_ticks() >= deadline) {
       return ready_count;
     }
+    for (u32 i = 0; i < count; ++i) {
+      constexpr u16 poll_input = 1;
+      const i32 descriptor = poll_descriptors[i].descriptor;
+      if (descriptor < 0 || descriptor >= 16 ||
+          (poll_descriptors[i].events & poll_input) == 0) {
+        continue;
+      }
+      const auto* slot = descriptor_slot(static_cast<u32>(descriptor));
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      static bool reported_ppoll_wait = false;
+      if (!reported_ppoll_wait && slot != nullptr &&
+          slot->node == Node::network_socket) {
+        reported_ppoll_wait = true;
+        write_text("MIKOS:PPOLL_NETWORK_WAIT fd=");
+        write_u32(static_cast<u32>(descriptor));
+        write_text("\n");
+      }
+#endif
+      if (slot != nullptr && slot->node == Node::network_socket &&
+          park_background(frame, slot->socket)) {
+        return static_cast<i32>(frame.x[10]);
+      }
+    }
   }
 }
 
-[[maybe_unused, nodiscard]] i32 pselect6(u32 count, u32 read_address,
+[[maybe_unused, nodiscard]] i32 pselect6(TrapFrame& frame, u32 count,
+                                        u32 read_address,
                                         u32 write_address, u32 error_address,
                                         u32 timeout_address, bool time64) {
   if (count > 16) {
@@ -1783,6 +2118,27 @@ static_assert(sizeof(Statx) == 256);
       }
       return ready_count;
     }
+    for (u32 descriptor = 0; descriptor < count; ++descriptor) {
+      const u32 bit = 1u << descriptor;
+      if ((requested_read & bit) == 0) {
+        continue;
+      }
+      const auto* slot = descriptor_slot(descriptor);
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      static bool reported_pselect_wait = false;
+      if (!reported_pselect_wait && slot != nullptr &&
+          slot->node == Node::network_socket) {
+        reported_pselect_wait = true;
+        write_text("MIKOS:PSELECT_NETWORK_WAIT fd=");
+        write_u32(descriptor);
+        write_text("\n");
+      }
+#endif
+      if (slot != nullptr && slot->node == Node::network_socket &&
+          park_background(frame, slot->socket)) {
+        return static_cast<i32>(frame.x[10]);
+      }
+    }
   }
 }
 
@@ -1813,7 +2169,7 @@ static_assert(sizeof(Statx) == 256);
     const auto executable = drivers::fs::root::lookup(canonical);
     node = executable ? Node{executable.value} : Node{Node::none};
   }
-  if (!parent.active || !user_memory.aligned(argv, alignof(u32))) {
+  if (!user_memory.aligned(argv, alignof(u32))) {
     return error(Errno::invalid_argument);
   }
   if (node == Node::none || node != Node::filesystem ||
@@ -1843,7 +2199,8 @@ static_assert(sizeof(Statx) == 256);
     }
     arguments[count] = argument_storage[count];
   }
-  if (count == 0 || count == max_arguments || !save_parent_memory()) {
+  if (count == 0 || count == max_arguments ||
+      (parent.active && !save_parent_memory())) {
     return error(Errno::no_memory);
   }
   if (!replace_with_executable(frame, canonical, arguments, count)) {
@@ -2274,6 +2631,24 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
     }
     const auto result = network::socket_write(
         slot.socket, reinterpret_cast<const u8*>(address), size);
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    if (result.result == network::SocketResult::success) {
+      static u32 tcp_write_calls = 0;
+      ++tcp_write_calls;
+      if (tcp_write_calls == 1) {
+        write_text("MIKOS:TCP_WRITE ");
+        write_u32(result.size);
+        write_text("\n");
+      }
+      if (tcp_write_calls <= 8) {
+        write_text("MIKOS:TCP_WRITE_PROGRESS calls=");
+        write_u32(tcp_write_calls);
+        write_text(" size=");
+        write_u32(result.size);
+        write_text("\n");
+      }
+    }
+#endif
     return result.result == network::SocketResult::success
                ? static_cast<i32>(result.size)
                : socket_error(result.result);
@@ -2357,11 +2732,12 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   return static_cast<i32>(total);
 }
 
-[[nodiscard]] i32 read(u32 descriptor, u32 address, u32 size) {
+[[nodiscard]] i32 read(TrapFrame& frame, u32 descriptor, u32 address,
+                       u32 size) {
   if (descriptor >= 3 ||
       (descriptor < 3 &&
        standard_redirects[descriptor].node != Node::none)) {
-    return read_virtual(descriptor, address, size);
+    return read_virtual(frame, descriptor, address, size);
   }
   if (descriptor != 0) {
     return error(Errno::bad_file_descriptor);
@@ -2375,6 +2751,9 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   u8 data{};
   while (!drivers::uart::receive(data)) {
     network::poll();
+    if (resume_background_if_ready(frame)) {
+      return static_cast<i32>(frame.x[10]);
+    }
   }
 #ifdef MIKOS_TRIBE_INTERACTIVE
   auto echo_input = [](u8 value) {
@@ -2573,6 +2952,38 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   if (descriptors[descriptor - 3].node != Node::network_socket) {
     return error(Errno::not_a_tty);
   }
+  if (request == network::siocgifconf) {
+    if (!user_memory.contains(address, sizeof(network::Ifconf32))) {
+      return error(Errno::bad_address);
+    }
+    auto* configuration =
+        reinterpret_cast<network::Ifconf32*>(address);
+    if (configuration->length < 0) {
+      return error(Errno::invalid_argument);
+    }
+    if (configuration->buffer == 0) {
+      configuration->length = sizeof(network::Ifreq32);
+      return 0;
+    }
+    if (configuration->length < static_cast<i32>(sizeof(network::Ifreq32))) {
+      configuration->length = 0;
+      return 0;
+    }
+    if (!user_memory.contains(configuration->buffer,
+                              sizeof(network::Ifreq32))) {
+      return error(Errno::bad_address);
+    }
+    network::Ifreq32 interface_request{};
+    network::write_interface_name(interface_request.name);
+    if (network::interface_ioctl(network::siocgifaddr, interface_request) !=
+        network::InterfaceControlResult::success) {
+      return error(Errno::no_device);
+    }
+    memcpy(reinterpret_cast<void*>(configuration->buffer),
+           &interface_request, sizeof(interface_request));
+    configuration->length = sizeof(interface_request);
+    return 0;
+  }
   if (!user_memory.contains(address, sizeof(network::Ifreq32))) {
     return error(Errno::bad_address);
   }
@@ -2693,15 +3104,11 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
 }
 
 [[nodiscard]] i32 unknown(u32 number) {
-#ifndef MIKOS_TRIBE_INTERACTIVE
   write_text("MIKOS:ENOSYS ");
   write_u32(number);
   write_text(" ");
   write_text(abi::riscv32::name(number));
   write_text("\n");
-#else
-  static_cast<void>(number);
-#endif
   return error(Errno::no_syscall);
 }
 
@@ -2751,13 +3158,13 @@ i32 dispatch_syscall(TrapFrame& frame) {
       return writev(a0, a1, a2);
     case Syscall::pselect6:
 #ifdef MIKOS_TRIBE_INTERACTIVE
-      return pselect6(a0, a1, a2, a3, a4, false);
+      return pselect6(frame, a0, a1, a2, a3, a4, false);
 #else
       return unknown(number);
 #endif
     case Syscall::ppoll:
 #ifdef MIKOS_TRIBE_INTERACTIVE
-      return ppoll(a0, a1, a2, false);
+      return ppoll(frame, a0, a1, a2, false);
 #else
       return unknown(number);
 #endif
@@ -2775,7 +3182,7 @@ i32 dispatch_syscall(TrapFrame& frame) {
                  ? 0
                  : error(Errno::io);
     case Syscall::read:
-      return read(a0, a1, a2);
+      return read(frame, a0, a1, a2);
     case Syscall::chdir:
       return chdir(a0);
     case Syscall::faccessat:
@@ -2799,11 +3206,27 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::exit_group:
       if (parent.active) {
         const u32 restored_child_pid = parent.child_pid;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+        write_text("MIKOS:CHILD_EXIT pid=");
+        write_u32(process.pid);
+        write_text(" status=");
+        write_u32(a0);
+        write_text("\n");
+#endif
         if (child_tid_address != 0 &&
             user_memory.contains(child_tid_address, sizeof(u32))) {
           *reinterpret_cast<u32*>(child_tid_address) = 0;
         }
         child_tid_address = 0;
+        if (background.used && process.pid == background.pid) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+          write_text("MIKOS:BACKGROUND_EXIT status=");
+          write_u32(a0);
+          write_text("\n");
+#endif
+          background.used = false;
+          background.wait = BackgroundWait::none;
+        }
         restore_parent(frame, a0);
         // The trap handler stores the dispatch result in the restored a0.
         // Returning a constant here made every fork after PID 2 appear to its
@@ -2905,13 +3328,13 @@ i32 dispatch_syscall(TrapFrame& frame) {
 #endif
     case Syscall::ppoll64:
 #ifdef MIKOS_TRIBE_INTERACTIVE
-      return ppoll(a0, a1, a2, true);
+      return ppoll(frame, a0, a1, a2, true);
 #else
       return unknown(number);
 #endif
     case Syscall::pselect6_time64:
 #ifdef MIKOS_TRIBE_INTERACTIVE
-      return pselect6(a0, a1, a2, a3, a4, true);
+      return pselect6(frame, a0, a1, a2, a3, a4, true);
 #else
       return unknown(number);
 #endif
@@ -2932,9 +3355,9 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::listen:
       return listen(a0, a1);
     case Syscall::accept:
-      return accept(a0, a1, a2, 0);
+      return accept(frame, a0, a1, a2, 0);
     case Syscall::accept4:
-      return accept(a0, a1, a2, a3);
+      return accept(frame, a0, a1, a2, a3);
     case Syscall::getsockname:
       return socket_name(a0, a1, a2, false);
     case Syscall::getpeername:

@@ -13,6 +13,7 @@ class Filesystem {
     proc_pid1,
     proc_pid2,
     proc_net,
+    proc_net_dev,
     proc_stat,
     proc_meminfo,
     proc_loadavg,

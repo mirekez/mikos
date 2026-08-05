@@ -1,0 +1,32 @@
+diff --git a/tribe/TribeTest.h b/tribe/TribeTest.h
+index b0a796f..6e7cf64 100644
+--- a/tribe/TribeTest.h
++++ b/tribe/TribeTest.h
+@@ -1177,7 +1177,7 @@ public:
+ #ifdef MULTICORE
+         for (i = 0; i < TEST_TRIBE_CPU_CORES; ++i) {
+             tribe.clint_msip_per_core_in[i] = clint.msip_per_hart_out[i]();
+-            tribe.clint_mtip_per_core_in[i] = clint.mtip_per_hart_out[i]();
++            tribe.clint_mtip_per_core_in[i] = clint.mtip_for_hart(i);
+             tribe.external_irq_per_core_in[i] = plic.external_irq_per_hart_out[i]();
+         }
+ #else
+diff --git a/tribe/devices/CLINT.h b/tribe/devices/CLINT.h
+index 014b735..5769723 100644
+--- a/tribe/devices/CLINT.h
++++ b/tribe/devices/CLINT.h
+@@ -127,6 +127,14 @@ private:
+     }
+ 
+ public:
++    // Verilator's C++ wrapper must sample the register state directly.  The
++    // generated per-hart _PORT callbacks can retain the value from an earlier
++    // combinational evaluation and leave a pending timer invisible to a core.
++    bool mtip_for_hart(size_t hart)
++    {
++        return (uint64_t)mtime_reg >= (uint64_t)mtimecmp_reg[hart];
++    }
++
+     void _assign()
+     {
+ #ifdef MULTICORE

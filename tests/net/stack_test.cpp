@@ -17,6 +17,7 @@ bool receive_ready{};
 alignas(4) mikos::u8 transmitted_frame[1536]{};
 mikos::u32 transmitted_size{};
 mikos::u32 transmit_count{};
+mikos::u32 transmit_failures{};
 
 void make_packet(mikos::u8 flags, mikos::u32 sequence,
                  mikos::u32 acknowledgement,
@@ -96,6 +97,10 @@ bool receive(Frame& frame) {
 }
 
 bool transmit(const u8* frame, u32 size) {
+  if (transmit_failures != 0) {
+    --transmit_failures;
+    return false;
+  }
   if (size > sizeof(transmitted_frame)) {
     return false;
   }
@@ -180,7 +185,30 @@ int main() {
   MIKOS_CHECK(suite, response_view.payload_size == sizeof(response));
   MIKOS_CHECK(suite, response_view.payload[1] == 'o');
 
-  make_packet(tcp_ack | tcp_fin, 1005, server_sequence + 5);
+  // If the polling NIC cannot send the immediate ACK, a later poll retries it.
+  // One further duplicate is retained for a silent compute interval, but no
+  // third duplicate is emitted (which could trigger fast retransmit).
+  const u8 slow_request[]{'x'};
+  transmit_failures = 1;
+  make_packet(tcp_ack | tcp_psh, 1005, server_sequence + 5, slow_request,
+              sizeof(slow_request));
+  const u32 before_failed_ack = transmit_count;
+  poll();
+  MIKOS_CHECK(suite, transmit_count == before_failed_ack);
+  poll();
+  MIKOS_CHECK(suite, transmit_count == before_failed_ack + 1);
+  TcpView retried_ack{};
+  MIKOS_CHECK(suite, transmitted_tcp(retried_ack));
+  MIKOS_CHECK(suite, retried_ack.tcp->flags == tcp_ack);
+  MIKOS_CHECK(suite, net32(retried_ack.tcp->acknowledgement) == 1006);
+  poll();
+  MIKOS_CHECK(suite, transmit_count == before_failed_ack + 2);
+  poll();
+  MIKOS_CHECK(suite, transmit_count == before_failed_ack + 2);
+  MIKOS_CHECK(suite,
+              socket_read(accepted.handle, input, sizeof(input)).size == 1);
+
+  make_packet(tcp_ack | tcp_fin, 1006, server_sequence + 5);
   poll();
   MIKOS_CHECK(suite,
               socket_read(accepted.handle, input, sizeof(input)).result ==

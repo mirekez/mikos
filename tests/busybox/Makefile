@@ -33,6 +33,7 @@ DROPBEAR_REFERENCE ?=
 DROPBEAR_SOURCE := $(BUILD)/dropbear-source
 DROPBEAR := $(DROPBEAR_SOURCE)/dropbear
 DROPBEAR_CONFIG := config/dropbear_localoptions.h
+DROPBEAR_PATCH := patches/dropbear-mikos.patch
 DROPBEAR_ADDRESS := 0x81000000
 
 ROOTFS_STAGE := $(BUILD)/rootfs
@@ -40,6 +41,7 @@ ROOTFS_IMAGE := $(BUILD)/rootfs.ext4
 ROOTFS_SIZE ?= 16M
 ROOTFS_CONFIG := rootfs/etc/group rootfs/etc/inittab rootfs/etc/passwd \
 	rootfs/etc/shells rootfs/etc/init.d/rcS \
+	rootfs/etc/dropbear/dropbear_ed25519_host_key.b64 \
 	rootfs/root/.ssh/authorized_keys
 
 .PHONY: all payloads rootfs busybox stress-ng dropbear clean
@@ -101,9 +103,11 @@ $(DROPBEAR_SOURCE)/.source-ready: download_dropbear.sh
 		$(DROPBEAR_SHA256)
 
 $(DROPBEAR): $(DROPBEAR_SOURCE)/.source-ready $(DROPBEAR_CONFIG) \
+		$(DROPBEAR_PATCH) \
 		build_dropbear.sh
 	./build_dropbear.sh $(DROPBEAR_SOURCE) $(RISCV_PREFIX) \
-		$(DROPBEAR_ADDRESS) $(LLVM_READELF) $(JOBS) $(DROPBEAR_CONFIG)
+		$(DROPBEAR_ADDRESS) $(LLVM_READELF) $(JOBS) $(DROPBEAR_CONFIG) \
+		$(DROPBEAR_PATCH)
 
 $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 		$(ROOTFS_CONFIG) set_rootfs_owners.sh verify_rootfs.sh
@@ -126,6 +130,9 @@ $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 	install -m 0644 rootfs/etc/passwd $(ROOTFS_STAGE)/etc/passwd
 	install -m 0644 rootfs/etc/shells $(ROOTFS_STAGE)/etc/shells
 	install -m 0755 rootfs/etc/init.d/rcS $(ROOTFS_STAGE)/etc/init.d/rcS
+	base64 -d rootfs/etc/dropbear/dropbear_ed25519_host_key.b64 \
+		>$(ROOTFS_STAGE)/etc/dropbear/dropbear_ed25519_host_key
+	chmod 0600 $(ROOTFS_STAGE)/etc/dropbear/dropbear_ed25519_host_key
 	install -m 0600 rootfs/root/.ssh/authorized_keys \
 		$(ROOTFS_STAGE)/root/.ssh/authorized_keys
 	touch -d @946684800 $(ROOTFS_STAGE) $(ROOTFS_STAGE)/bin \
@@ -142,6 +149,7 @@ $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 		$(ROOTFS_STAGE)/bin/sh $(ROOTFS_STAGE)/sbin/init \
 		$(ROOTFS_STAGE)/bin/stress-ng \
 		$(ROOTFS_STAGE)/usr/sbin/dropbear \
+		$(ROOTFS_STAGE)/etc/dropbear/dropbear_ed25519_host_key \
 		$(ROOTFS_STAGE)/etc/group $(ROOTFS_STAGE)/etc/inittab \
 		$(ROOTFS_STAGE)/etc/passwd $(ROOTFS_STAGE)/etc/shells \
 		$(ROOTFS_STAGE)/etc/init.d/rcS \

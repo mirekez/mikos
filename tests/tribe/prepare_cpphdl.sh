@@ -81,6 +81,12 @@ git -C "$source_tree" apply \
   "$root/tests/tribe/patches/polling-dma-invalidate.patch"
 git -C "$source_tree" apply \
   "$root/tests/tribe/patches/preserve-host-control-frames.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/full-ethernet-frame-rx.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/verilator-memory-config.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/multicore-clint-hart0.patch"
 
 "$toolchain/bin/cmake" -S "$source_tree" -B "$build_tree" \
   -G "Unix Makefiles" \

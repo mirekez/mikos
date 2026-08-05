@@ -52,7 +52,16 @@ void rearm_scheduler_timer() {
 void start_scheduler_timer() {
   rearm_scheduler_timer();
   constexpr u32 machine_timer_enable = 1u << 7;
-  asm volatile("csrs mie, %0" : : "r"(machine_timer_enable));
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  // Tribe exposes CLINT timer pending as STIP while the CPU is outside
+  // M-mode, including MikOS user mode. Enable both forms so the same timer
+  // continues across privilege transitions.
+  constexpr u32 supervisor_timer_enable = 1u << 5;
+  constexpr u32 timer_enable = machine_timer_enable | supervisor_timer_enable;
+#else
+  constexpr u32 timer_enable = machine_timer_enable;
+#endif
+  asm volatile("csrs mie, %0" : : "r"(timer_enable));
 }
 
 u64 time_ticks() {

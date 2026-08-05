@@ -14,6 +14,7 @@ inline constexpr u16 interface_running = 0x0040;
 inline constexpr u16 interface_multicast = 0x1000;
 
 inline constexpr u32 siocgifflags = 0x8913;
+inline constexpr u32 siocgifconf = 0x8912;
 inline constexpr u32 siocsifflags = 0x8914;
 inline constexpr u32 siocgifaddr = 0x8915;
 inline constexpr u32 siocsifaddr = 0x8916;
@@ -21,8 +22,11 @@ inline constexpr u32 siocgifbrdaddr = 0x8919;
 inline constexpr u32 siocsifbrdaddr = 0x891a;
 inline constexpr u32 siocgifnetmask = 0x891b;
 inline constexpr u32 siocsifnetmask = 0x891c;
+inline constexpr u32 siocgifmetric = 0x891d;
+inline constexpr u32 siocgifmtu = 0x8921;
 inline constexpr u32 siocgifhwaddr = 0x8927;
 inline constexpr u32 siocgifindex = 0x8933;
+inline constexpr u32 siocgiftxqlen = 0x8942;
 
 struct [[gnu::packed]] Sockaddr32 {
   u16 family;
@@ -33,6 +37,9 @@ union IfreqValue32 {
   Sockaddr32 address;
   u16 flags;
   i32 index;
+  i32 metric;
+  i32 mtu;
+  i32 queue_length;
   u8 bytes[16];
 };
 
@@ -41,9 +48,15 @@ struct [[gnu::packed]] Ifreq32 {
   IfreqValue32 value;
 };
 
+struct [[gnu::packed]] Ifconf32 {
+  i32 length;
+  u32 buffer;
+};
+
 static_assert(sizeof(Sockaddr32) == 16);
 static_assert(sizeof(IfreqValue32) == 16);
 static_assert(sizeof(Ifreq32) == 32);
+static_assert(sizeof(Ifconf32) == 8);
 
 struct InterfaceState {
   MacAddress mac{{0, 0, 0, 0, 0, 0}};
@@ -109,6 +122,15 @@ constexpr void update_broadcast(InterfaceState& state) {
       return InterfaceControlResult::success;
     case siocgifflags:
       interface_request.value.flags = state.flags;
+      return InterfaceControlResult::success;
+    case siocgifmetric:
+      interface_request.value.metric = 0;
+      return InterfaceControlResult::success;
+    case siocgifmtu:
+      interface_request.value.mtu = 1500;
+      return InterfaceControlResult::success;
+    case siocgiftxqlen:
+      interface_request.value.queue_length = 1000;
       return InterfaceControlResult::success;
     case siocsifflags:
       state.flags = interface_request.value.flags;

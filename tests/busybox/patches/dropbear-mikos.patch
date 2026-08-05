@@ -1,0 +1,141 @@
+--- a/src/common-session.c
++++ b/src/common-session.c
+@@ -42,6 +42,7 @@ static int ident_readln(int fd, char* buf, int count);
+ static void read_session_identification(void);
+ 
+ struct sshsession ses; /* GLOBAL */
++static buffer *pending_session_input;
+ 
+ /* called only at the start of a session, set up initial state */
+ void common_session_init(int sock_in, int sock_out) {
+@@ -353,6 +354,7 @@ void session_cleanup() {
+ 	cleanup_buf(&ses.hash);
+ 	cleanup_buf(&ses.payload);
+ 	cleanup_buf(&ses.readbuf);
++	cleanup_buf(&pending_session_input);
+ 	cleanup_buf(&ses.writepayload);
+ 	cleanup_buf(&ses.kexhashbuf);
+ 	cleanup_buf(&ses.transkexinit);
+@@ -377,6 +379,22 @@ void send_session_identification() {
+ 	writebuf_enqueue(writebuf);
+ }
+ 
++ssize_t session_read(int fd, void *output, size_t size) {
++	if (pending_session_input != NULL) {
++		unsigned int available = pending_session_input->len -
++			pending_session_input->pos;
++		unsigned int count = MIN((unsigned int)size, available);
++		memcpy(output, buf_getptr(pending_session_input, count), count);
++		buf_incrpos(pending_session_input, count);
++		if (pending_session_input->pos == pending_session_input->len) {
++			buf_free(pending_session_input);
++			pending_session_input = NULL;
++		}
++		return count;
++	}
++	return read(fd, output, size);
++}
++
+ static void read_session_identification() {
+ 	/* max length of 255 chars */
+ 	char linebuf[256];
+@@ -426,6 +444,8 @@ static int ident_readln(int fd, char* buf, int count) {
+ 	
+-	char in;
++	unsigned char input[256];
+ 	int pos = 0;
+ 	int num = 0;
++	int input_pos;
++	int line_done = 0;
+ 	fd_set fds;
+ 	struct timeval timeout;
+@@ -460,8 +480,7 @@ static int ident_readln(int fd, char* buf, int count) {
+-		/* Have to go one byte at a time, since we don't want to read past
+-		 * the end, and have to somehow shove bytes back into the normal
+-		 * packet reader */
++		/* Read a batch and preserve bytes beyond the identification line. */
+ 		if (FD_ISSET(fd, &fds)) {
+-			num = read(fd, &in, 1);
++			num = read(fd, input,
++				MIN((int)sizeof(input), count - 1 - pos));
+ 			/* a "\n" is a newline, "\r" we want to read in and keep going
+ 			 * so that it won't be read as part of the next line */
+ 			if (num < 0) {
+@@ -479,18 +498,37 @@ static int ident_readln(int fd, char* buf, int count) {
+ 				return -1;
+ 			}
+ 
++			for (input_pos = 0; input_pos < num; input_pos++) {
+ #if DROPBEAR_FUZZ
+-			fuzz_dump(&in, 1);
++				fuzz_dump(&input[input_pos], 1);
+ #endif
+ 
+-			if (in == '\n') {
+-				/* end of ident string */
+-				break;
+-			}
+-			/* we don't want to include '\r's */
+-			if (in != '\r') {
+-				buf[pos] = in;
+-				pos++;
++				if (input[input_pos] == '\n') {
++					unsigned int remaining = num - input_pos - 1;
++					/* Preserve a coalesced first SSH packet for read_packet(). */
++					if (remaining != 0) {
++						if (pending_session_input == NULL) {
++							pending_session_input = buf_new(remaining);
++						} else if (pending_session_input->size -
++								pending_session_input->pos < remaining) {
++							pending_session_input = buf_resize(pending_session_input,
++								pending_session_input->pos + remaining);
++						}
++						buf_putbytes(pending_session_input,
++							&input[input_pos + 1], remaining);
++						buf_setpos(pending_session_input, 0);
++					}
++					line_done = 1;
++					break;
++				}
++				/* we don't want to include '\r's */
++				if (input[input_pos] != '\r') {
++					buf[pos] = input[input_pos];
++					pos++;
++				}
+ 			}
++			if (line_done) {
++				break;
++			}
+ 		}
+ 	}
+--- a/src/packet.c
++++ b/src/packet.c
+@@ -180,7 +180,8 @@ void read_packet() {
+ 		 */
+ 		len = 0;
+ 	} else {
+-		len = read(ses.sock_in, buf_getptr(ses.readbuf, maxlen), maxlen);
++		len = session_read(ses.sock_in, buf_getptr(ses.readbuf, maxlen),
++			maxlen);
+ 
+ 		if (len == 0) {
+ 			ses.remoteclosed();
+@@ -231,7 +232,7 @@ static int read_packet_init() {
+ 	maxlen = blocksize - ses.readbuf->pos;
+ 			
+ 	/* read the rest of the packet if possible */
+-	slen = read(ses.sock_in, buf_getwriteptr(ses.readbuf, maxlen),
++	slen = session_read(ses.sock_in, buf_getwriteptr(ses.readbuf, maxlen),
+ 			maxlen);
+ 	if (slen == 0) {
+ 		ses.remoteclosed();
+--- a/src/session.h
++++ b/src/session.h
+@@ -48,6 +48,7 @@ void common_session_init(int sock_in, int sock_out);
+ void session_loop(void(*loophandler)(void)) ATTRIB_NORETURN;
+ void session_cleanup(void);
+ void send_session_identification(void);
++ssize_t session_read(int fd, void *output, size_t size);
+ void send_msg_ignore(void);
+ void ignore_recv_response(void);
+ 

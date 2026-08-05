@@ -319,15 +319,16 @@ bool replace_with_executable(TrapFrame& frame, const char* path,
   process.brk = image.brk;
   process.mutable_begin = image.mutable_begin;
   if (busybox) {
-    process.mmap_cursor = 0x81800000;
+    process.mmap_begin = 0x81800000;
   } else {
     constexpr u32 heap_reserve = 512 * 1024;
     if (process.brk > user_stack_top - heap_reserve) {
       return false;
     }
-    process.mmap_cursor = align_up(process.brk + heap_reserve,
-                                   static_cast<u32>(4096));
+    process.mmap_begin = align_up(process.brk + heap_reserve,
+                                  static_cast<u32>(4096));
   }
+  process.mmap_cursor = process.mmap_begin;
   const u32 stack = make_initial_stack(image, arguments, argument_count);
   for (auto& value : frame.x) {
     value = 0;
@@ -342,6 +343,12 @@ bool replace_with_executable(TrapFrame& frame, const char* path,
 
 void restore_busybox_image() {
   static_cast<void>(required_image("/bin/busybox"));
+}
+
+bool restore_executable_image(const char* path) {
+  const auto node = drivers::fs::root::lookup(path);
+  Image image{};
+  return node && load_image(node.value, image);
 }
 
 void start_stress_ng(TrapFrame& frame) {
@@ -427,7 +434,17 @@ extern "C" void kernel_main() {
     static_cast<void>(network::boot_probe());
   }
 #else
-  static_cast<void>(network_ready);
+  if (network_ready) {
+    network::Ifreq32 request{};
+    network::write_interface_name(request.name);
+    network::write_sockaddr_ipv4(
+        request.value.address, Ipv4Address{{192, 168, 76, 2}});
+    static_cast<void>(network::interface_ioctl(network::siocsifaddr, request));
+    network::write_sockaddr_ipv4(
+        request.value.address, Ipv4Address{{255, 255, 255, 0}});
+    static_cast<void>(
+        network::interface_ioctl(network::siocsifnetmask, request));
+  }
   write_text("MIKOS:TRIBE_INTERACTIVE\n");
 #endif
   if (!drivers::fs::root::initialize()) {
@@ -438,7 +455,8 @@ extern "C" void kernel_main() {
   const auto image = required_image("/bin/busybox");
   process.brk = image.brk;
   process.mutable_begin = image.mutable_begin;
-  process.mmap_cursor = 0x81800000;
+  process.mmap_begin = 0x81800000;
+  process.mmap_cursor = process.mmap_begin;
   process.pid = 1;
   process.parent_pid = 0;
   process.process_group = 1;
@@ -446,7 +464,9 @@ extern "C" void kernel_main() {
   copy_path(process.current_directory, "/");
   copy_path(process.executable_path, "/bin/busybox");
 #ifdef MIKOS_TRIBE_INTERACTIVE
-  constexpr const char* arguments[] = {"busybox", "sh", "-i", "+m"};
+  constexpr const char* arguments[] = {
+      "busybox", "sh", "-c",
+      ". /etc/init.d/rcS mikos; exec /bin/busybox sh -i +m"};
 #else
   constexpr const char* arguments[] = {
       "busybox", "sh", "-c",
@@ -474,6 +494,10 @@ extern "C" void kernel_main() {
   // Minimal Tribe excludes the optional PMP CSR range.
   write_text("MIKOS:PMP_UNAVAILABLE\n");
   write_text("MIKOS:TRIBE_POLLING\n");
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  arch::start_scheduler_timer();
+  write_text("MIKOS:NETWORK_TIMER_ON\n");
+#endif
   enter_user(image.entry, stack);
 #else
   if (!protect_kernel()) {
@@ -583,12 +607,25 @@ extern "C" void trap_handler(mikos::TrapFrame* frame) {
     }
   }
 #endif
-  if (frame->mcause == arch::scheduler_timer_cause) {
+  if (frame->mcause == arch::scheduler_timer_cause
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      || frame->mcause == arch::tribe_user_timer_cause
+#endif
+  ) {
     arch::rearm_scheduler_timer();
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    static bool reported_network_timer_tick = false;
+    if (!reported_network_timer_tick) {
+      reported_network_timer_tick = true;
+      write_text("MIKOS:NETWORK_TIMER_TICK\n");
+    }
+    return;
+#else
     u32 mstatus;
     asm volatile("csrr %0, mstatus" : "=r"(mstatus));
     scheduler.on_timer(*frame, (mstatus & 8u) == 0);
     return;
+#endif
   }
   if (frame->mcause == user_ecall) {
     frame->x[10] = static_cast<u32>(dispatch_syscall(*frame));

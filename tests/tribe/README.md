@@ -105,6 +105,30 @@ implemented; remote command and PTY execution remain pending. The rootfs `rcS`
 uses the same explicit foreground-in-background invocation so a normal init
 boot owns and reports the service.
 
+The MikOS test build also enables Dropbear's test-only `none` cipher. A
+Dropbear client built with the same `DROPBEAR_NONE_CIPHER=1` option can request
+an integrity-protected but unencrypted SSH transport:
+
+```sh
+ssh-agent sh -c 'ssh-add build/mikos_ssh_key >/dev/null && \
+  build/tests/busybox/dropbear-host/dbclient -c none -y \
+    root@192.168.76.2'
+```
+
+The normal BusyBox/rootfs and `tribe_interactive.sh` builds produce this host
+client automatically. `make dropbear-client` remains available as an explicit
+incremental target.
+
+This is cleartext SSH rather than raw Telnet: key exchange, host and user
+authentication, SSH framing, and the packet MAC still run. Stock OpenSSH does
+not implement the `none` cipher, so `/usr/bin/ssh -c none` cannot be used.
+
+Interactive runs and regressions use `tribe_interactive.sh` as their single
+public entry point and use the native C++ Tribe simulator by default. Select an
+automated regression with `--test ping`, `--test tcp`, `--test process`, or
+`--test ssh`. Pass `--verilator` explicitly when testing the separate
+Verilator pipeline.
+
 Type `q` to leave `top`, `exit` to shut down cleanly, Ctrl+C to stop the
 simulator, or Ctrl+Z to suspend it. `TRIBE_INTERACTIVE_CYCLES` controls the
 safety limit.

@@ -35,6 +35,8 @@ DROPBEAR := $(DROPBEAR_SOURCE)/dropbear
 DROPBEAR_CONFIG := config/dropbear_localoptions.h
 DROPBEAR_PATCH := patches/dropbear-mikos.patch
 DROPBEAR_ADDRESS := 0x81000000
+DROPBEAR_HOST_OUT := $(BUILD)/dropbear-host
+DROPBEAR_HOST_STAMP := $(DROPBEAR_HOST_OUT)/.built
 
 ROOTFS_STAGE := $(BUILD)/rootfs
 ROOTFS_IMAGE := $(BUILD)/rootfs.ext4
@@ -44,19 +46,21 @@ ROOTFS_CONFIG := rootfs/etc/group rootfs/etc/inittab rootfs/etc/passwd \
 	rootfs/etc/dropbear/dropbear_ed25519_host_key.b64 \
 	rootfs/root/.ssh/authorized_keys
 
-.PHONY: all payloads rootfs busybox stress-ng dropbear clean
+.PHONY: all payloads rootfs busybox stress-ng dropbear dropbear-client clean
 
 all: rootfs
 
 payloads: rootfs
 
-rootfs: $(ROOTFS_IMAGE)
+rootfs: $(ROOTFS_IMAGE) $(DROPBEAR_HOST_STAMP)
 
 busybox: $(BUSYBOX)
 
 stress-ng: $(STRESS_NG)
 
 dropbear: $(DROPBEAR)
+
+dropbear-client: $(DROPBEAR_HOST_STAMP)
 
 $(BUSYBOX_SOURCE)/.source-ready: download_busybox.sh
 	@mkdir -p $(BUILD)
@@ -108,6 +112,11 @@ $(DROPBEAR): $(DROPBEAR_SOURCE)/.source-ready $(DROPBEAR_CONFIG) \
 	./build_dropbear.sh $(DROPBEAR_SOURCE) $(RISCV_PREFIX) \
 		$(DROPBEAR_ADDRESS) $(LLVM_READELF) $(JOBS) $(DROPBEAR_CONFIG) \
 		$(DROPBEAR_PATCH)
+
+$(DROPBEAR_HOST_STAMP): $(DROPBEAR) $(DROPBEAR_CONFIG) \
+		build_dropbear_host.sh
+	./build_dropbear_host.sh $(DROPBEAR_SOURCE) $(DROPBEAR_HOST_OUT) \
+		$(JOBS) $(DROPBEAR_CONFIG)
 
 $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 		$(ROOTFS_CONFIG) set_rootfs_owners.sh verify_rootfs.sh

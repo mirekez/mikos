@@ -10,11 +10,12 @@ tap_socket="${TRIBE_ETH_TAP_SOCKET:-/tmp/tribe-ethgig.sock}"
 tap_name="${TRIBE_INTERACTIVE_TAP:-tap-tribe}"
 host_address="${TRIBE_INTERACTIVE_HOST_ADDRESS:-192.168.76.1}"
 guest_address="${TRIBE_INTERACTIVE_GUEST_ADDRESS:-192.168.76.2}"
-use_verilator=0
+use_verilator="${TRIBE_INTERACTIVE_USE_VERILATOR:-0}"
 verilator_cores=1
+test_mode=""
 
 usage() {
-  echo "usage: $0 [--multicore] [--verilator] [--tap-socket PATH]" >&2
+  echo "usage: $0 [--multicore] [--verilator] [--tap-socket PATH] [--test ping|tcp|process|ssh]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -27,6 +28,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --verilator)
       use_verilator=1
+      ;;
+    --test)
+      if [[ $# -lt 2 ]]; then
+        usage
+        echo "--test requires ping, tcp, process, or ssh" >&2
+        exit 2
+      fi
+      test_mode="$2"
+      shift
       ;;
     --tap-socket)
       if [[ $# -lt 2 ]]; then
@@ -49,6 +59,30 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ "$use_verilator" != 0 && "$use_verilator" != 1 ]]; then
+  echo "TRIBE_INTERACTIVE_USE_VERILATOR must be 0 or 1" >&2
+  exit 2
+fi
+
+if [[ -n "$test_mode" ]]; then
+  case "$test_mode" in
+    ping|tcp|process|ssh)
+      ;;
+    *)
+      usage
+      echo "unknown interactive test: $test_mode" >&2
+      exit 2
+      ;;
+  esac
+  test_arguments=()
+  if [[ "$simulator_name" == "tribe64_multicore" ]]; then
+    test_arguments+=(--multicore)
+  fi
+  exec env TRIBE_INTERACTIVE_USE_VERILATOR="$use_verilator" \
+    "$root/tests/tribe/run_interactive_${test_mode}.sh" \
+    "${test_arguments[@]}"
+fi
 
 if [[ ! -S "$tap_socket" ]]; then
   echo "Tribe TAP bridge socket is missing: $tap_socket" >&2
@@ -79,7 +113,7 @@ if [[ ! -x "$simulator" ]]; then
   "$root/tests/tribe/prepare_cpphdl.sh" "${prepare_arguments[@]}"
 fi
 
-make -C "$root" "$kernel_target"
+make -C "$root" "$kernel_target" dropbear-client
 
 if [[ ! -t 0 ]]; then
   echo "warning: stdin is not a terminal; UART input will follow stdin" >&2
@@ -95,7 +129,7 @@ simulator_arguments=(--noveril)
 if [[ "$use_verilator" == 1 ]]; then
   verilator_simulator="$(dirname "$simulator")/TribeTest_${verilator_cores}/obj_dir/VTribeTest"
   if [[ ! -x "$verilator_simulator" || "$simulator" -nt "$verilator_simulator" ]]; then
-    echo "Building the faster Verilator model for interactive execution..." >&2
+    echo "Building the optional Verilator model for interactive execution..." >&2
     "$simulator" 1
   fi
   if [[ ! -x "$verilator_simulator" ]]; then

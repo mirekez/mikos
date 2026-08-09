@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 multicore=()
+simulator_backend=()
 tap="${TRIBE_INTERACTIVE_TAP:-tap-tribe}"
 guest_address="${TRIBE_INTERACTIVE_GUEST_ADDRESS:-192.168.76.2}"
 host_address="${TRIBE_INTERACTIVE_HOST_ADDRESS:-192.168.76.1}"
@@ -18,14 +19,26 @@ if [[ "${MIKOS_TRIBE_SSH_NETNS_ENTERED:-0}" != 1 &&
   exec unshare -Urn env MIKOS_TRIBE_SSH_NETNS_ENTERED=1 "$0" "$@"
 fi
 
-if [[ "${1:-}" == "--multicore" ]]; then
-  multicore+=(--multicore)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --multicore)
+      multicore=(--multicore)
+      ;;
+    --verilator)
+      simulator_backend=(--verilator)
+      ;;
+    -h|--help)
+      echo "usage: $0 [--multicore] [--verilator]" >&2
+      exit 0
+      ;;
+    *)
+      echo "usage: $0 [--multicore] [--verilator]" >&2
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
   shift
-fi
-if [[ $# -ne 0 ]]; then
-  echo "usage: $0 [--multicore]" >&2
-  exit 2
-fi
+done
 for required in "$identity" "$root/build/tests/busybox/rootfs.ext4" \
                 "$root/build/tests/qemu/ethgig_tap"; do
   if [[ ! -f "$required" ]]; then
@@ -93,7 +106,8 @@ fi
 TRIBE_INTERACTIVE_CYCLES="${TRIBE_INTERACTIVE_SSH_CYCLES:-0}" \
   TRIBE_INTERACTIVE_SD_IMAGE="$rootfs" \
   "$root/tests/tribe/tribe_interactive.sh" "${multicore[@]}" \
-  --verilator --tap-socket "$tap_socket" <"$input" >"$log" 2>&1 &
+  "${simulator_backend[@]}" --tap-socket "$tap_socket" \
+  <"$input" >"$log" 2>&1 &
 simulator_pid=$!
 
 wait_for_log() {

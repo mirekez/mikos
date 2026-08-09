@@ -87,7 +87,7 @@ ETHGIG_TAP := $(BUILD)/tests/qemu/ethgig_tap
 TRIBE_NET_PEER := $(BUILD)/tests/tribe/net_peer
 
 .PHONY: all test kernel tribe-kernel tribe-interactive-kernel \
-	tribe-interactive-multicore-kernel inspect busybox \
+	tribe-interactive-multicore-kernel inspect busybox dropbear-client \
 	stress-ng run qemu-test qemu-net-test qemu-ssh-top tribe-prepare tribe-test \
 	tribe-interactive tribe-interactive-ping-test \
 	tribe-interactive-tcp-test tribe-interactive-process-test \
@@ -111,7 +111,10 @@ inspect: $(KERNEL_ELF)
 	tests/kernel/inspect_kernel.sh
 
 busybox:
-	$(MAKE) -C tests/busybox busybox
+	$(MAKE) -C tests/busybox all
+
+dropbear-client:
+	$(MAKE) -C tests/busybox dropbear-client
 
 stress-ng:
 	$(MAKE) -C tests/busybox stress-ng
@@ -222,19 +225,19 @@ tribe-interactive: $(ROOTFS_IMAGE) $(TRIBE_INTERACTIVE_ELF)
 
 tribe-interactive-ping-test: $(ROOTFS_IMAGE) \
 		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
-	tests/tribe/run_interactive_ping.sh --multicore
+	tests/tribe/tribe_interactive.sh --multicore --test ping
 
 tribe-interactive-tcp-test: $(ROOTFS_IMAGE) \
 		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
-	tests/tribe/run_interactive_tcp.sh --multicore
+	tests/tribe/tribe_interactive.sh --multicore --test tcp
 
 tribe-interactive-process-test: $(ROOTFS_IMAGE) \
 		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
-	tests/tribe/run_interactive_process.sh --multicore
+	tests/tribe/tribe_interactive.sh --multicore --test process
 
 tribe-interactive-ssh-test: $(ROOTFS_IMAGE) \
 		$(TRIBE_INTERACTIVE_MULTICORE_ELF)
-	tests/tribe/run_interactive_ssh.sh --multicore
+	tests/tribe/tribe_interactive.sh --multicore --test ssh
 
 qemu-ssh-top: ethgig-tap
 	tests/qemu/run_qemu_ssh.sh

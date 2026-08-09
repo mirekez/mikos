@@ -10,6 +10,10 @@
 #define DROPBEAR_SFTPSERVER 0
 #define DROPBEAR_REEXEC 0
 
+/* Test-only cleartext SSH transport for the cycle-accurate simulator.  Key
+ * exchange, public-key authentication, and packet integrity remain enabled. */
+#define DROPBEAR_NONE_CIPHER 1
+
 /* Curve25519 and Ed25519 execute in a cycle-accurate RV32 simulator.  The
  * upstream five-minute pre-authentication limit can expire while a valid key
  * exchange is still computing, so give the interactive regression enough

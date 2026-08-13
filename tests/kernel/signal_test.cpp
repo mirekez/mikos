@@ -16,7 +16,7 @@ int main() {
   MIKOS_CHECK(suite,
               signals.set_action(signal_stop, {}) == SignalStatus::uncatchable);
 
-  SignalAction action{0x81234000, 0x10000000, 0x81235000,
+  SignalAction action{0x81234000, 0x10000000,
                       SignalState::bit(2) | SignalState::bit(signal_kill)};
   SignalAction old{};
   MIKOS_CHECK(suite, signals.set_action(10, action, &old) ==

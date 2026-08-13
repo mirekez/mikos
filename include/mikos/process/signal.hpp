@@ -28,7 +28,6 @@ enum class SignalDefault : u8 { ignore, terminate, stop, resume };
 struct SignalAction {
   u32 handler{};
   u32 flags{};
-  u32 restorer{};
   u64 mask{};
 
   [[nodiscard]] constexpr bool operator==(const SignalAction&) const = default;

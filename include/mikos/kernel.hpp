@@ -38,6 +38,7 @@ void write_text(const char* text);
 void write_u32(u32 value);
 [[noreturn]] void shutdown(u32 code);
 i32 dispatch_syscall(TrapFrame& frame);
+void deliver_pending_signal(TrapFrame& frame);
 void start_stress_ng(TrapFrame& frame);
 void restore_busybox_image();
 [[nodiscard]] bool restore_executable_image(const char* path);

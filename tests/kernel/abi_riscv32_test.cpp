@@ -22,6 +22,7 @@ int main() {
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::brk) == 214);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::clone) == 220);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::execve) == 221);
+  MIKOS_CHECK(suite, static_cast<mikos::i32>(Errno::text_file_busy) == 26);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::wait4) == 260);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::statx) == 291);
   MIKOS_CHECK(suite,

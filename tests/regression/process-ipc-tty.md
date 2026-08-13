@@ -20,11 +20,17 @@ Current executable gates:
   process-group-selected nonzero child reaping through RV32 glibc's `waitid`
   emulation. The sequence reaches PID 8, detecting duplicate parent-side fork
   results as well as stale or cross-parent zombies.
+- `tests/tribe/run_interactive_ssh.sh --multicore`: native-C++ Tribe boot,
+  background Dropbear listen/accept and none-mode test authentication, nested
+  command fork in a second concurrent address space, zombie publication,
+  caught `SIGCHLD` delivery through an RV32 Linux-compatible signal frame,
+  `rt_sigreturn`, `waitpid` reaping, remote output, exit status, and clean SSH
+  channel close.
 - All four RV32 kernels compile the live `pipe2`, signal-mask/action,
   process-group/session, `/dev/ptmx`, `/dev/pts/N`, PTY I/O, and terminal-ioctl
   adapters with freestanding warnings treated as errors.
 
-Still pending target gates include concurrent/background runnable ordering,
-blocking pipe wake/replay, nested fork, user signal-frame delivery and
-`rt_sigreturn`, canonical line discipline, a PTY-attached shell, and Dropbear.
+Still pending target gates include general concurrent/background runnable
+ordering, blocking pipe wake/replay, canonical line discipline, and a fully
+interactive PTY-attached SSH shell.
 They must not be inferred from host state-machine coverage or compile success.

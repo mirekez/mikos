@@ -12,6 +12,8 @@ inline constexpr u32 socket_receive_capacity = 4096;
 inline constexpr u32 listen_backlog_capacity = 4;
 inline constexpr u32 reassembly_capacity = 16;
 inline constexpr u32 reassembly_segment_capacity = 1500;
+inline constexpr u32 transmit_capacity = 16;
+inline constexpr u32 transmit_segment_capacity = 1024;
 
 enum class SocketState : u8 {
   free,
@@ -103,6 +105,27 @@ struct ReassemblySegment {
   u16 size{};
   bool finish{};
   u8 data[reassembly_segment_capacity]{};
+};
+
+struct TransmitKey {
+  u8 handle{invalid_socket};
+  u32 sequence{};
+
+  [[nodiscard]] constexpr bool operator==(const TransmitKey&) const = default;
+};
+
+struct TransmitHash {
+  [[nodiscard]] constexpr u32 operator()(TransmitKey key) const {
+    return key.sequence * 2654435761u + key.handle * 97u;
+  }
+};
+
+struct TransmitSegment {
+  u32 retry_at{};
+  u16 size{};
+  u8 flags{};
+  u8 attempts{};
+  u8 data[transmit_segment_capacity]{};
 };
 
 class SocketTable {

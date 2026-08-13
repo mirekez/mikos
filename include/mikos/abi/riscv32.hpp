@@ -112,6 +112,7 @@ enum class Errno : i32 {
   is_directory = 21,
   invalid_argument = 22,
   not_a_tty = 25,
+  text_file_busy = 26,
   no_space = 28,
   broken_pipe = 32,
   read_only_filesystem = 30,

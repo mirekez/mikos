@@ -51,6 +51,7 @@ class BootstrapStack {
     if (drivers::net::receive(frame)) {
       record(handle(frame));
     }
+    flush_retransmission();
   }
 
   [[nodiscard]] InterfaceControlResult ioctl(u32 request, Ifreq32& value) {
@@ -82,7 +83,12 @@ class BootstrapStack {
       ++value->send_next;
       value->send_closed = true;
     }
-    return sockets_.release(handle);
+    const bool final_reference = value->references == 1;
+    const auto result = sockets_.release(handle);
+    if (final_reference && result == SocketResult::success) {
+      clear_transmissions(handle);
+    }
+    return result;
   }
 
   [[nodiscard]] SocketResult socket_bind(u8 handle, Endpoint local) {
@@ -115,14 +121,13 @@ class BootstrapStack {
         value->send_closed) {
       return {SocketResult::not_connected, 0};
     }
-    constexpr u32 maximum_segment = 1024;
     u32 written = 0;
     while (written < size) {
-      const u32 count = size - written > maximum_segment
-                            ? maximum_segment
+      const u32 count = size - written > transmit_segment_capacity
+                            ? transmit_segment_capacity
                             : size - written;
-      if (!send_segment(*value, tcp_ack | tcp_psh, input + written, count,
-                        value->send_next)) {
+      if (!queue_transmission(handle, *value, tcp_ack | tcp_psh,
+                              input + written, count, value->send_next)) {
         return written == 0 ? ReadResult{SocketResult::no_space, 0}
                             : ReadResult{SocketResult::success, written};
       }
@@ -329,6 +334,74 @@ class BootstrapStack {
     return drivers::net::transmit(transmit_buffer_, headers + payload_size);
   }
 
+  [[nodiscard]] bool queue_transmission(u8 handle, const SocketSlot& socket,
+                                        u8 flags, const u8* payload,
+                                        u32 payload_size, u32 sequence) {
+    bool inserted = false;
+    auto* pending = transmissions_.find_or_emplace({handle, sequence}, inserted);
+    if (pending == nullptr || !inserted || payload_size > sizeof(pending->data)) {
+      return false;
+    }
+    pending->size = static_cast<u16>(payload_size);
+    pending->flags = flags;
+    pending->attempts = 0;
+    for (u32 i = 0; i < payload_size; ++i) {
+      pending->data[i] = payload[i];
+    }
+    if (!send_segment(socket, flags, pending->data, payload_size, sequence)) {
+      static_cast<void>(transmissions_.erase({handle, sequence}));
+      return false;
+    }
+    pending->attempts = 1;
+    pending->retry_at = poll_epoch_ + retransmission_poll_interval;
+    return true;
+  }
+
+  void acknowledge_transmissions(u8 handle, u32 acknowledgement,
+                                  u32 send_next) {
+    if (static_cast<i32>(acknowledgement - send_next) > 0) {
+      return;
+    }
+    transmissions_.erase_if([&](TransmitKey key) {
+      if (key.handle != handle) {
+        return false;
+      }
+      const auto* segment = transmissions_.find(key);
+      if (segment == nullptr) {
+        return false;
+      }
+      const u32 end = key.sequence + segment->size;
+      return static_cast<i32>(acknowledgement - end) >= 0;
+    });
+  }
+
+  void clear_transmissions(u8 handle) {
+    transmissions_.erase_if(
+        [handle](TransmitKey key) { return key.handle == handle; });
+  }
+
+  void flush_retransmission() {
+    ++poll_epoch_;
+    bool transmitted = false;
+    transmissions_.for_each([&](TransmitKey key, TransmitSegment& pending) {
+      if (transmitted || static_cast<i32>(poll_epoch_ - pending.retry_at) < 0) {
+        return;
+      }
+      auto* socket = sockets_.slot(key.handle);
+      if (socket == nullptr ||
+          (socket->state != SocketState::established &&
+           socket->state != SocketState::close_wait)) {
+        return;
+      }
+      if (send_segment(*socket, pending.flags, pending.data, pending.size,
+                       key.sequence)) {
+        ++pending.attempts;
+        pending.retry_at = poll_epoch_ + retransmission_poll_interval;
+        transmitted = true;
+      }
+    });
+  }
+
   void flush_acknowledgement(SocketSlot& socket) {
     if (socket.acknowledgement_retries == 0 ||
         (socket.state != SocketState::established &&
@@ -394,6 +467,7 @@ class BootstrapStack {
       return;
     }
     if ((view.tcp->flags & tcp_rst) != 0) {
+      clear_transmissions(connection);
       sockets_.reset(connection);
       return;
     }
@@ -408,6 +482,10 @@ class BootstrapStack {
               SocketResult::success) {
         return;
       }
+    }
+    if ((view.tcp->flags & tcp_ack) != 0) {
+      acknowledge_transmissions(connection, acknowledgement,
+                                 value->send_next);
     }
     const bool finish = (view.tcp->flags & tcp_fin) != 0;
     if (view.payload_size != 0 || finish) {
@@ -453,10 +531,18 @@ class BootstrapStack {
 
   InterfaceState state_{};
   SocketTable sockets_{};
+  container::FixedUnorderedMap<TransmitKey, TransmitSegment,
+                               transmit_capacity, TransmitHash>
+      transmissions_{};
   alignas(4) u8 transmit_buffer_[1536]{};
   char tcp_table_buffer_[2048]{};
   u32 next_sequence_{0x4d494b4f};
   u16 next_identification_{1};
+  u32 poll_epoch_{};
+  // Polling is the only clock available in the bootstrap stack. Keep the
+  // interval long enough to avoid racing a normal delayed ACK, but short
+  // enough to recover while a cycle-accurate userspace process is blocked.
+  static constexpr u32 retransmission_poll_interval = 256;
   bool initialized_{};
   bool arp_replied_{};
   bool echo_replied_{};

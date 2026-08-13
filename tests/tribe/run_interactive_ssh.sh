@@ -9,10 +9,8 @@ guest_address="${TRIBE_INTERACTIVE_GUEST_ADDRESS:-192.168.76.2}"
 host_address="${TRIBE_INTERACTIVE_HOST_ADDRESS:-192.168.76.1}"
 guest_port="${TRIBE_INTERACTIVE_SSH_PORT:-22}"
 wall_timeout="${TRIBE_INTERACTIVE_SSH_TIMEOUT:-3600}"
-connect_timeout="${TRIBE_INTERACTIVE_SSH_CONNECT_TIMEOUT:-$wall_timeout}"
-identity="${TRIBE_INTERACTIVE_SSH_IDENTITY:-$root/build/mikos_ssh_key}"
-require_auth="${TRIBE_INTERACTIVE_SSH_REQUIRE_AUTH:-0}"
-early_client="${TRIBE_INTERACTIVE_SSH_EARLY_CLIENT:-0}"
+dropbear_identity="${TRIBE_INTERACTIVE_DROPBEAR_IDENTITY:-$root/build/tests/busybox/dropbear-host/mikos_ssh_key.dropbear}"
+early_client="${TRIBE_INTERACTIVE_SSH_EARLY_CLIENT:-1}"
 
 if [[ "${MIKOS_TRIBE_SSH_NETNS_ENTERED:-0}" != 1 &&
       -z "${TRIBE_ETH_TAP_SOCKET:-}" ]]; then
@@ -39,7 +37,8 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
-for required in "$identity" "$root/build/tests/busybox/rootfs.ext4" \
+for required in "$dropbear_identity" \
+                "$root/build/tests/busybox/rootfs.ext4" \
                 "$root/build/tests/qemu/ethgig_tap"; do
   if [[ ! -f "$required" ]]; then
     echo "missing required SSH test input: $required" >&2
@@ -135,24 +134,15 @@ wait_for_log() {
   return 1
 }
 
-ssh_options=(
-  -i "$identity"
-  -o BatchMode=yes
-  -o "ConnectTimeout=$connect_timeout"
-  -o TCPKeepAlive=no
-  -o StrictHostKeyChecking=no
-  -o UserKnownHostsFile=/dev/null
-  -o LogLevel=DEBUG3
-  -o SessionType=none
-  -o KexAlgorithms=curve25519-sha256
-  -o HostKeyAlgorithms=ssh-ed25519
-  -o PubkeyAcceptedAlgorithms=ssh-ed25519
-  -o Ciphers=chacha20-poly1305@openssh.com
-)
-
 start_ssh_client() {
-  ssh "${ssh_options[@]}" -N -p "$guest_port" "root@$guest_address" \
-    >"$ssh_log" 2>&1 &
+  # A previous cycle-accurate run can leave a FAILED neighbor entry behind.
+  # Let this connection perform fresh ARP resolution; a short host ping is not
+  # a useful readiness gate because a single guest packet may take longer than
+  # ping's wall-clock timeout.
+  ip neigh flush to "$guest_address" dev "$tap" 2>/dev/null || true
+  "$root/build/tests/busybox/dropbear-host/dbclient" \
+    -i "$dropbear_identity" -c none -y -y -T -p "$guest_port" \
+    "root@$guest_address" 'echo MIKOS_SSH_AUTH_OK' >"$ssh_log" 2>&1 &
   ssh_pid=$!
 }
 
@@ -162,6 +152,8 @@ if [[ "$early_client" == 1 ]]; then
 else
   wait_for_log 'MIKOS_SSH_STARTING 192\.168\.76\.2:22 pid='
   wait_for_log '/ # '
+  printf 'ps\n' >&3
+  wait_for_log 'dropbear([[:space:]]|$)'
   printf 'ifconfig -a\n' >&3
   wait_for_log 'inet addr:192\.168\.76\.2'
   printf 'netstat -ln\n' >&3
@@ -171,39 +163,23 @@ fi
 
 wait_for_log 'MIKOS:TCP_ACCEPT fd='
 wait_for_log 'MIKOS:TCP_WRITE 26'
-wait_for_log 'MIKOS:BACKGROUND_CONNECTION_HOLD '
-
-if [[ "$require_auth" != 1 ]]; then
-  kill "$ssh_pid" 2>/dev/null || true
-  wait "$ssh_pid" 2>/dev/null || true
-  ssh_pid=""
-  echo "PASS: ifconfig reported $guest_address and resident Dropbear accepted SSH and advanced beyond its identification on $guest_address:$guest_port"
-  exit 0
-fi
-
-authenticated=0
+wait_for_log 'MIKOS:TCP_READ '
 deadline=$((SECONDS + wall_timeout))
 while ((SECONDS < deadline)); do
-  if rg -q '^Authenticated to ' "$ssh_log" 2>/dev/null; then
-    authenticated=1
-    break
+  if rg -q '^MIKOS_SSH_AUTH_OK$' "$ssh_log" 2>/dev/null; then
+    wait "$ssh_pid"
+    ssh_pid=""
+    echo "PASS: background Dropbear completed the none-mode public-key proof and executed a remote command on $guest_address:$guest_port"
+    exit 0
   fi
   if ! kill -0 "$ssh_pid" 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
-if [[ "$authenticated" != 1 ]]; then
-  wait "$ssh_pid" 2>/dev/null || true
-  ssh_pid=""
-  sed -n '1,420p' "$log" >&2
-  sed -n '1,240p' "$ssh_log" >&2
-  echo "FAIL: Dropbear listened but public-key authentication failed" >&2
-  exit 1
-fi
-
-kill "$ssh_pid" 2>/dev/null || true
 wait "$ssh_pid" 2>/dev/null || true
 ssh_pid=""
-
-echo "PASS: ifconfig reported $guest_address and background Dropbear listened and accepted public-key SSH authentication on $guest_address:$guest_port"
+sed -n '1,420p' "$log" >&2
+sed -n '1,240p' "$ssh_log" >&2
+echo "FAIL: Dropbear listened but dbclient -c none did not complete its public-key proof and remote command" >&2
+exit 1

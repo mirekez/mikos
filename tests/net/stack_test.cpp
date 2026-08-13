@@ -185,12 +185,75 @@ int main() {
   MIKOS_CHECK(suite, response_view.payload_size == sizeof(response));
   MIKOS_CHECK(suite, response_view.payload[1] == 'o');
 
+  // Outbound payload is retained until a cumulative ACK covers it. This is
+  // essential for SSH, which emits adjacent identification/KEX records and
+  // cannot recover if either TCP segment is silently lost by the polling NIC.
+  const u32 before_response_retry = transmit_count;
+  for (u32 i = 0; i < 255; ++i) {
+    poll();
+  }
+  MIKOS_CHECK(suite, transmit_count == before_response_retry);
+  poll();
+  MIKOS_CHECK(suite, transmit_count == before_response_retry + 1);
+  TcpView response_retry{};
+  MIKOS_CHECK(suite, transmitted_tcp(response_retry));
+  MIKOS_CHECK(suite, net32(response_retry.tcp->sequence) ==
+                         server_sequence + 1);
+  MIKOS_CHECK(suite, response_retry.payload_size == sizeof(response));
+
+  // Two writes occupy distinct sequence-keyed slots. A cumulative ACK of the
+  // first must leave only the second eligible for retransmission.
+  make_packet(tcp_ack, 1005, server_sequence + 5);
+  poll();
+  transmit_failures = 1;
+  const u8 failed_write[]{'?'};
+  const auto failed_write_result =
+      socket_write(accepted.handle, failed_write, sizeof(failed_write));
+  MIKOS_CHECK(suite,
+              failed_write_result.result == SocketResult::no_space);
+  const u32 after_failed_write = transmit_count;
+  for (u32 i = 0; i < 300; ++i) {
+    poll();
+  }
+  MIKOS_CHECK(suite, transmit_count == after_failed_write);
+  const u8 first_followup[]{'a', 'b', 'c'};
+  const u8 second_followup[]{'d', 'e'};
+  MIKOS_CHECK(suite,
+              socket_write(accepted.handle, first_followup,
+                           sizeof(first_followup)).size ==
+                  sizeof(first_followup));
+  MIKOS_CHECK(suite,
+              socket_write(accepted.handle, second_followup,
+                           sizeof(second_followup)).size ==
+                  sizeof(second_followup));
+  TcpView second_followup_view{};
+  MIKOS_CHECK(suite, transmitted_tcp(second_followup_view));
+  MIKOS_CHECK(suite, net32(second_followup_view.tcp->sequence) ==
+                         server_sequence + 8);
+  make_packet(tcp_ack, 1005, server_sequence + 8);
+  poll();
+  const u32 before_second_retry = transmit_count;
+  for (u32 i = 0; i < 254; ++i) {
+    poll();
+  }
+  MIKOS_CHECK(suite, transmit_count == before_second_retry);
+  poll();
+  MIKOS_CHECK(suite, transmit_count == before_second_retry + 1);
+  TcpView second_retry{};
+  MIKOS_CHECK(suite, transmitted_tcp(second_retry));
+  MIKOS_CHECK(suite, net32(second_retry.tcp->sequence) ==
+                         server_sequence + 8);
+  MIKOS_CHECK(suite, second_retry.payload_size == sizeof(second_followup));
+  MIKOS_CHECK(suite, second_retry.payload[0] == 'd');
+  make_packet(tcp_ack, 1005, server_sequence + 10);
+  poll();
+
   // If the polling NIC cannot send the immediate ACK, a later poll retries it.
   // One further duplicate is retained for a silent compute interval, but no
   // third duplicate is emitted (which could trigger fast retransmit).
   const u8 slow_request[]{'x'};
   transmit_failures = 1;
-  make_packet(tcp_ack | tcp_psh, 1005, server_sequence + 5, slow_request,
+  make_packet(tcp_ack | tcp_psh, 1005, server_sequence + 10, slow_request,
               sizeof(slow_request));
   const u32 before_failed_ack = transmit_count;
   poll();
@@ -208,7 +271,7 @@ int main() {
   MIKOS_CHECK(suite,
               socket_read(accepted.handle, input, sizeof(input)).size == 1);
 
-  make_packet(tcp_ack | tcp_fin, 1006, server_sequence + 5);
+  make_packet(tcp_ack | tcp_fin, 1006, server_sequence + 10);
   poll();
   MIKOS_CHECK(suite,
               socket_read(accepted.handle, input, sizeof(input)).result ==
@@ -231,6 +294,11 @@ int main() {
   TcpView final_fin{};
   MIKOS_CHECK(suite, transmitted_tcp(final_fin));
   MIKOS_CHECK(suite, final_fin.tcp->flags == (tcp_fin | tcp_ack));
+  const u32 before_closed_polling = transmit_count;
+  for (u32 i = 0; i < 300; ++i) {
+    poll();
+  }
+  MIKOS_CHECK(suite, transmit_count == before_closed_polling);
   MIKOS_CHECK(suite, socket_close(listener.handle) == SocketResult::success);
 
   const u32 before_corrupt = transmit_count;

@@ -89,39 +89,67 @@ runnable; background ordering and blocking-pipe scheduling remain pending.
 
 `make tribe-interactive-ssh-test` configures the guest address, starts
 Dropbear with `-F` as a BusyBox background job, waits for the kernel TCP listen
-marker, verifies that `ifconfig -a` reports `eth0` at `192.168.76.2/24`, and
-then verifies a real host SSH connection through `accept` and the server
-identification write on the multicore Tribe profile. After accepting a
+marker, and then verifies a real host SSH connection through `accept`,
+identification, KEXINIT, and the next client key-exchange packet on the
+multicore Tribe profile. Optional shell-side diagnostics verify that `ps`
+reports the parked `dropbear` PID, `ifconfig -a` reports `eth0` at
+`192.168.76.2/24`, and `netstat` reports port 22. After accepting a
 connection, Dropbear remains resident across network waits so SSH packets do
 not trigger repeated SD-backed executable swaps; UART input can preempt it
 back to the interactive shell. BusyBox `ip address`
 still requires the unimplemented `AF_NETLINK`/rtnetlink interface; use
-`ifconfig -a` for interface inspection in this profile. Set
-`TRIBE_INTERACTIVE_SSH_REQUIRE_AUTH=1` for the extended Curve25519/Ed25519
-public-key authentication check; guest software crypto takes tens of minutes in
-the four-core cycle-accurate model. The test-only Dropbear build handles the
-accepted connection without forking because nested background fork is not
-implemented; remote command and PTY execution remain pending. The rootfs `rcS`
-uses the same explicit foreground-in-background invocation so a normal init
-boot owns and reports the service.
+`ifconfig -a` for interface inspection in this profile. The regression requires
+the paired `dbclient -c none` to match the authorized Ed25519 public key,
+complete the test-only transcript proof, and execute a remote marker command;
+a transport-only exchange is not considered a pass. The
+test-only Dropbear build handles the accepted connection without forking
+because nested background fork is not implemented. The rootfs `rcS` uses the
+same explicit foreground-in-background invocation so a normal init boot owns
+and reports the service.
+
+The automated SSH regression starts its single client as soon as the TCP
+listen marker appears. Set `TRIBE_INTERACTIVE_SSH_EARLY_CLIENT=0` only when
+the slower shell-side `ps`, `ifconfig`, and `netstat` checks are also wanted.
+
+Do not start a second Dropbear after `MIKOS:TCP_LISTEN 22` and
+`MIKOS:BACKGROUND_PARK 2`; those markers mean the original service is alive.
+The interactive kernel rejects a duplicate execution with `ETXTBSY` instead
+of suspending the shell through another slow initialization. Restart Dropbear
+only after `MIKOS:BACKGROUND_EXIT` reports that the parked service ended.
 
 The MikOS test build also enables Dropbear's test-only `none` cipher. A
 Dropbear client built with the same `DROPBEAR_NONE_CIPHER=1` option can request
-an integrity-protected but unencrypted SSH transport:
+an unencrypted, unauthenticated SSH test transport:
 
 ```sh
-ssh-agent sh -c 'ssh-add build/mikos_ssh_key >/dev/null && \
-  build/tests/busybox/dropbear-host/dbclient -c none -y \
-    root@192.168.76.2'
+ip neigh flush to 192.168.76.2 dev tap-tribe 2>/dev/null || true
+build/tests/busybox/dropbear-host/dbclient \
+  -i build/tests/busybox/dropbear-host/mikos_ssh_key.dropbear \
+  -c none -y -y root@192.168.76.2
 ```
 
-The normal BusyBox/rootfs and `tribe_interactive.sh` builds produce this host
-client automatically. `make dropbear-client` remains available as an explicit
-incremental target.
+Flushing the neighbor entry avoids an immediate `No route to host` from stale
+state left by an earlier run. The client then performs fresh ARP resolution as
+part of the connection. Do not gate the client behind a short ping: one packet
+can take longer than ping's wall-clock timeout in the cycle-accurate model.
+Use this client as the first SSH connection after Dropbear starts; the current
+`DEBUG_NOFORK` test profile accepts one connection.
 
-This is cleartext SSH rather than raw Telnet: key exchange, host and user
-authentication, SSH framing, and the packet MAC still run. Stock OpenSSH does
-not implement the `none` cipher, so `/usr/bin/ssh -c none` cannot be used.
+The normal BusyBox/rootfs and `tribe_interactive.sh` builds produce this host
+client and a converted Dropbear-format copy of the test identity automatically.
+Passing the OpenSSH private-key file directly to `dbclient -i` is unsupported;
+use the generated `mikos_ssh_key.dropbear`. `make dropbear-client` remains
+available as an explicit incremental target.
+
+This is a deliberately insecure cleartext SSH protocol test mode rather than
+raw Telnet: host-key and user-public-key state machines and SSH framing still
+run, and the configured public key must match `authorized_keys`, but this mode
+provides no cryptographic host/user authentication, confidentiality, or packet
+MAC. For speed, the paired client/server use a deterministic precomputed
+X25519 transcript and a SHA-256 transcript/public-key proof in place of
+Ed25519 only when `-c none` is explicitly selected. AES/encrypted transports
+retain upstream X25519 and Ed25519. Stock OpenSSH does not implement the
+`none` cipher, so `/usr/bin/ssh -c none` cannot be used.
 
 Interactive runs and regressions use `tribe_interactive.sh` as their single
 public entry point and use the native C++ Tribe simulator by default. Select an

@@ -57,6 +57,12 @@ struct TickTime {
   u32 nanoseconds;
 };
 
+struct ActiveSignalFrame {
+  TrapFrame frame{};
+  u64 blocked{};
+  bool active{};
+};
+
 struct SuspendedParent {
   TrapFrame frame{};
   u32 brk{};
@@ -75,6 +81,7 @@ struct SuspendedParent {
   u32 session{};
   u32 image{};
   process_model::SignalState signals{};
+  ActiveSignalFrame signal_frame{};
   u32 file_creation_mask{};
   char current_directory[256]{};
   char executable_path[256]{};
@@ -84,6 +91,8 @@ struct SuspendedParent {
 };
 
 SuspendedParent parent{};
+SuspendedParent nested_ancestor{};
+bool nested_ancestor_saved{};
 struct WaitableChild {
   u32 pid{};
   u32 parent_pid{};
@@ -96,6 +105,7 @@ WaitableChild waitable_children[8]{};
 u32 file_creation_mask{0022};
 u32 child_tid_address{};
 process_model::SignalState signals{};
+ActiveSignalFrame active_signal_frame{};
 inline constexpr u32 parent_backup_capacity = 4 * 1024 * 1024;
 [[gnu::section(".noinit")]] alignas(16)
 u8 parent_backup[parent_backup_capacity];
@@ -118,6 +128,7 @@ struct ParkedBackground {
   u32 session{};
   u32 image{};
   process_model::SignalState signals{};
+  ActiveSignalFrame signal_frame{};
   u32 file_creation_mask{};
   char current_directory[256]{};
   char executable_path[256]{};
@@ -138,6 +149,8 @@ void restore_parent_descriptors();
 void discard_parent_descriptors();
 [[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket);
 [[nodiscard]] bool resume_background_if_ready(TrapFrame& frame);
+[[nodiscard]] bool stack_suspended_ancestor();
+void reinstate_suspended_ancestor(TrapFrame& frame);
 
 [[nodiscard]] bool waitable_space() {
   for (const auto& child : waitable_children) {
@@ -180,6 +193,15 @@ void refresh_child_waitable() {
   parent.stack_size = user_stack_top - parent.stack_begin;
   const u64 total = static_cast<u64>(parent.mutable_size) +
                     parent.mmap_size + parent.stack_size;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:CLONE_COPY mutable=");
+  write_u32(parent.mutable_size);
+  write_text(" mmap=");
+  write_u32(parent.mmap_size);
+  write_text(" stack=");
+  write_u32(parent.stack_size);
+  write_text("\n");
+#endif
   if (total > parent_backup_capacity) {
     return false;
   }
@@ -234,6 +256,7 @@ void resume_parent(TrapFrame& frame, u32 status, bool child_completed,
   process.process_group = parent.process_group;
   process.session = parent.session;
   signals = parent.signals;
+  active_signal_frame = parent.signal_frame;
   process.image = parent.image;
   file_creation_mask = parent.file_creation_mask;
   memcpy(process.current_directory, parent.current_directory,
@@ -246,6 +269,10 @@ void resume_parent(TrapFrame& frame, u32 status, bool child_completed,
     parent.child_process_group = child_process_group;
     publish_child_exit(parent.child_pid, parent.parent_pid,
                        child_process_group, status);
+    // Linux publishes the zombie before making SIGCHLD observable.  Queue the
+    // signal in the just-restored immediate parent; nested flat-address-space
+    // suspension may subsequently put an older ancestor underneath it.
+    static_cast<void>(signals.queue(process_model::signal_child));
   }
   parent.active = false;
   parent.memory_saved = false;
@@ -258,6 +285,9 @@ void restore_parent(TrapFrame& frame, u32 status) {
 
 [[nodiscard]] i32 clone(TrapFrame& frame, u32 flags, u32 stack,
                         u32 child_tid) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:CLONE_START\n");
+#endif
   constexpr u32 signal_mask = 0xff;
   constexpr u32 sigchld = 17;
   constexpr u32 clone_vm = 0x100;
@@ -270,15 +300,23 @@ void restore_parent(TrapFrame& frame, u32 status) {
   const bool ordinary_fork = (behavior & ~fork_bookkeeping) == 0;
   const bool vfork = behavior == (clone_vm | clone_vfork);
   const u32 child_stack = stack == 0 ? frame.x[2] : stack;
+  const bool nested_background_fork =
+      parent.active && process.pid == parent.child_pid &&
+      !nested_ancestor_saved;
   if ((!ordinary_fork && !vfork) || (flags & signal_mask) != sigchld ||
-      parent.active || !user_memory.contains(child_stack, 1) ||
+      (parent.active && !nested_background_fork) ||
+      !user_memory.contains(child_stack, 1) ||
       !waitable_space() ||
       (((flags & (clone_child_settid | clone_child_cleartid)) != 0) &&
        (!user_memory.contains(child_tid, sizeof(u32)) ||
         !user_memory.aligned(child_tid, alignof(u32))))) {
     return error(Errno::invalid_argument);
   }
+  if (nested_background_fork && !stack_suspended_ancestor()) {
+    return error(Errno::no_memory);
+  }
   if (!save_parent_descriptors()) {
+    reinstate_suspended_ancestor(frame);
     return error(Errno::no_memory);
   }
   parent.frame = frame;
@@ -297,6 +335,7 @@ void restore_parent(TrapFrame& frame, u32 status) {
   parent.session = process.session;
   parent.image = process.image;
   parent.signals = signals;
+  parent.signal_frame = active_signal_frame;
   static u32 next_pid = 2;
   parent.child_pid = next_pid++;
   parent.active = true;
@@ -304,8 +343,12 @@ void restore_parent(TrapFrame& frame, u32 status) {
   if (!save_parent_memory()) {
     parent.active = false;
     discard_parent_descriptors();
+    reinstate_suspended_ancestor(frame);
     return error(Errno::no_memory);
   }
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:CLONE_DONE\n");
+#endif
   process.pid = parent.child_pid;
   process.parent_pid = parent.parent_pid;
   child_tid_address =
@@ -546,6 +589,7 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
   background.session = process.session;
   background.image = process.image;
   background.signals = signals;
+  background.signal_frame = active_signal_frame;
   background.file_creation_mask = file_creation_mask;
   memcpy(background.current_directory, process.current_directory,
          sizeof(background.current_directory));
@@ -554,6 +598,63 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
   background.wait = BackgroundWait::socket_read;
   background.wait_socket = wait_socket;
   background.used = true;
+}
+
+[[nodiscard]] bool stack_suspended_ancestor() {
+  if (!parent.active || nested_ancestor_saved) {
+    return false;
+  }
+  const u64 total = static_cast<u64>(parent.mutable_size) + parent.mmap_size +
+                    parent.stack_size;
+  if (!parent.memory_saved || total > parent_backup_capacity) {
+    return false;
+  }
+
+  nested_ancestor = parent;
+  memcpy(background_backup, parent_backup, static_cast<u32>(total));
+  for (u32 i = 0; i < 13; ++i) {
+    background_descriptors[i] = parent_descriptors[i];
+    parent_descriptors[i] = {};
+  }
+  for (u32 i = 0; i < 3; ++i) {
+    background_standard_redirects[i] = parent_standard_redirects[i];
+    parent_standard_redirects[i] = {};
+  }
+  parent = {};
+  background = {};
+  nested_ancestor_saved = true;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:NESTED_CLONE_STACK\n");
+#endif
+  return true;
+}
+
+void reinstate_suspended_ancestor(TrapFrame& frame) {
+  if (!nested_ancestor_saved) {
+    return;
+  }
+
+  // The nested child has restored its immediate parent (the background
+  // service). Keep identifying that active service so it can park again or
+  // exit, then put the original shell suspension back underneath it.
+  capture_background(frame, network::invalid_socket);
+  background.wait = BackgroundWait::none;
+  parent = nested_ancestor;
+  nested_ancestor = {};
+  const u32 total = parent.mutable_size + parent.mmap_size + parent.stack_size;
+  memcpy(parent_backup, background_backup, total);
+  for (u32 i = 0; i < 13; ++i) {
+    parent_descriptors[i] = background_descriptors[i];
+    background_descriptors[i] = {};
+  }
+  for (u32 i = 0; i < 3; ++i) {
+    parent_standard_redirects[i] = background_standard_redirects[i];
+    background_standard_redirects[i] = {};
+  }
+  nested_ancestor_saved = false;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:NESTED_CLONE_UNSTACK\n");
+#endif
 }
 
 [[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket) {
@@ -614,6 +715,7 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
   write_u32(background.pid);
   write_text("\n");
 #endif
+  arch::set_network_timer_waiting(true);
   // The first park returns from fork. Later parks replay the syscall that had
   // blocked in the already-running service.
   const bool first_park = parent.frame.x[17] ==
@@ -646,6 +748,7 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
   parent.session = process.session;
   parent.image = process.image;
   parent.signals = signals;
+  parent.signal_frame = active_signal_frame;
   parent.file_creation_mask = file_creation_mask;
   memcpy(parent.current_directory, process.current_directory,
          sizeof(parent.current_directory));
@@ -686,6 +789,7 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
   process.session = background.session;
   process.image = background.image;
   signals = background.signals;
+  active_signal_frame = background.signal_frame;
   file_creation_mask = background.file_creation_mask;
   memcpy(process.current_directory, background.current_directory,
          sizeof(process.current_directory));
@@ -693,6 +797,7 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
          sizeof(process.executable_path));
   process.image_replaced = true;
   background.wait = BackgroundWait::none;
+  arch::set_network_timer_waiting(false);
 #ifdef MIKOS_TRIBE_INTERACTIVE
   write_text("MIKOS:BACKGROUND_RESUME ");
   write_u32(background.pid);
@@ -1517,6 +1622,22 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
       node.pseudo_node == PseudoFilesystem::Node::proc_net_tcp) {
     return network::tcp_table();
   }
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  if (node == Node::pseudo && background.used && background.pid == 2 &&
+      text_is(background.executable_path, "/usr/sbin/dropbear")) {
+    static constexpr const char dropbear_stat[] =
+        "2 (dropbear) S 1 1 1 0 0 0 0 0 0 0 2 1 0 0 20 0 1 0 1 "
+        "2600000 144 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+    static constexpr const char dropbear_command[] =
+        "/usr/sbin/dropbear\0";
+    if (node.pseudo_node == PseudoFilesystem::Node::proc_pid2_stat) {
+      return dropbear_stat;
+    }
+    if (node.pseudo_node == PseudoFilesystem::Node::proc_pid2_cmdline) {
+      return dropbear_command;
+    }
+  }
+#endif
   return node == Node::pseudo
              ? PseudoFilesystem::contents(node.pseudo_node)
              : nullptr;
@@ -1531,6 +1652,16 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
   if (node == Node::pseudo) {
     if (node.pseudo_node == PseudoFilesystem::Node::proc_net_tcp) {
       return text_size(network::tcp_table());
+    }
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    if (node.pseudo_node == PseudoFilesystem::Node::proc_pid2_cmdline &&
+        background.used && background.pid == 2 &&
+        text_is(background.executable_path, "/usr/sbin/dropbear")) {
+      return sizeof("/usr/sbin/dropbear");
+    }
+#endif
+    if (node.pseudo_node == PseudoFilesystem::Node::proc_pid2_stat) {
+      return text_size(node_contents(node));
     }
     return PseudoFilesystem::size(node.pseudo_node);
   }
@@ -2179,6 +2310,21 @@ static_assert(sizeof(Statx) == 256);
   if ((node.file.mode & 0111) == 0) {
     return error(Errno::access_denied);
   }
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  // The interactive flat-address-space scheduler keeps a blocked background
+  // service as a memory snapshot. Starting the same executable again would
+  // suspend the shell for another full initialization only to fail bind(2)
+  // against the original listener. Reject that duplicate before replacing
+  // the child image. Once the service exits, background.used is cleared and
+  // an intentional restart is allowed.
+  if (background.used &&
+      text_is(canonical, background.executable_path)) {
+    write_text("MIKOS:BACKGROUND_EXEC_BUSY pid=");
+    write_u32(background.pid);
+    write_text("\n");
+    return error(Errno::text_file_busy);
+  }
+#endif
   constexpr u32 max_arguments = 16;
   constexpr u32 max_argument_size = 128;
   char argument_storage[max_arguments][max_argument_size]{};
@@ -2313,11 +2459,132 @@ static_assert(sizeof(ChildSiginfo) == 128);
 struct [[gnu::packed]] SignalAction32 {
   u32 handler;
   u32 flags;
-  u32 restorer;
   u64 mask;
 };
 
-static_assert(sizeof(SignalAction32) == 20);
+static_assert(sizeof(SignalAction32) == 16);
+
+// RV32 Linux rt_sigframe is siginfo_t followed by ucontext_t.  RISC-V keeps
+// PC in gregs[0], x1..x31 in gregs[1..31], and aligns mcontext to 16 bytes.
+struct SignalUcontext32 {
+  u32 flags;
+  u32 link;
+  u32 stack_pointer;
+  u32 stack_flags;
+  u32 stack_size;
+  u8 signal_mask_and_reserved[140];
+  u32 general_registers[32];
+  u8 floating_point_state[528];
+};
+
+struct SignalFrame32 {
+  u8 information[128];
+  SignalUcontext32 context;
+  u32 return_trampoline[2];
+  u8 alignment[8];
+};
+
+static_assert(sizeof(SignalUcontext32) == 816);
+static_assert(__builtin_offsetof(SignalUcontext32, general_registers) == 160);
+static_assert(sizeof(SignalFrame32) == 960);
+
+void deliver_pending_signal_impl(TrapFrame& frame) {
+  if (active_signal_frame.active) {
+    return;
+  }
+  const u8 signal = signals.next();
+  if (signal == 0) {
+    return;
+  }
+  const auto action = signals.action(signal);
+  constexpr u32 signal_ignore = 1;
+  if (action.handler == signal_ignore ||
+      (action.handler == 0 &&
+       process_model::SignalState::default_for(signal) ==
+           process_model::SignalDefault::ignore)) {
+    return;
+  }
+  if (action.handler == 0) {
+    // The current interactive profile only resumes caught/ignored signals.
+    // Preserve deterministic fail-closed behavior for an unsupported default
+    // terminate/stop action instead of returning to user code silently.
+    write_text("MIKOS:UNHANDLED_SIGNAL ");
+    write_u32(signal);
+    write_text("\n");
+    shutdown(128 + signal);
+  }
+
+  const u32 old_stack = frame.x[2];
+  if (old_stack < sizeof(SignalFrame32)) {
+    shutdown(128 + signal);
+  }
+  const u32 address = align_down(old_stack - sizeof(SignalFrame32),
+                                 static_cast<u32>(16));
+  if (!user_memory.contains(address, sizeof(SignalFrame32))) {
+    shutdown(128 + signal);
+  }
+  auto* signal_frame = reinterpret_cast<SignalFrame32*>(address);
+  memset(signal_frame, 0, sizeof(*signal_frame));
+  *reinterpret_cast<i32*>(signal_frame->information) = signal;
+  *reinterpret_cast<u64*>(signal_frame->context.signal_mask_and_reserved) =
+      signals.blocked();
+  signal_frame->context.general_registers[0] = frame.mepc;
+  for (u32 index = 1; index < 32; ++index) {
+    signal_frame->context.general_registers[index] = frame.x[index];
+  }
+
+  active_signal_frame = {frame, signals.blocked(), true};
+  // RISC-V Linux normally supplies __kernel_rt_sigreturn from the VDSO.
+  // MikOS has no VDSO yet, so execute the equivalent two instructions from
+  // the signal frame (the flat user mapping is executable in this profile).
+  signal_frame->return_trampoline[0] = 0x08b00893;  // li a7, 139
+  signal_frame->return_trampoline[1] = 0x00000073;  // ecall
+  constexpr u32 signal_action_siginfo = 4;
+  constexpr u32 signal_action_nodefer = 0x40000000;
+  u64 handler_mask = signals.blocked() | action.mask;
+  if ((action.flags & signal_action_nodefer) == 0) {
+    handler_mask |= process_model::SignalState::bit(signal);
+  }
+  static_cast<void>(signals.change_mask(
+      process_model::SignalMaskOperation::set, handler_mask));
+  frame.x[1] = address + __builtin_offsetof(SignalFrame32, return_trampoline);
+  frame.x[2] = address;
+  frame.x[10] = signal;
+  if ((action.flags & signal_action_siginfo) != 0) {
+    frame.x[11] = address;
+    frame.x[12] = address + __builtin_offsetof(SignalFrame32, context);
+  }
+  frame.mepc = action.handler;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:SIGNAL_DELIVER ");
+  write_u32(signal);
+  write_text("\n");
+#endif
+}
+
+[[nodiscard]] i32 rt_sigreturn(TrapFrame& frame) {
+  if (!active_signal_frame.active ||
+      !user_memory.contains(frame.x[2], sizeof(SignalFrame32))) {
+    return error(Errno::bad_address);
+  }
+  const auto* signal_frame =
+      reinterpret_cast<const SignalFrame32*>(frame.x[2]);
+  const auto& registers = signal_frame->context.general_registers;
+  TrapFrame restored = active_signal_frame.frame;
+  restored.mepc = registers[0];
+  for (u32 index = 1; index < 32; ++index) {
+    restored.x[index] = registers[index];
+  }
+  const u64 restored_mask =
+      *reinterpret_cast<const u64*>(
+          signal_frame->context.signal_mask_and_reserved);
+  static_cast<void>(signals.change_mask(
+      process_model::SignalMaskOperation::set, restored_mask));
+  active_signal_frame = {};
+  frame = restored;
+  process.image_replaced = true;
+  return static_cast<i32>(frame.x[10]);
+}
 
 [[nodiscard]] i32 rt_sigaction(u32 signal, u32 action_address,
                                u32 old_address, u32 set_size) {
@@ -2330,8 +2597,7 @@ static_assert(sizeof(SignalAction32) == 20);
       return error(Errno::bad_address);
     }
     const auto old = signals.action(number);
-    const SignalAction32 output{old.handler, old.flags, old.restorer,
-                                old.mask};
+    const SignalAction32 output{old.handler, old.flags, old.mask};
     memcpy(reinterpret_cast<void*>(old_address), &output, sizeof(output));
   }
   if (action_address == 0) {
@@ -2343,7 +2609,7 @@ static_assert(sizeof(SignalAction32) == 20);
   SignalAction32 input{};
   memcpy(&input, reinterpret_cast<const void*>(action_address), sizeof(input));
   const process_model::SignalAction action{input.handler, input.flags,
-                                            input.restorer, input.mask};
+                                            input.mask};
   switch (signals.set_action(number, action)) {
     case process_model::SignalStatus::success:
       return 0;
@@ -3114,14 +3380,34 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
 
 }  // namespace
 
+void deliver_pending_signal(TrapFrame& frame) {
+  deliver_pending_signal_impl(frame);
+}
+
 i32 dispatch_syscall(TrapFrame& frame) {
   static u32 announced_image = ~u32{0};
   if (announced_image != process.image) {
-    write_text(process.image == 0 ? "MIKOS:BUSYBOX_ENTRY\n"
-                                  : "MIKOS:STRESS_NG_ENTRY\n");
+    if (process.image == 0) {
+      write_text("MIKOS:BUSYBOX_ENTRY\n");
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    } else if (text_is(process.executable_path, "/usr/sbin/dropbear")) {
+      write_text("MIKOS:DROPBEAR_ENTRY\n");
+#endif
+    } else {
+      write_text("MIKOS:STRESS_NG_ENTRY\n");
+    }
     announced_image = process.image;
   }
   const u32 number = frame.x[17];
+#if defined(MIKOS_TRIBE_INTERACTIVE) && defined(MIKOS_TRACE_DROPBEAR_SYSCALLS)
+  if (text_is(process.executable_path, "/usr/sbin/dropbear")) {
+    write_text("MIKOS:DROPBEAR_SYSCALL ");
+    write_u32(number);
+    write_text(" ");
+    write_text(abi::riscv32::name(number));
+    write_text("\n");
+  }
+#endif
 #ifdef MIKOS_TRACE_SYSCALLS
   write_text("MIKOS:SYSCALL ");
   write_u32(number);
@@ -3228,6 +3514,7 @@ i32 dispatch_syscall(TrapFrame& frame) {
           background.wait = BackgroundWait::none;
         }
         restore_parent(frame, a0);
+        reinstate_suspended_ancestor(frame);
         // The trap handler stores the dispatch result in the restored a0.
         // Returning a constant here made every fork after PID 2 appear to its
         // parent as PID 2 even though waitid correctly reported the real PID.
@@ -3401,7 +3688,7 @@ i32 dispatch_syscall(TrapFrame& frame) {
       return a0 == process.pid ? send_signal(a1, a2)
                                : error(Errno::no_entry);
     case Syscall::rt_sigreturn:
-      return unknown(number);
+      return rt_sigreturn(frame);
     case Syscall::setpgid:
       return setpgid(a0, a1);
     case Syscall::getpgid:

@@ -34,15 +34,17 @@ DROPBEAR_SOURCE := $(BUILD)/dropbear-source
 DROPBEAR := $(DROPBEAR_SOURCE)/dropbear
 DROPBEAR_CONFIG := config/dropbear_localoptions.h
 DROPBEAR_PATCH := patches/dropbear-mikos.patch
-DROPBEAR_ADDRESS := 0x81000000
+DROPBEAR_ADDRESS := 0x81400000
 DROPBEAR_HOST_OUT := $(BUILD)/dropbear-host
 DROPBEAR_HOST_STAMP := $(DROPBEAR_HOST_OUT)/.built
+DROPBEAR_HOST_KEY := $(ROOT)/build/mikos_ssh_key
+DROPBEAR_CLIENT_KEY := $(DROPBEAR_HOST_OUT)/mikos_ssh_key.dropbear
 
 ROOTFS_STAGE := $(BUILD)/rootfs
 ROOTFS_IMAGE := $(BUILD)/rootfs.ext4
 ROOTFS_SIZE ?= 16M
 ROOTFS_CONFIG := rootfs/etc/group rootfs/etc/inittab rootfs/etc/passwd \
-	rootfs/etc/shells rootfs/etc/init.d/rcS \
+	rootfs/etc/profile rootfs/etc/shells rootfs/etc/init.d/rcS \
 	rootfs/etc/dropbear/dropbear_ed25519_host_key.b64 \
 	rootfs/root/.ssh/authorized_keys
 
@@ -60,7 +62,7 @@ stress-ng: $(STRESS_NG)
 
 dropbear: $(DROPBEAR)
 
-dropbear-client: $(DROPBEAR_HOST_STAMP)
+dropbear-client: $(DROPBEAR_HOST_STAMP) $(DROPBEAR_CLIENT_KEY)
 
 $(BUSYBOX_SOURCE)/.source-ready: download_busybox.sh
 	@mkdir -p $(BUILD)
@@ -106,7 +108,7 @@ $(DROPBEAR_SOURCE)/.source-ready: download_dropbear.sh
 		./download_dropbear.sh $(DROPBEAR_SOURCE) $(DROPBEAR_VERSION) \
 		$(DROPBEAR_SHA256)
 
-$(DROPBEAR): $(DROPBEAR_SOURCE)/.source-ready $(DROPBEAR_CONFIG) \
+$(DROPBEAR): Makefile $(DROPBEAR_SOURCE)/.source-ready $(DROPBEAR_CONFIG) \
 		$(DROPBEAR_PATCH) \
 		build_dropbear.sh
 	./build_dropbear.sh $(DROPBEAR_SOURCE) $(RISCV_PREFIX) \
@@ -117,6 +119,14 @@ $(DROPBEAR_HOST_STAMP): $(DROPBEAR) $(DROPBEAR_CONFIG) \
 		build_dropbear_host.sh
 	./build_dropbear_host.sh $(DROPBEAR_SOURCE) $(DROPBEAR_HOST_OUT) \
 		$(JOBS) $(DROPBEAR_CONFIG)
+
+$(DROPBEAR_CLIENT_KEY): $(DROPBEAR_HOST_STAMP) $(DROPBEAR_HOST_KEY)
+	@tmp="$@.tmp.$$$$"; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	$(DROPBEAR_HOST_OUT)/dropbearconvert openssh dropbear \
+		$(DROPBEAR_HOST_KEY) "$$tmp"; \
+	chmod 0600 "$$tmp"; \
+	mv -f "$$tmp" '$@'
 
 $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 		$(ROOTFS_CONFIG) set_rootfs_owners.sh verify_rootfs.sh
@@ -137,6 +147,7 @@ $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 	install -m 0644 rootfs/etc/group $(ROOTFS_STAGE)/etc/group
 	install -m 0644 rootfs/etc/inittab $(ROOTFS_STAGE)/etc/inittab
 	install -m 0644 rootfs/etc/passwd $(ROOTFS_STAGE)/etc/passwd
+	install -m 0644 rootfs/etc/profile $(ROOTFS_STAGE)/etc/profile
 	install -m 0644 rootfs/etc/shells $(ROOTFS_STAGE)/etc/shells
 	install -m 0755 rootfs/etc/init.d/rcS $(ROOTFS_STAGE)/etc/init.d/rcS
 	base64 -d rootfs/etc/dropbear/dropbear_ed25519_host_key.b64 \
@@ -160,7 +171,8 @@ $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 		$(ROOTFS_STAGE)/usr/sbin/dropbear \
 		$(ROOTFS_STAGE)/etc/dropbear/dropbear_ed25519_host_key \
 		$(ROOTFS_STAGE)/etc/group $(ROOTFS_STAGE)/etc/inittab \
-		$(ROOTFS_STAGE)/etc/passwd $(ROOTFS_STAGE)/etc/shells \
+		$(ROOTFS_STAGE)/etc/passwd $(ROOTFS_STAGE)/etc/profile \
+		$(ROOTFS_STAGE)/etc/shells \
 		$(ROOTFS_STAGE)/etc/init.d/rcS \
 		$(ROOTFS_STAGE)/root/.ssh/authorized_keys
 	truncate -s $(ROOTFS_SIZE) $@

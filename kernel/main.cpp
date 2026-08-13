@@ -6,6 +6,12 @@
 extern "C" void* memcpy(void*, const void*, mikos::usize);
 extern "C" void* memset(void*, int, mikos::usize);
 extern "C" void trap_entry();
+#ifdef MIKOS_TRIBE_INTERACTIVE
+extern "C" unsigned char __embedded_busybox_begin[];
+extern "C" unsigned char __embedded_busybox_end[];
+extern "C" unsigned char __embedded_dropbear_begin[];
+extern "C" unsigned char __embedded_dropbear_end[];
+#endif
 
 namespace mikos {
 namespace {
@@ -81,16 +87,13 @@ struct Aux {
   return result && result.value == size;
 }
 
-[[nodiscard]] bool load_image(const drivers::fs::root::Node& file,
-                              Image& image, bool writable_only = false) {
-  if (file.type != drivers::fs::root::Type::regular ||
-      file.size > 0xffffffffu) {
-    return false;
-  }
-  const u32 file_size = static_cast<u32>(file.size);
+template <typename Reader>
+[[nodiscard]] bool load_image_from(u32 file_size, Reader read, Image& image,
+                                   bool writable_only,
+                                   u32 preloaded_base) {
   ElfHeader header{};
   if (file_size < sizeof(header) ||
-      !read_file(file, 0, &header, sizeof(header)) ||
+      !read(0, &header, sizeof(header)) ||
       !valid_elf(header, file_size)) {
     return false;
   }
@@ -103,7 +106,7 @@ struct Aux {
     ProgramHeader segment{};
     const u32 program_offset =
         header.program_offset + i * sizeof(ProgramHeader);
-    if (!read_file(file, program_offset, &segment, sizeof(segment))) {
+    if (!read(program_offset, &segment, sizeof(segment))) {
       return false;
     }
     constexpr u32 interpreter = 3;
@@ -147,7 +150,7 @@ struct Aux {
     ProgramHeader segment{};
     const u32 program_offset =
         header.program_offset + i * sizeof(ProgramHeader);
-    if (!read_file(file, program_offset, &segment, sizeof(segment))) {
+    if (!read(program_offset, &segment, sizeof(segment))) {
       return false;
     }
     constexpr u32 load = 1;
@@ -157,8 +160,29 @@ struct Aux {
       continue;
     }
     auto* destination = reinterpret_cast<u8*>(segment.virtual_address);
-    if (!read_file(file, segment.offset, destination, segment.file_size)) {
-      return false;
+    if (preloaded_base != 0) {
+      // The interactive kernel ELF contains selected executable file bytes
+      // near their linked virtual addresses. Identity-mapped PT_LOAD segments
+      // need no simulated SD or CPU copy.
+      const u32 source_address = preloaded_base + segment.offset;
+      if (segment.virtual_address != source_address) {
+        const auto* source = reinterpret_cast<const u8*>(source_address);
+        // A linker may place a writable PT_LOAD one page beyond its file
+        // offset. Copy only that small non-identity segment, backwards when
+        // the preloaded source and destination overlap.
+        if (segment.virtual_address > source_address &&
+            segment.virtual_address < source_address + segment.file_size) {
+          for (u32 byte = segment.file_size; byte != 0; --byte) {
+            destination[byte - 1] = source[byte - 1];
+          }
+        } else {
+          memcpy(destination, source, segment.file_size);
+        }
+      }
+    } else {
+      if (!read(segment.offset, destination, segment.file_size)) {
+        return false;
+      }
     }
     memset(destination + segment.file_size, 0,
            segment.memory_size - segment.file_size);
@@ -171,6 +195,50 @@ struct Aux {
   return true;
 }
 
+[[nodiscard]] bool load_image(const drivers::fs::root::Node& file,
+                              Image& image, bool writable_only = false) {
+  if (file.type != drivers::fs::root::Type::regular ||
+      file.size > 0xffffffffu) {
+    return false;
+  }
+  const auto reader = [&file](u32 offset, void* output, u32 size) {
+    return read_file(file, offset, output, size);
+  };
+  return load_image_from(static_cast<u32>(file.size), reader, image,
+                         writable_only, 0);
+}
+
+#ifdef MIKOS_TRIBE_INTERACTIVE
+[[nodiscard]] bool load_preloaded_image(const drivers::fs::root::Node& file,
+                                        Image& image, usize begin,
+                                        usize end) {
+  if (file.type != drivers::fs::root::Type::regular || begin > 0xffffffffu ||
+      end < begin || file.size != end - begin || file.size > 0xffffffffu) {
+    return false;
+  }
+  const auto reader = [begin](u32 offset, void* output, u32 size) {
+    memcpy(output, reinterpret_cast<const void*>(begin + offset), size);
+    return true;
+  };
+  return load_image_from(static_cast<u32>(file.size), reader, image, false,
+                         static_cast<u32>(begin));
+}
+
+[[nodiscard]] bool load_preloaded_busybox(
+    const drivers::fs::root::Node& file, Image& image) {
+  return load_preloaded_image(
+      file, image, reinterpret_cast<usize>(__embedded_busybox_begin),
+      reinterpret_cast<usize>(__embedded_busybox_end));
+}
+
+[[nodiscard]] bool load_preloaded_dropbear(
+    const drivers::fs::root::Node& file, Image& image) {
+  return load_preloaded_image(
+      file, image, reinterpret_cast<usize>(__embedded_dropbear_begin),
+      reinterpret_cast<usize>(__embedded_dropbear_end));
+}
+#endif
+
 void copy_path(char* output, const char* input) {
   u32 index = 0;
   while (index != 255 && input[index] != '\0') {
@@ -181,10 +249,17 @@ void copy_path(char* output, const char* input) {
 }
 
 [[nodiscard]] Image required_image(const char* path,
-                                   bool writable_only = false) {
+                                   bool writable_only = false,
+                                   bool preloaded_busybox = false) {
   const auto node = drivers::fs::root::lookup(path);
   Image image{};
-  if (!node || !load_image(node.value, image, writable_only)) {
+  if (!node ||
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      (preloaded_busybox ? !load_preloaded_busybox(node.value, image)
+                         : !load_image(node.value, image, writable_only))) {
+#else
+      preloaded_busybox || !load_image(node.value, image, writable_only)) {
+#endif
     write_text("MIKOS:BAD_ELF\n");
     shutdown(1);
   }
@@ -313,7 +388,24 @@ bool replace_with_executable(TrapFrame& frame, const char* path,
   const bool busybox = busybox_node &&
                        busybox_node.value.inode == node.value.inode;
   Image image{};
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  const auto dropbear_node =
+      drivers::fs::root::lookup("/usr/sbin/dropbear");
+  const bool dropbear = dropbear_node &&
+                        dropbear_node.value.inode == node.value.inode;
+  if (dropbear) {
+    write_text("MIKOS:DROPBEAR_PRELOAD_START\n");
+  }
+  const bool loaded = dropbear ? load_preloaded_dropbear(node.value, image)
+                               : load_image(node.value, image, busybox);
+  if (dropbear) {
+    write_text(loaded ? "MIKOS:DROPBEAR_PRELOAD_OK\n"
+                      : "MIKOS:DROPBEAR_PRELOAD_FAIL\n");
+  }
+  if (!loaded) {
+#else
   if (!load_image(node.value, image, busybox)) {
+#endif
     return false;
   }
   process.brk = image.brk;
@@ -348,6 +440,13 @@ void restore_busybox_image() {
 bool restore_executable_image(const char* path) {
   const auto node = drivers::fs::root::lookup(path);
   Image image{};
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  const auto dropbear_node =
+      drivers::fs::root::lookup("/usr/sbin/dropbear");
+  if (node && dropbear_node && node.value.inode == dropbear_node.value.inode) {
+    return load_preloaded_dropbear(node.value, image);
+  }
+#endif
   return node && load_image(node.value, image);
 }
 
@@ -452,7 +551,14 @@ extern "C" void kernel_main() {
     shutdown(8);
   }
   write_text("MIKOS:EXT4_ROOT_OK\n");
-  const auto image = required_image("/bin/busybox");
+  const auto image = required_image(
+      "/bin/busybox", false,
+#ifdef MIKOS_TRIBE_INTERACTIVE
+      true
+#else
+      false
+#endif
+  );
   process.brk = image.brk;
   process.mutable_begin = image.mutable_begin;
   process.mmap_begin = 0x81800000;
@@ -465,8 +571,7 @@ extern "C" void kernel_main() {
   copy_path(process.executable_path, "/bin/busybox");
 #ifdef MIKOS_TRIBE_INTERACTIVE
   constexpr const char* arguments[] = {
-      "busybox", "sh", "-c",
-      ". /etc/init.d/rcS mikos; exec /bin/busybox sh -i +m"};
+      "busybox", "sh", "-il", "+m"};
 #else
   constexpr const char* arguments[] = {
       "busybox", "sh", "-c",
@@ -634,6 +739,7 @@ extern "C" void trap_handler(mikos::TrapFrame* frame) {
     } else {
       frame->mepc += 4;
     }
+    deliver_pending_signal(*frame);
     return;
   }
   write_text("MIKOS:TRAP cause=");

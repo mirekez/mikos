@@ -10,7 +10,7 @@ queries, shutdown/close, and `/proc/net/tcp` visibility.
 
 This is a passive, bounded transport rather than a general TCP/IP stack. It
 does not claim active `connect`, IPv6, IP fragmentation, TCP congestion
-control, retransmission timers, unbounded reassembly, urgent data, window
+control, adaptive retransmission timers, unbounded reassembly, urgent data, window
 scaling, or unbounded queues. Those features must be added only with a caller
 and regression that needs them.
 
@@ -28,6 +28,9 @@ and regression that needs them.
    duplicate SYNs, assemble bounded out-of-order payload through an
    open-addressed hash keyed by socket and sequence number, acknowledge FIN,
    surface RST, and emit FIN on shutdown/last close.
+   Retain a bounded set of outbound payload segments keyed by socket and TCP
+   sequence, retire them through cumulative ACKs, and retransmit silently lost
+   payload from the polling loop.
 4. **Syscall I/O — complete.** Implement blocking/nonblocking accept and read,
    bounded segmented writes, `ppoll` and `pselect6` readiness, harmless socket
    option hints used by servers, endpoint queries, and shutdown.
@@ -94,6 +97,11 @@ combinatorial tests for features explicitly outside the boundary.
   duplicate keys do not consume capacity, and table exhaustion is explicit.
 - Receive capacity never overflows; excess bytes are not acknowledged as
   consumed and can be retransmitted.
+- Outbound payload writes occupy distinct fixed hash entries keyed by socket
+  and sequence number; cumulative ACKs retire every covered entry.
+- A failed initial NIC transmit is reported without leaving a ghost retry;
+  an unacknowledged successful transmit is retried after the fixed polling
+  interval; reset and final close clear all retained payload.
 
 ### Wire validation and response generation
 
@@ -112,6 +120,9 @@ combinatorial tests for features explicitly outside the boundary.
   issue a duplicate ACK for retransmitted/out-of-order input.
 - Segment application writes below the NIC frame bound with monotonically
   increasing sequence numbers and valid checksums.
+- Retransmit an unacknowledged segment with its original sequence and payload;
+  acknowledge adjacent writes independently and preserve only the uncovered
+  suffix after a cumulative ACK.
 - ACK FIN at sequence plus one; surface EOF while preserving the writable
   local half; emit local FIN exactly once on shutdown or last close; surface
   RST without returning stale data.

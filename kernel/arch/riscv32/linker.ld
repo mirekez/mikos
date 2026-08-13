@@ -39,6 +39,23 @@ SECTIONS
   __kernel_stack_top = .;
   __kernel_end = .;
 
+  /*
+   * Interactive Tribe kernels preload the BusyBox file at the same address
+   * as its first PT_LOAD segment. The section is empty for all other kernels.
+   * Keeping it out of __kernel_end preserves the kernel/user boundary check.
+   */
+  .user_busybox 0x81000000 : ALIGN(16) {
+    __embedded_busybox_begin = .;
+    KEEP(*(.user_busybox))
+    __embedded_busybox_end = .;
+  }
+
+  .user_dropbear 0x81400000 : ALIGN(16) {
+    __embedded_dropbear_begin = .;
+    KEEP(*(.user_dropbear))
+    __embedded_dropbear_end = .;
+  }
+
   /DISCARD/ : {
     *(.comment)
     *(.eh_frame*)

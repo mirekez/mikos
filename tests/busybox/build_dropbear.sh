@@ -30,12 +30,16 @@ elif ! patch -d "$source_tree" -p1 --reverse --dry-run \
   exit 1
 fi
 
+# SSH key exchange is CPU-bound under Tribe's cycle-level native C++ model.
+# Optimizing this guest code for size makes Curve25519 take many times longer
+# in wall time, while section garbage collection still keeps unused algorithms
+# out of the embedded image.
 (
   cd "$source_tree"
   CC="${cross_prefix}gcc" AR="${cross_prefix}ar" \
     RANLIB="${cross_prefix}ranlib" STRIP="${cross_prefix}strip" \
-    CFLAGS="-O3 -fomit-frame-pointer" \
-    LDFLAGS="-Wl,-Ttext-segment=$address" \
+    CFLAGS="-O3 -fomit-frame-pointer -ffunction-sections -fdata-sections" \
+    LDFLAGS="-Wl,--gc-sections -Wl,-Ttext-segment=$address" \
     ./configure --host="$host" --enable-static --disable-zlib \
       --disable-syslog --disable-lastlog --disable-utmp \
       --disable-utmpx --disable-wtmp --disable-wtmpx

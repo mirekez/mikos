@@ -7,6 +7,7 @@ CXX := $(CONDA)/clang++
 LLVM_READELF := $(CONDA)/llvm-readelf
 RISCV_PREFIX ?= /home/me/riscv/bin/riscv32-unknown-linux-gnu-
 LD := $(RISCV_PREFIX)ld
+OBJCOPY := $(RISCV_PREFIX)objcopy
 
 RV_FLAGS := --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 \
 	-mcmodel=medany -msmall-data-limit=0 -std=c++2c -ffreestanding \
@@ -80,6 +81,12 @@ TRIBE_INTERACTIVE_MULTICORE_DEPS := \
 # BusyBox and stress-ng live in one ext4 root image shared by QEMU and Tribe.
 BUSYBOX_TEST_BUILD := $(BUILD)/tests/busybox
 ROOTFS_IMAGE := $(BUSYBOX_TEST_BUILD)/rootfs.ext4
+BUSYBOX_BINARY := $(BUSYBOX_TEST_BUILD)/busybox/busybox
+DROPBEAR_BINARY := $(BUSYBOX_TEST_BUILD)/dropbear-source/dropbear
+TRIBE_EMBEDDED_BUSYBOX_OBJECT := \
+	$(BUILD)/tribe-interactive/embedded-busybox.o
+TRIBE_EMBEDDED_DROPBEAR_OBJECT := \
+	$(BUILD)/tribe-interactive/embedded-dropbear.o
 
 QEMU := $(BUILD)/qemu/qemu-system-riscv32
 NET_PEER := $(BUILD)/tests/qemu/net_peer
@@ -130,6 +137,7 @@ $(ROOTFS_IMAGE): tests/busybox/Makefile \
 		tests/busybox/rootfs/etc/group \
 		tests/busybox/rootfs/etc/inittab \
 		tests/busybox/rootfs/etc/passwd \
+		tests/busybox/rootfs/etc/profile \
 		tests/busybox/rootfs/etc/shells \
 		tests/busybox/rootfs/etc/init.d/rcS \
 		tests/busybox/rootfs/etc/dropbear/dropbear_ed25519_host_key.b64 \
@@ -138,6 +146,18 @@ $(ROOTFS_IMAGE): tests/busybox/Makefile \
 		tests/busybox/verify_rootfs.sh \
 		tests/busybox/patches/stress-ng-mikos.patch
 	$(MAKE) -C tests/busybox rootfs
+
+$(TRIBE_EMBEDDED_BUSYBOX_OBJECT): $(ROOTFS_IMAGE)
+	@mkdir -p $(@D)
+	$(OBJCOPY) -I binary -O elf32-littleriscv -B riscv \
+		--rename-section .data=.user_busybox,alloc,load,readonly,data,contents \
+		$(BUSYBOX_BINARY) $@
+
+$(TRIBE_EMBEDDED_DROPBEAR_OBJECT): $(ROOTFS_IMAGE)
+	@mkdir -p $(@D)
+	$(OBJCOPY) -I binary -O elf32-littleriscv -B riscv \
+		--rename-section .data=.user_dropbear,alloc,load,readonly,data,contents \
+		$(DROPBEAR_BINARY) $@
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
@@ -187,21 +207,28 @@ $(TRIBE_KERNEL_ELF): $(TRIBE_KERNEL_OBJECTS) \
 	$(LLVM_READELF) -h -l $@ > $(BUILD)/mikos-tribe-rv32.headers.txt
 
 $(TRIBE_INTERACTIVE_ELF): $(TRIBE_INTERACTIVE_OBJECTS) \
+		$(TRIBE_EMBEDDED_BUSYBOX_OBJECT) \
+		$(TRIBE_EMBEDDED_DROPBEAR_OBJECT) \
 		kernel/arch/riscv32/linker.ld
 	$(LD) -m elf32lriscv -nostdlib --gc-sections \
 		-T kernel/arch/riscv32/linker.ld \
 		-Map $(TRIBE_INTERACTIVE_MAP) -o $@ \
-		$(TRIBE_INTERACTIVE_OBJECTS)
+		$(TRIBE_INTERACTIVE_OBJECTS) $(TRIBE_EMBEDDED_BUSYBOX_OBJECT) \
+		$(TRIBE_EMBEDDED_DROPBEAR_OBJECT)
 	$(LLVM_READELF) -h -l $@ > \
 		$(BUILD)/mikos-tribe-interactive-rv32.headers.txt
 
 $(TRIBE_INTERACTIVE_MULTICORE_ELF): \
 		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) \
+		$(TRIBE_EMBEDDED_BUSYBOX_OBJECT) \
+		$(TRIBE_EMBEDDED_DROPBEAR_OBJECT) \
 		kernel/arch/riscv32/linker.ld
 	$(LD) -m elf32lriscv -nostdlib --gc-sections \
 		-T kernel/arch/riscv32/linker.ld \
 		-Map $(TRIBE_INTERACTIVE_MULTICORE_MAP) -o $@ \
-		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS)
+		$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS) \
+		$(TRIBE_EMBEDDED_BUSYBOX_OBJECT) \
+		$(TRIBE_EMBEDDED_DROPBEAR_OBJECT)
 	$(LLVM_READELF) -h -l $@ > \
 		$(BUILD)/mikos-tribe-interactive-multicore-rv32.headers.txt
 
@@ -275,6 +302,8 @@ clean:
 		$(TRIBE_INTERACTIVE_MULTICORE_DEPS) \
 		$(TRIBE_INTERACTIVE_MULTICORE_ELF) \
 		$(TRIBE_INTERACTIVE_MULTICORE_MAP) \
+		$(TRIBE_EMBEDDED_BUSYBOX_OBJECT) \
+		$(TRIBE_EMBEDDED_DROPBEAR_OBJECT) \
 		$(BUILD)/mikos-tribe-interactive-multicore-rv32.headers.txt \
 		$(BUILD)/mikos-rv32.headers.txt $(BUILD)/mikos-rv32.sections.txt \
 		$(BUILD)/mikos-rv32.undefined.txt $(NET_PEER) $(ETHGIG_TAP)

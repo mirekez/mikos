@@ -10,7 +10,17 @@ inline constexpr u32 mtime = 0x8200c0f8;
 inline constexpr u32 mtimecmp = 0x02004000;
 inline constexpr u32 mtime = 0x0200bff8;
 #endif
+#if defined(MIKOS_TRIBE) && defined(MIKOS_TRIBE_INTERACTIVE)
+// The cycle-accurate Tribe model advances far more slowly than wall time, so
+// switch to frequent polling only while a background network service is
+// parked. A 500-tick interval combined with the former eight-poll handler
+// caused a permanent interrupt storm before BusyBox's first syscall.
+inline constexpr u32 normal_quantum_ticks = 50'000;
+inline constexpr u32 network_quantum_ticks = 5'000;
+u32 quantum_ticks = normal_quantum_ticks;
+#else
 inline constexpr u32 quantum_ticks = 200'000;  // 20 ms at QEMU's 10 MHz.
+#endif
 
 struct Counter {
   u32 low;
@@ -62,6 +72,15 @@ void start_scheduler_timer() {
   constexpr u32 timer_enable = machine_timer_enable;
 #endif
   asm volatile("csrs mie, %0" : : "r"(timer_enable));
+}
+
+void set_network_timer_waiting(bool waiting) {
+#if defined(MIKOS_TRIBE) && defined(MIKOS_TRIBE_INTERACTIVE)
+  quantum_ticks = waiting ? network_quantum_ticks : normal_quantum_ticks;
+  rearm_scheduler_timer();
+#else
+  static_cast<void>(waiting);
+#endif
 }
 
 u64 time_ticks() {

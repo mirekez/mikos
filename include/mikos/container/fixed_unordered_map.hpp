@@ -72,6 +72,24 @@ class FixedUnorderedMap {
     }
   }
 
+  template <typename Function>
+  void for_each(Function function) {
+    for (auto& entry : entries_) {
+      if (entry.status == Status::occupied) {
+        function(entry.key, entry.value);
+      }
+    }
+  }
+
+  template <typename Function>
+  void for_each(Function function) const {
+    for (const auto& entry : entries_) {
+      if (entry.status == Status::occupied) {
+        function(entry.key, entry.value);
+      }
+    }
+  }
+
   [[nodiscard]] u32 size() const {
     u32 result = 0;
     for (const auto& entry : entries_) {

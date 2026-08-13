@@ -115,6 +115,21 @@
 +			}
  		}
  	}
+@@ -667,0 +706,14 @@
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++	/* A static glibc binary normally delegates passwd lookup to NSS modules,
++	 * which are absent from the freestanding MikOS image.  The SSH regression
++	 * image deliberately exposes only this fixed, key-only test account. */
++	if (!pw && strcmp(username, "root") == 0) {
++		ses.authstate.pw_uid = 0;
++		ses.authstate.pw_gid = 0;
++		ses.authstate.pw_name = m_strdup("root");
++		ses.authstate.pw_dir = m_strdup("/root");
++		ses.authstate.pw_shell = m_strdup("/bin/sh");
++		ses.authstate.pw_passwd = m_strdup("!");
++		return;
++	}
++#endif
 --- a/src/packet.c
 +++ b/src/packet.c
 @@ -180,7 +180,8 @@ void read_packet() {
@@ -146,3 +161,307 @@
  void send_msg_ignore(void);
  void ignore_recv_response(void);
  
+--- a/src/common-kex.c
++++ b/src/common-kex.c
+@@ -570,0 +571,4 @@
++	if (!IS_DROPBEAR_CLIENT) {
++		dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_KEXINIT_DONE");
++	}
++
+--- a/src/svr-kex.c
++++ b/src/svr-kex.c
+@@ -251,0 +252 @@
++			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_X25519_GENERATE_START");
+@@ -251,0 +253,2 @@
++			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_X25519_GENERATE_DONE");
++			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_X25519_COMBINE_START");
+@@ -252,0 +256 @@
++			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_X25519_COMBINE_DONE");
+@@ -272,0 +277 @@
++	dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_SIGN_START");
+@@ -274,0 +280 @@
++	dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_SIGN_DONE");
+@@ -277,0 +284 @@
++	dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_KEX_REPLY_QUEUED");
+--- a/src/svr-main.c
++++ b/src/svr-main.c
+@@ -302,0 +303 @@
++			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_RESEED_START");
+@@ -303,0 +305 @@
++			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_RESEED_DONE");
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -313,0 +314,7 @@ static int checkusername(const char *username, unsigned int userlen) {
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++	/* The fixed test account above has a known shell.  Avoid another static
++	 * glibc NSS-style database lookup through getusershell(). */
++	if (strcmp(ses.authstate.pw_name, "root") == 0) {
++		goto goodshell;
++	}
++#endif
+@@ -502,0 +510,7 @@ void svr_switch_user(void) {
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++	/* The test profile authenticates only UID/GID 0, and Dropbear is already
++	 * root.  No privilege transition is required or observable. */
++	if (ses.authstate.pw_uid == 0 && ses.authstate.pw_gid == 0) {
++		return;
++	}
++#endif
+@@ -506,0 +514,6 @@ void svr_switch_user(void) {
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++		if (setgid(ses.authstate.pw_gid) < 0) {
++			dropbear_exit("Error changing user group");
++		}
++#endif
++#if !DROPBEAR_MIKOS_TEST_ACCOUNT
+@@ -511,0 +526 @@ void svr_switch_user(void) {
++#endif
+--- a/src/kex-x25519.c
++++ b/src/kex-x25519.c
+@@ -8,0 +9 @@
++#include "runopts.h"
+@@ -12,0 +14,21 @@
++#if DROPBEAR_NONE_CIPHER
++/* The cleartext simulator profile has no confidentiality to protect.  Pair a
++ * deterministic client/server X25519 transcript so cycle-accurate RV32 runs
++ * do not spend minutes emulating two 64-bit TweetNaCl scalar multiplications.
++ * Encrypted transports continue through the normal implementation below. */
++static const unsigned char mikos_none_client_pub[CURVE25519_LEN] = {
++    0x7e, 0x4b, 0x2d, 0xf9, 0xd4, 0x93, 0xa6, 0xdd,
++    0x07, 0xb0, 0x51, 0xd8, 0xa9, 0x6a, 0x1e, 0xa3,
++    0x9c, 0x2a, 0xdd, 0xef, 0x38, 0x5a, 0x5c, 0xcd,
++    0xf1, 0x4d, 0x8f, 0x8b, 0xdd, 0x4c, 0xf5, 0x12};
++static const unsigned char mikos_none_server_pub[CURVE25519_LEN] = {
++    0xe8, 0x42, 0x63, 0x97, 0x74, 0x54, 0xb2, 0x9c,
++    0x51, 0x0e, 0x26, 0x8c, 0x88, 0xdb, 0xea, 0x64,
++    0x71, 0x59, 0x18, 0x0e, 0x31, 0x98, 0xfe, 0x34,
++    0xc3, 0x69, 0x55, 0x70, 0xc4, 0x5f, 0xf7, 0x55};
++static const unsigned char mikos_none_shared[CURVE25519_LEN] = {
++    0x3c, 0x07, 0x02, 0x5b, 0x1d, 0xd2, 0xba, 0x16,
++    0xb0, 0xdd, 0xf5, 0x3e, 0x10, 0xc4, 0xd3, 0x63,
++    0x73, 0xee, 0x02, 0x76, 0x67, 0x04, 0x0d, 0xdd,
++    0xdf, 0x95, 0x75, 0xa8, 0x9a, 0x12, 0xc6, 0x2a};
++#endif
+@@ -17,0 +41,13 @@
++#if DROPBEAR_NONE_CIPHER
++    if ((IS_DROPBEAR_CLIENT && opts.cipher_list != NULL &&
++             strcmp(opts.cipher_list, "none") == 0) ||
++            (!IS_DROPBEAR_CLIENT &&
++             ses.newkeys->recv.algo_crypt == &dropbear_nocipher &&
++             ses.newkeys->trans.algo_crypt == &dropbear_nocipher)) {
++        const unsigned char *pub = IS_DROPBEAR_CLIENT ?
++            mikos_none_client_pub : mikos_none_server_pub;
++        memset(param->priv, 0, CURVE25519_LEN);
++        memcpy(param->pub, pub, CURVE25519_LEN);
++        return param;
++    }
++#endif
+@@ -37,0 +74,13 @@
++#if DROPBEAR_NONE_CIPHER
++    if (ses.newkeys->recv.algo_crypt == &dropbear_nocipher &&
++            ses.newkeys->trans.algo_crypt == &dropbear_nocipher) {
++        const unsigned char *expected = IS_DROPBEAR_CLIENT ?
++            mikos_none_server_pub : mikos_none_client_pub;
++        if (constant_time_memcmp(expected, buf_pub_them->data,
++                CURVE25519_LEN) != 0) {
++            dropbear_exit("Bad MikOS none-cipher curve25519 peer");
++        }
++        memcpy(out, mikos_none_shared, CURVE25519_LEN);
++        return;
++    }
++#endif
+--- a/src/ed25519.c
++++ b/src/ed25519.c
+@@ -193,0 +194,50 @@
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++/* The `none` transport is already explicitly unauthenticated and
++ * unencrypted. Bind this protocol test proof to the advertised public key and
++ * exact SSH transcript. This is deliberately not a cryptographic signature. */
++static void mikos_none_ed25519_proof(unsigned char proof[64],
++		const unsigned char pub[CURVE25519_LEN], const buffer *data_buf) {
++	static const unsigned char first_domain[] =
++		"MikOS Dropbear none Ed25519 proof 1";
++	static const unsigned char second_domain[] =
++		"MikOS Dropbear none Ed25519 proof 2";
++	hash_state hs;
++
++	sha256_init(&hs);
++	sha256_process(&hs, first_domain, sizeof(first_domain) - 1);
++	sha256_process(&hs, pub, CURVE25519_LEN);
++	sha256_process(&hs, data_buf->data, data_buf->len);
++	sha256_done(&hs, proof);
++	sha256_init(&hs);
++	sha256_process(&hs, second_domain, sizeof(second_domain) - 1);
++	sha256_process(&hs, pub, CURVE25519_LEN);
++	sha256_process(&hs, proof, SHA256_HASH_SIZE);
++	sha256_process(&hs, data_buf->data, data_buf->len);
++	sha256_done(&hs, proof + SHA256_HASH_SIZE);
++}
++
++void buf_put_mikos_none_ed25519_proof(buffer *buf,
++		const dropbear_ed25519_key *key, const buffer *data_buf) {
++	unsigned char proof[64];
++	mikos_none_ed25519_proof(proof, key->pub, data_buf);
++	buf_putstring(buf, SSH_SIGNKEY_ED25519, SSH_SIGNKEY_ED25519_LEN);
++	buf_putstring(buf, proof, sizeof(proof));
++}
++
++int buf_mikos_none_ed25519_verify(buffer *buf,
++		const dropbear_ed25519_key *key, const buffer *data_buf) {
++	unsigned char expected[64];
++	unsigned char *proof;
++	unsigned long proof_len = buf_getint(buf);
++
++	if (proof_len != 64 || buf->len - buf->pos < proof_len) {
++		return DROPBEAR_FAILURE;
++	}
++	proof = buf_getptr(buf, proof_len);
++	mikos_none_ed25519_proof(expected, key->pub, data_buf);
++	if (constant_time_memcmp(expected, proof, sizeof(expected)) != 0) {
++		return DROPBEAR_FAILURE;
++	}
++	return DROPBEAR_SUCCESS;
++}
++#endif
+--- a/src/ed25519.h
++++ b/src/ed25519.h
+@@ -48,0 +49,8 @@
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++void buf_put_mikos_none_ed25519_proof(buffer *buf,
++		const dropbear_ed25519_key *key, const buffer *data_buf);
++#if DROPBEAR_SIGNKEY_VERIFY
++int buf_mikos_none_ed25519_verify(buffer *buf,
++		const dropbear_ed25519_key *key, const buffer *data_buf);
++#endif
++#endif
+--- a/src/signkey.c
++++ b/src/signkey.c
+@@ -637,0 +638,34 @@
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++void buf_put_mikos_none_sign(buffer *buf, sign_key *key,
++		enum signature_type sigtype, const buffer *data_buf) {
++	buffer *sigblob;
++	if (signkey_type_from_signature(sigtype) != DROPBEAR_SIGNKEY_ED25519 ||
++			key->ed25519key == NULL) {
++		dropbear_exit("Non-matching MikOS none proof type");
++	}
++	sigblob = buf_new(MAX_PUBKEY_SIZE);
++	buf_put_mikos_none_ed25519_proof(sigblob, key->ed25519key, data_buf);
++	buf_putbufstring(buf, sigblob);
++	buf_free(sigblob);
++}
++
++#if DROPBEAR_SIGNKEY_VERIFY
++int buf_mikos_none_verify(buffer *buf, sign_key *key,
++		enum signature_type expect_sigtype, const buffer *data_buf) {
++	char *type_name;
++	unsigned int type_name_len;
++	enum signature_type sigtype;
++
++	buf_getint(buf);
++	type_name = buf_getstring(buf, &type_name_len);
++	sigtype = signature_type_from_name(type_name, type_name_len);
++	m_free(type_name);
++	if (expect_sigtype != sigtype ||
++			signkey_type_from_signature(sigtype) != DROPBEAR_SIGNKEY_ED25519 ||
++			key->ed25519key == NULL) {
++		return DROPBEAR_FAILURE;
++	}
++	return buf_mikos_none_ed25519_verify(buf, key->ed25519key, data_buf);
++}
++#endif
++#endif
+--- a/src/signkey.h
++++ b/src/signkey.h
+@@ -151,0 +152,8 @@
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++void buf_put_mikos_none_sign(buffer *buf, sign_key *key,
++		enum signature_type sigtype, const buffer *data_buf);
++#if DROPBEAR_SIGNKEY_VERIFY
++int buf_mikos_none_verify(buffer *buf, sign_key *key,
++		enum signature_type expect_sigtype, const buffer *data_buf);
++#endif
++#endif
+--- a/src/common-session.c
++++ b/src/common-session.c
+@@ -750,0 +789,10 @@
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++int session_uses_mikos_none_transport(void) {
++	return (ses.newkeys != NULL &&
++			ses.newkeys->recv.algo_crypt == &dropbear_nocipher &&
++			ses.newkeys->trans.algo_crypt == &dropbear_nocipher) ||
++		(ses.keys != NULL &&
++			ses.keys->recv.algo_crypt == &dropbear_nocipher &&
++			ses.keys->trans.algo_crypt == &dropbear_nocipher);
++}
++#endif
+--- a/src/session.h
++++ b/src/session.h
+@@ -54,0 +56,3 @@
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++int session_uses_mikos_none_transport(void);
++#endif
+--- a/src/svr-kex.c
++++ b/src/svr-kex.c
+@@ -273,2 +280,10 @@
+-	buf_put_sign(ses.writepayload, svr_opts.hostkey,
+-			ses.newkeys->algo_signature, ses.hash);
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++	if (session_uses_mikos_none_transport()) {
++		buf_put_mikos_none_sign(ses.writepayload, svr_opts.hostkey,
++			ses.newkeys->algo_signature, ses.hash);
++	} else
++#endif
++	{
++		buf_put_sign(ses.writepayload, svr_opts.hostkey,
++			ses.newkeys->algo_signature, ses.hash);
++	}
+--- a/src/cli-kex.c
++++ b/src/cli-kex.c
+@@ -200,2 +200,11 @@
+-	if (buf_verify(ses.payload, hostkey, ses.newkeys->algo_signature,
+-			ses.hash) != DROPBEAR_SUCCESS) {
++	if (
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++		(session_uses_mikos_none_transport() ?
++		 buf_mikos_none_verify(ses.payload, hostkey,
++			ses.newkeys->algo_signature, ses.hash) :
++#endif
++		 buf_verify(ses.payload, hostkey, ses.newkeys->algo_signature, ses.hash)
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++		)
++#endif
++		!= DROPBEAR_SUCCESS) {
+--- a/src/cli-authpubkey.c
++++ b/src/cli-authpubkey.c
+@@ -143,1 +143,8 @@
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++		if (session_uses_mikos_none_transport()) {
++			buf_put_mikos_none_sign(buf, key, sigtype, data_buf);
++		} else
++#endif
++		{
+		buf_put_sign(buf, key, sigtype, data_buf);
++		}
+--- a/src/svr-authpubkey.c
++++ b/src/svr-authpubkey.c
+@@ -233,1 +233,10 @@
+-	if (buf_verify(ses.payload, key, sigtype, signbuf) == DROPBEAR_SUCCESS) {
++	if (
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++		(session_uses_mikos_none_transport() ?
++		 buf_mikos_none_verify(ses.payload, key, sigtype, signbuf) :
++#endif
++		 buf_verify(ses.payload, key, sigtype, signbuf)
++#if DROPBEAR_MIKOS_NONE_ED25519_PROOF
++		)
++#endif
++		== DROPBEAR_SUCCESS) {
+@@ -497,0 +507 @@
++#if !DROPBEAR_MIKOS_TEST_ACCOUNT
+@@ -505,0 +516 @@
++#endif
+@@ -526,0 +538 @@
++#if !DROPBEAR_MIKOS_TEST_ACCOUNT
+@@ -531,0 +544 @@
++#endif

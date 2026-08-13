@@ -50,5 +50,18 @@ int main() {
   MIKOS_CHECK(suite, values.find({3}) != nullptr);
   MIKOS_CHECK(suite, values.size() == 1);
 
+  mikos::u32 visited = 0;
+  values.for_each([&](Key key, mikos::u32& value) {
+    ++visited;
+    MIKOS_CHECK(suite, key.value == 3);
+    value = 44;
+  });
+  MIKOS_CHECK(suite, visited == 1);
+  const Map& const_values = values;
+  const_values.for_each([&](Key key, const mikos::u32& value) {
+    MIKOS_CHECK(suite, key.value == 3);
+    MIKOS_CHECK(suite, value == 44);
+  });
+
   return suite.finish();
 }

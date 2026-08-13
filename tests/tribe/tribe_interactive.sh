@@ -103,6 +103,7 @@ fi
 
 simulator="$root/build/tests/tribe/cpphdl-build/$simulator_name/$simulator_name"
 rootfs="${TRIBE_INTERACTIVE_SD_IMAGE:-$root/build/tests/busybox/rootfs.ext4}"
+client_key="$root/build/tests/busybox/dropbear-host/mikos_ssh_key.dropbear"
 
 if [[ ! -x "$simulator" ]]; then
   echo "Tribe simulator is missing; preparing cpphdl..." >&2
@@ -122,8 +123,8 @@ fi
 echo "Starting MikOS interactive BusyBox shell." >&2
 echo "Type 'exit' to stop MikOS; Ctrl+C stops the simulator; Ctrl+Z suspends it." >&2
 echo "Host link: $tap_name $host_address/24; guest: $guest_address/24." >&2
-echo "SSH after MIKOS_SSH_STARTING:" >&2
-echo "  ssh -i $root/build/mikos_ssh_key -o ConnectTimeout=600 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$guest_address" >&2
+echo "SSH after MIKOS_SSH_STARTING (run exactly once; this server accepts one connection):" >&2
+echo "  ip neigh flush to $guest_address dev $tap_name 2>/dev/null || true; $root/build/tests/busybox/dropbear-host/dbclient -i $client_key -c none -y -y root@$guest_address" >&2
 
 simulator_arguments=(--noveril)
 if [[ "$use_verilator" == 1 ]]; then

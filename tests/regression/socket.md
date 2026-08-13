@@ -19,6 +19,9 @@ Covered by the interactive Tribe ping regression:
 Covered by `tests/net/socket_test.cpp`, `tests/net/tcp_test.cpp`, and
 `tests/net/stack_test.cpp`:
 
+- outbound TCP payload retention and retransmission after silent loss;
+- sequence-keyed adjacent writes, cumulative ACK retirement, and cleanup on
+  the final socket close;
 - fixed-capacity bind/listen/accept lifecycle, conflict and backlog rules,
   handshake transitions, reference counts, ordered receive, EOF, and capacity;
 - IPv4/TCP length, fragment, destination, and checksum validation;

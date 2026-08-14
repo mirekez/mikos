@@ -116,6 +116,11 @@ fi
 
 make -C "$root" "$kernel_target" dropbear-client
 
+# A stopped cycle-accurate run commonly leaves a FAILED/STALE neighbor entry.
+# Clear it before the guest starts so the first dbclient performs fresh ARP
+# resolution even when the user copies only the client half of the hint below.
+ip neigh flush to "$guest_address" dev "$tap_name" >/dev/null 2>&1 || true
+
 if [[ ! -t 0 ]]; then
   echo "warning: stdin is not a terminal; UART input will follow stdin" >&2
 fi
@@ -123,8 +128,9 @@ fi
 echo "Starting MikOS interactive BusyBox shell." >&2
 echo "Type 'exit' to stop MikOS; Ctrl+C stops the simulator; Ctrl+Z suspends it." >&2
 echo "Host link: $tap_name $host_address/24; guest: $guest_address/24." >&2
-echo "SSH after MIKOS_SSH_STARTING (run exactly once; this server accepts one connection):" >&2
+echo "SSH after MIKOS_SSH_STARTING, but only before MIKOS:TCP_ACCEPT (run once):" >&2
 echo "  ip neigh flush to $guest_address dev $tap_name 2>/dev/null || true; $root/build/tests/busybox/dropbear-host/dbclient -i $client_key -c none -y -y root@$guest_address" >&2
+echo "If MIKOS:TCP_ACCEPT is already visible, a client consumed this one-session server; restart MikOS instead of opening another client." >&2
 
 simulator_arguments=(--noveril)
 if [[ "$use_verilator" == 1 ]]; then

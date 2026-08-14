@@ -90,8 +90,9 @@ runnable; background ordering and blocking-pipe scheduling remain pending.
 `make tribe-interactive-ssh-test` configures the guest address, starts
 Dropbear with `-F` as a BusyBox background job, waits for the kernel TCP listen
 marker, and then verifies a real host SSH connection through `accept`,
-identification, KEXINIT, and the next client key-exchange packet on the
-multicore Tribe profile. Optional shell-side diagnostics verify that `ps`
+identification, key exchange, none-mode test authentication, nested remote
+command execution, `SIGCHLD` delivery/reaping, exit status, and clean channel
+close on the multicore Tribe profile. Optional shell-side diagnostics verify that `ps`
 reports the parked `dropbear` PID, `ifconfig -a` reports `eth0` at
 `192.168.76.2/24`, and `netstat` reports port 22. After accepting a
 connection, Dropbear remains resident across network waits so SSH packets do
@@ -102,10 +103,11 @@ still requires the unimplemented `AF_NETLINK`/rtnetlink interface; use
 the paired `dbclient -c none` to match the authorized Ed25519 public key,
 complete the test-only transcript proof, and execute a remote marker command;
 a transport-only exchange is not considered a pass. The
-test-only Dropbear build handles the accepted connection without forking
-because nested background fork is not implemented. The rootfs `rcS` uses the
-same explicit foreground-in-background invocation so a normal init boot owns
-and reports the service.
+test-only Dropbear build handles the accepted network connection without a
+service fork. Its remote command may perform one nested fork using the
+interactive kernel's stacked address-space snapshots. The rootfs `rcS` uses
+the same explicit foreground-in-background invocation so a normal init boot
+owns and reports the service.
 
 The automated SSH regression starts its single client as soon as the TCP
 listen marker appears. Set `TRIBE_INTERACTIVE_SSH_EARLY_CLIENT=0` only when
@@ -128,12 +130,22 @@ build/tests/busybox/dropbear-host/dbclient \
   -c none -y -y root@192.168.76.2
 ```
 
-Flushing the neighbor entry avoids an immediate `No route to host` from stale
-state left by an earlier run. The client then performs fresh ARP resolution as
-part of the connection. Do not gate the client behind a short ping: one packet
-can take longer than ping's wall-clock timeout in the cycle-accurate model.
+The interactive launcher now flushes the neighbor entry at startup, and the
+shown command flushes it again defensively. This avoids an immediate `No route
+to host` from stale state left by an earlier run. The client then performs
+fresh ARP resolution as part of the connection. Do not gate the client behind
+a short ping: one packet can take longer than ping's wall-clock timeout in the
+cycle-accurate model.
 Use this client as the first SSH connection after Dropbear starts; the current
 `DEBUG_NOFORK` test profile accepts one connection.
+
+If `MIKOS:TCP_ACCEPT` is already present, the server's only session has been
+claimed (possibly by a client still running in another terminal). A later
+dbclient is not a retry of that connection: stop the old client/simulator,
+start `tribe_interactive.sh` again, wait for `MIKOS_SSH_STARTING`, and run the
+printed command exactly once. If no accept marker exists, inspect
+`ip neigh show dev tap-tribe`; a `FAILED` entry can be reset with the printed
+`ip neigh flush` command.
 
 The normal BusyBox/rootfs and `tribe_interactive.sh` builds produce this host
 client and a converted Dropbear-format copy of the test identity automatically.

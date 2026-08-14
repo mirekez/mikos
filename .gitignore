@@ -1,0 +1,4 @@
+/.conda
+/build
+/out.txt
+/tests/tribe/out.txt

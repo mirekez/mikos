@@ -33,6 +33,12 @@ inline constexpr u32 descriptor_length = 0x007fffff;
 inline constexpr u32 mac_unicast_low = 0x700;
 inline constexpr u32 mac_unicast_high = 0x704;
 inline constexpr u32 buffer_size = 1536;
+// A normal SSH KEX response can arrive as three distinct frames before the
+// slow cycle model next polls us: ACK(server KEX reply), client KEX payload,
+// ACK(server NEWKEYS). Two descriptors lose the payload between those ACKs.
+// Leave additional headroom for retransmissions and channel/PTY bursts.
+inline constexpr u32 receive_descriptor_count = 8;
+static_assert(receive_descriptor_count >= 4);
 inline constexpr u32 timeout = 5'000'000;
 inline constexpr MacAddress local_mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}};
 
@@ -40,11 +46,13 @@ struct alignas(64) Descriptor {
   u32 word[16];
 };
 
-Descriptor rx_descriptor{};
+Descriptor rx_descriptors[receive_descriptor_count]{};
 Descriptor tx_descriptor{};
-alignas(64) u8 rx_buffer[buffer_size]{};
+alignas(64) u8 rx_buffers[receive_descriptor_count][buffer_size]{};
 alignas(64) u8 tx_buffer[buffer_size]{};
 bool rx_posted{};
+u32 rx_consume_index{};
+u32 rx_rearm_index{};
 
 [[nodiscard]] volatile u32& dma_reg(u32 offset) {
   return *reinterpret_cast<volatile u32*>(dma_base + offset);
@@ -62,19 +70,41 @@ void clear(Descriptor& descriptor) {
   }
 }
 
-void post_receive() {
-  clear(rx_descriptor);
-  rx_descriptor.word[descriptor_next / 4] = 0;
-  rx_descriptor.word[descriptor_buffer / 4] =
-      static_cast<u32>(reinterpret_cast<usize>(rx_buffer));
-  rx_descriptor.word[descriptor_control / 4] = buffer_size;
+void prepare_receive(u32 index) {
+  auto& descriptor = rx_descriptors[index];
+  clear(descriptor);
+  descriptor.word[descriptor_next / 4] = static_cast<u32>(
+      reinterpret_cast<usize>(
+          &rx_descriptors[(index + 1) % receive_descriptor_count]));
+  descriptor.word[descriptor_buffer / 4] =
+      static_cast<u32>(reinterpret_cast<usize>(rx_buffers[index]));
+  descriptor.word[descriptor_control / 4] = buffer_size;
+}
+
+void initialize_receive_ring() {
+  for (u32 index = 0; index < receive_descriptor_count; ++index) {
+    prepare_receive(index);
+  }
   fence();
   dma_reg(rx_status) = dma_irq_all;
   dma_reg(rx_current) =
-      static_cast<u32>(reinterpret_cast<usize>(&rx_descriptor));
+      static_cast<u32>(reinterpret_cast<usize>(&rx_descriptors[0]));
   dma_reg(rx_control) = dma_run | dma_irq_complete | dma_irq_error;
-  dma_reg(rx_tail) =
-      static_cast<u32>(reinterpret_cast<usize>(&rx_descriptor));
+  dma_reg(rx_tail) = static_cast<u32>(reinterpret_cast<usize>(
+      &rx_descriptors[receive_descriptor_count - 1]));
+  fence();
+  rx_posted = true;
+  rx_consume_index = 0;
+}
+
+void rearm_receive() {
+  prepare_receive(rx_rearm_index);
+  fence();
+  dma_reg(rx_status) = dma_irq_all;
+  // Moving TDESC to the descriptor just returned to DMA extends the posted
+  // ring without disturbing CDESC or a packet already filling its peer.
+  dma_reg(rx_tail) = static_cast<u32>(
+      reinterpret_cast<usize>(&rx_descriptors[rx_rearm_index]));
   fence();
   rx_posted = true;
 }
@@ -108,7 +138,7 @@ bool initialize() {
   mac_reg(mac_unicast_low) = 0x00000002;
   mac_reg(mac_unicast_high) = 0x00000200;
   fence();
-  post_receive();
+  initialize_receive_ring();
   return true;
 }
 
@@ -116,22 +146,30 @@ MacAddress mac_address() { return local_mac; }
 
 bool receive(Frame& frame) {
   if (!rx_posted) {
-    post_receive();
+    rearm_receive();
+    return false;
   }
   fence();
-  const u32 status = rx_descriptor.word[descriptor_status / 4];
+  const u32 dma_status = dma_reg(rx_status);
+  if ((dma_status & dma_irq_error) != 0) {
+    rx_posted = false;
+    rx_rearm_index = rx_consume_index;
+    dma_reg(rx_status) = dma_irq_all;
+    return false;
+  }
+  auto& descriptor = rx_descriptors[rx_consume_index];
+  const u32 status = descriptor.word[descriptor_status / 4];
   if ((status & descriptor_done) == 0) {
     return false;
   }
   rx_posted = false;
-  if ((dma_reg(rx_status) & dma_irq_error) != 0) {
-    return false;
-  }
+  rx_rearm_index = rx_consume_index;
+  rx_consume_index = (rx_consume_index + 1) % receive_descriptor_count;
   const u32 size = status & descriptor_length;
   if (size < 14 || size > buffer_size) {
     return false;
   }
-  frame = Frame{rx_buffer, size};
+  frame = Frame{rx_buffers[rx_rearm_index], size};
   return true;
 }
 

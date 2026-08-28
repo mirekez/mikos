@@ -40,6 +40,14 @@ SECTIONS
   __kernel_end = .;
 
   /*
+   * Fork snapshots use the otherwise unoccupied physical RAM between the
+   * kernel and the first user image. The arena is not an ELF section: it has
+   * no load-time contents and allocations are initialized by the kernel.
+   */
+  __fork_snapshot_arena_begin = ALIGN(16);
+  __fork_snapshot_arena_end = 0x81000000;
+
+  /*
    * Interactive Tribe kernels preload the BusyBox file at the same address
    * as its first PT_LOAD segment. The section is empty for all other kernels.
    * Keeping it out of __kernel_end preserves the kernel/user boundary check.
@@ -63,4 +71,6 @@ SECTIONS
   }
 
   ASSERT(__kernel_end < 0x81000000, "kernel overlaps user image")
+  ASSERT(__fork_snapshot_arena_begin < __fork_snapshot_arena_end,
+         "no physical RAM remains for fork snapshots")
 }

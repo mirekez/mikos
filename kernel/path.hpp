@@ -5,6 +5,32 @@
 namespace mikos::path {
 
 inline constexpr u32 capacity = 256;
+inline constexpr u32 invalid_number = ~u32{0};
+
+[[nodiscard]] constexpr u32 numbered_suffix(const char* text,
+                                             const char* prefix,
+                                             u32 limit) {
+  if (text == nullptr || prefix == nullptr || limit == 0) {
+    return invalid_number;
+  }
+  u32 index = 0;
+  while (prefix[index] != '\0' && text[index] == prefix[index]) {
+    ++index;
+  }
+  if (prefix[index] != '\0' || text[index] < '0' || text[index] > '9') {
+    return invalid_number;
+  }
+  u32 value = 0;
+  do {
+    const u32 digit = static_cast<u32>(text[index] - '0');
+    if (digit >= limit || value > (limit - 1 - digit) / 10) {
+      return invalid_number;
+    }
+    value = value * 10 + digit;
+    ++index;
+  } while (text[index] >= '0' && text[index] <= '9');
+  return text[index] == '\0' && value < limit ? value : invalid_number;
+}
 
 [[nodiscard]] inline bool canonicalize(const char* current_directory,
                                        const char* path, char* output,

@@ -1,47 +1,100 @@
 diff --git a/tribe/TribeTest.h b/tribe/TribeTest.h
-index 9df29f7..d1435a0 100644
 --- a/tribe/TribeTest.h
 +++ b/tribe/TribeTest.h
-@@ -245,6 +245,7 @@ class TestTribe : public Module
-     reg<u1> uart_script_reported_reg;
-     reg<u1> sd_dma_cache_invalidate_reg;
-     reg<u1> eth_dma_cache_invalidate_reg;
-+    reg<u1> eth_dma_irq_latched_reg;
-     bool eth_loopback_enabled = false;
-     EthGigTapSocket eth_tap_socket;
-     bool tohost_done = false;
-@@ -1224,7 +1225,8 @@ public:
+@@ -754,9 +754,20 @@ public:
+     static constexpr bool eth_dma_needs_cache_invalidate(bool tx_irq, bool rx_irq)
+     {
+         (void)tx_irq;
+         return rx_irq;
+     }
+-
++    static constexpr bool eth_dma_cache_invalidate_next(
++        bool rx_irq, bool pending, bool ready)
++    {
++        // Emit distinct invalidate pulses while RX completion remains high.
++        // Software may clear and repost the descriptor between testbench
++        // samples, so a one-edge latch can hide the next DMA completion.
++        if (pending && ready) {
++            return false;
++        }
++        return rx_irq || pending;
++    }
++
+     void set_uart_script_delay(uint32_t delay)
+     {
+         uart_script_delay_reg.set((u32)delay);
+@@ -1224,15 +1236,10 @@ public:
          else {
              sd_dma_cache_invalidate_reg._next = sd_dma_cache_invalidate_reg;
          }
 -        if (eth_dma_needs_cache_invalidate(ethgig_dma.tx_irq_out(), ethgig_dma.rx_irq_out())) {
-+        bool eth_dma_irq = eth_dma_needs_cache_invalidate(ethgig_dma.tx_irq_out(), ethgig_dma.rx_irq_out());
-+        if (eth_dma_irq && !eth_dma_irq_latched_reg) {
-             eth_dma_cache_invalidate_reg._next = true;
-         }
-         else if (eth_dma_cache_invalidate_reg && eth_dma_cache_invalidate_ready) {
-@@ -1233,6 +1235,7 @@ public:
-         else {
-             eth_dma_cache_invalidate_reg._next = eth_dma_cache_invalidate_reg;
-         }
-+        eth_dma_irq_latched_reg._next = eth_dma_irq;
+-            eth_dma_cache_invalidate_reg._next = true;
+-        }
+-        else if (eth_dma_cache_invalidate_reg && eth_dma_cache_invalidate_ready) {
+-            eth_dma_cache_invalidate_reg._next = false;
+-        }
+-        else {
+-            eth_dma_cache_invalidate_reg._next = eth_dma_cache_invalidate_reg;
+-        }
++        eth_dma_cache_invalidate_reg._next = eth_dma_cache_invalidate_next(
++            eth_dma_needs_cache_invalidate(
++                ethgig_dma.tx_irq_out(), ethgig_dma.rx_irq_out()),
++            eth_dma_cache_invalidate_reg, eth_dma_cache_invalidate_ready);
  #ifdef VERILATOR
          AXI4_RESPONDER_FROM_VERILATOR(tribe, mem0.axi_in, 0);
          AXI4_RESPONDER_FROM_VERILATOR(tribe, mem1.axi_in, 1);
-@@ -1247,6 +1250,7 @@ public:
-         if (reset) {
-             error = false;
-             sd_dma_cache_invalidate_reg.clr();
-             eth_dma_cache_invalidate_reg.clr();
-+            eth_dma_irq_latched_reg.clr();
-             return;
+diff --git a/tribe/tests/EthGigCPU_test.cpp b/tribe/tests/EthGigCPU_test.cpp
+--- a/tribe/tests/EthGigCPU_test.cpp
++++ b/tribe/tests/EthGigCPU_test.cpp
+@@ -126,8 +126,26 @@ static bool check_eth_dma_cache_invalidate_policy()
+     if (TestTribe::eth_dma_needs_cache_invalidate(false, false)) {
+         std::print("EthGig cache invalidate ERROR: idle DMA must not invalidate CPU cache\n");
+         ok = false;
+     }
++
++    bool pending = false;
++    pending = TestTribe::eth_dma_cache_invalidate_next(true, pending, true);
++    if (!pending) {
++        std::print("EthGig cache invalidate ERROR: RX completion did not raise a pulse\n");
++        ok = false;
++    }
++    pending = TestTribe::eth_dma_cache_invalidate_next(true, pending, true);
++    if (pending) {
++        std::print("EthGig cache invalidate ERROR: RX pulse did not clear for retrigger\n");
++        ok = false;
++    }
++    pending = TestTribe::eth_dma_cache_invalidate_next(true, pending, true);
++    if (!pending) {
++        std::print("EthGig cache invalidate ERROR: held RX IRQ did not retrigger\n");
++        ok = false;
++    }
++
+     return ok;
+ }
+-
++
+ int main(int argc, char** argv)
+@@ -134,6 +152,7 @@ int main(int argc, char** argv)
+ {
+     bool noveril = false;
+     bool debug = false;
++    bool policy_only = false;
+     for (int i = 1; i < argc; ++i) {
+         if (strcmp(argv[i], "--noveril") == 0) {
+             noveril = true;
+@@ -141,8 +160,14 @@ int main(int argc, char** argv)
+         if (strcmp(argv[i], "--debug") == 0) {
+             debug = true;
          }
-@@ -1291,6 +1295,7 @@ public:
-         uart_script_enabled_reg.strobe(checkpoint_fd);
-         uart_script_reported_reg.strobe(checkpoint_fd);
-         sd_dma_cache_invalidate_reg.strobe(checkpoint_fd);
-         eth_dma_cache_invalidate_reg.strobe();
-+        eth_dma_irq_latched_reg.strobe();
- #ifndef VERILATOR
-         uint64_t tribe_strobe_time_start = tribe_runtime_tick();
-         tribe._strobe(checkpoint_fd);
++        if (strcmp(argv[i], "--policy-only") == 0) {
++            policy_only = true;
++        }
+     }
+-
++
+     bool ok = check_eth_dma_cache_invalidate_policy();
++    if (policy_only) {
++        return ok ? 0 : 1;
++    }
+     ok = ok && build_ethgig_elf();
+     ok = ok && run_ethgig_cpu(debug);

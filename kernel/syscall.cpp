@@ -6,12 +6,16 @@
 #include <mikos/kernel.hpp>
 #include <mikos/abi/riscv32.hpp>
 #include <mikos/abi/socket.hpp>
+#include <mikos/process/model.hpp>
 #include <mikos/process/pipe.hpp>
 #include <mikos/process/signal.hpp>
+#include <mikos/process/snapshot_arena.hpp>
 #include <mikos/process/pty.hpp>
 
 extern "C" void* memset(void*, int, mikos::usize);
 extern "C" void* memcpy(void*, const void*, mikos::usize);
+extern "C" unsigned char __fork_snapshot_arena_begin[];
+extern "C" unsigned char __fork_snapshot_arena_end[];
 
 namespace mikos {
 namespace {
@@ -76,7 +80,8 @@ struct SuspendedParent {
   u32 child_status{};
   u32 child_pid{};
   u32 child_process_group{};
-  u32 parent_pid{};
+  process_model::ProcessLineage lineage{};
+  u32 child_tid_address{};
   u32 process_group{};
   u32 session{};
   u32 image{};
@@ -85,14 +90,20 @@ struct SuspendedParent {
   u32 file_creation_mask{};
   char current_directory[256]{};
   char executable_path[256]{};
+  process_model::SnapshotAllocation snapshot{};
   bool active{};
   bool memory_saved{};
   bool child_waitable{};
 };
 
 SuspendedParent parent{};
-SuspendedParent nested_ancestor{};
-bool nested_ancestor_saved{};
+// Process metadata remains bounded independently of address-space size.
+// Snapshots consume their exact byte count from the shared arena rather than
+// reserving this capacity times a worst-case image size.
+inline constexpr u32 process_context_capacity = 32;
+inline constexpr u32 nested_ancestor_capacity = process_context_capacity;
+SuspendedParent nested_ancestors[nested_ancestor_capacity]{};
+u32 nested_ancestor_depth{};
 struct WaitableChild {
   u32 pid{};
   u32 parent_pid{};
@@ -101,14 +112,16 @@ struct WaitableChild {
   bool used{};
 };
 
-WaitableChild waitable_children[8]{};
+WaitableChild waitable_children[process_context_capacity]{};
 u32 file_creation_mask{0022};
 u32 child_tid_address{};
 process_model::SignalState signals{};
 ActiveSignalFrame active_signal_frame{};
-inline constexpr u32 parent_backup_capacity = 4 * 1024 * 1024;
-[[gnu::section(".noinit")]] alignas(16)
-u8 parent_backup[parent_backup_capacity];
+// At most one free extent can be introduced per live context release. Keep
+// fragmentation metadata above the process-context bound plus the parked
+// background and PTY contexts.
+process_model::SnapshotArena<64> snapshot_arena{};
+bool snapshot_arena_initialized{};
 
 enum class BackgroundWait : u8 { none, socket_read };
 
@@ -127,19 +140,53 @@ struct ParkedBackground {
   u32 process_group{};
   u32 session{};
   u32 image{};
+  u32 child_tid_address{};
   process_model::SignalState signals{};
   ActiveSignalFrame signal_frame{};
   u32 file_creation_mask{};
   char current_directory[256]{};
   char executable_path[256]{};
+  process_model::SnapshotAllocation snapshot{};
   u8 wait_socket{network::invalid_socket};
   BackgroundWait wait{BackgroundWait::none};
   bool used{};
 };
 
 ParkedBackground background{};
-[[gnu::section(".noinit")]] alignas(16)
-u8 background_backup[parent_backup_capacity];
+
+// The flat address-space adapter normally runs a fork child to completion.
+// An interactive PTY shell is different: after writing its prompt it must
+// block on the slave while its immediate Dropbear parent drains the master,
+// forwards the prompt, and receives more input. Its exact-sized snapshot uses
+// the same shared arena as every other suspended address space.
+struct ParkedInteractiveChild {
+  TrapFrame frame{};
+  u32 brk{};
+  u32 mmap_begin{};
+  u32 mmap_cursor{};
+  u32 mutable_begin{};
+  u32 stack_begin{};
+  u32 mutable_size{};
+  u32 mmap_size{};
+  u32 stack_size{};
+  u32 pid{};
+  u32 parent_pid{};
+  u32 process_group{};
+  u32 session{};
+  u32 image{};
+  u32 child_tid_address{};
+  process_model::SignalState signals{};
+  ActiveSignalFrame signal_frame{};
+  u32 file_creation_mask{};
+  char current_directory[256]{};
+  char executable_path[256]{};
+  process_model::PtyHandle wait_pty{};
+  process_model::PtyEnd wait_end{process_model::PtyEnd::slave};
+  process_model::SnapshotAllocation snapshot{};
+  bool used{};
+};
+
+ParkedInteractiveChild interactive_child{};
 
 [[maybe_unused, nodiscard]] bool user_string_is(u32 address,
                                                 const char* expected);
@@ -149,6 +196,10 @@ void restore_parent_descriptors();
 void discard_parent_descriptors();
 [[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket);
 [[nodiscard]] bool resume_background_if_ready(TrapFrame& frame);
+[[nodiscard]] bool park_interactive_child(
+    TrapFrame& frame, process_model::PtyHandle wait_pty,
+    process_model::PtyEnd wait_end);
+[[nodiscard]] bool resume_interactive_child_if_ready(TrapFrame& frame);
 [[nodiscard]] bool stack_suspended_ancestor();
 void reinstate_suspended_ancestor(TrapFrame& frame);
 
@@ -179,6 +230,52 @@ void refresh_child_waitable() {
   }
 }
 
+[[nodiscard]] bool ensure_snapshot_arena() {
+  if (snapshot_arena_initialized) {
+    return true;
+  }
+  const auto begin = static_cast<u32>(
+      reinterpret_cast<usize>(__fork_snapshot_arena_begin));
+  const auto end = static_cast<u32>(
+      reinterpret_cast<usize>(__fork_snapshot_arena_end));
+  snapshot_arena_initialized =
+      snapshot_arena.initialize(begin, end) ==
+      process_model::SnapshotArenaStatus::success;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  if (snapshot_arena_initialized) {
+    write_text("MIKOS:FORK_ARENA begin=");
+    write_u32(begin);
+    write_text(" end=");
+    write_u32(end);
+    write_text(" bytes=");
+    write_u32(snapshot_arena.capacity());
+    write_text("\n");
+  }
+#endif
+  return snapshot_arena_initialized;
+}
+
+[[nodiscard]] bool allocate_snapshot(
+    u32 size, process_model::SnapshotAllocation& allocation) {
+  if (!ensure_snapshot_arena()) {
+    return false;
+  }
+  allocation = snapshot_arena.allocate(size);
+  return allocation.valid();
+}
+
+void release_snapshot(process_model::SnapshotAllocation& allocation) {
+  if (!allocation.valid()) {
+    return;
+  }
+  if (snapshot_arena.release(allocation) !=
+      process_model::SnapshotArenaStatus::success) {
+    write_text("MIKOS:FORK_ARENA_CORRUPT\n");
+    shutdown(9);
+  }
+  allocation = {};
+}
+
 [[nodiscard]] bool save_parent_memory() {
   if (parent.memory_saved) {
     return true;
@@ -202,19 +299,30 @@ void refresh_child_waitable() {
   write_u32(parent.stack_size);
   write_text("\n");
 #endif
-  if (total > parent_backup_capacity) {
+  if (total > ~u32{0} ||
+      !allocate_snapshot(static_cast<u32>(total), parent.snapshot)) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    write_text("MIKOS:FORK_ARENA_ENOMEM requested=");
+    write_u32(total > ~u32{0} ? ~u32{0} : static_cast<u32>(total));
+    write_text(" available=");
+    write_u32(snapshot_arena.available());
+    write_text(" largest=");
+    write_u32(snapshot_arena.largest_available());
+    write_text("\n");
+#endif
     return false;
   }
+  auto* snapshot = reinterpret_cast<u8*>(parent.snapshot.address);
   u32 cursor = 0;
-  memcpy(parent_backup + cursor,
+  memcpy(snapshot + cursor,
          reinterpret_cast<const void*>(parent.mutable_begin),
          parent.mutable_size);
   cursor += parent.mutable_size;
-  memcpy(parent_backup + cursor,
+  memcpy(snapshot + cursor,
          reinterpret_cast<const void*>(parent.mmap_begin),
          parent.mmap_size);
   cursor += parent.mmap_size;
-  memcpy(parent_backup + cursor,
+  memcpy(snapshot + cursor,
          reinterpret_cast<const void*>(parent.stack_begin),
          parent.stack_size);
   parent.memory_saved = true;
@@ -232,15 +340,18 @@ void resume_parent(TrapFrame& frame, u32 status, bool child_completed,
     shutdown(9);
   }
   if (parent.memory_saved) {
+    const auto* snapshot =
+        reinterpret_cast<const u8*>(parent.snapshot.address);
     u32 cursor = 0;
     memcpy(reinterpret_cast<void*>(parent.mutable_begin),
-           parent_backup + cursor, parent.mutable_size);
+           snapshot + cursor, parent.mutable_size);
     cursor += parent.mutable_size;
-    memcpy(reinterpret_cast<void*>(parent.mmap_begin), parent_backup + cursor,
+    memcpy(reinterpret_cast<void*>(parent.mmap_begin), snapshot + cursor,
            parent.mmap_size);
     cursor += parent.mmap_size;
-    memcpy(reinterpret_cast<void*>(parent.stack_begin), parent_backup + cursor,
+    memcpy(reinterpret_cast<void*>(parent.stack_begin), snapshot + cursor,
            parent.stack_size);
+    release_snapshot(parent.snapshot);
   }
   frame = parent.frame;
   if (return_from_clone) {
@@ -251,8 +362,9 @@ void resume_parent(TrapFrame& frame, u32 status, bool child_completed,
   process.mmap_begin = parent.mmap_begin;
   process.mmap_cursor = parent.mmap_cursor;
   process.mutable_begin = parent.mutable_begin;
-  process.pid = parent.parent_pid;
-  process.parent_pid = 0;
+  process.pid = parent.lineage.pid;
+  process.parent_pid = parent.lineage.parent_pid;
+  child_tid_address = parent.child_tid_address;
   process.process_group = parent.process_group;
   process.session = parent.session;
   signals = parent.signals;
@@ -267,7 +379,7 @@ void resume_parent(TrapFrame& frame, u32 status, bool child_completed,
   if (child_completed) {
     parent.child_status = status;
     parent.child_process_group = child_process_group;
-    publish_child_exit(parent.child_pid, parent.parent_pid,
+    publish_child_exit(parent.child_pid, parent.lineage.pid,
                        child_process_group, status);
     // Linux publishes the zombie before making SIGCHLD observable.  Queue the
     // signal in the just-restored immediate parent; nested flat-address-space
@@ -301,16 +413,21 @@ void restore_parent(TrapFrame& frame, u32 status) {
   const bool vfork = behavior == (clone_vm | clone_vfork);
   const u32 child_stack = stack == 0 ? frame.x[2] : stack;
   const bool nested_background_fork =
-      parent.active && process.pid == parent.child_pid &&
-      !nested_ancestor_saved;
+      parent.active && process.pid == parent.child_pid;
   if ((!ordinary_fork && !vfork) || (flags & signal_mask) != sigchld ||
-      (parent.active && !nested_background_fork) ||
       !user_memory.contains(child_stack, 1) ||
-      !waitable_space() ||
       (((flags & (clone_child_settid | clone_child_cleartid)) != 0) &&
        (!user_memory.contains(child_tid, sizeof(u32)) ||
         !user_memory.aligned(child_tid, alignof(u32))))) {
     return error(Errno::invalid_argument);
+  }
+  if (parent.active && !nested_background_fork) {
+    return error(Errno::invalid_argument);
+  }
+  if ((nested_background_fork &&
+       nested_ancestor_depth == nested_ancestor_capacity) ||
+      !waitable_space()) {
+    return error(Errno::no_memory);
   }
   if (nested_background_fork && !stack_suspended_ancestor()) {
     return error(Errno::no_memory);
@@ -330,7 +447,8 @@ void restore_parent(TrapFrame& frame, u32 status) {
   memcpy(parent.executable_path, process.executable_path,
          sizeof(parent.executable_path));
   parent.stack_begin = align_down(child_stack, static_cast<u32>(16));
-  parent.parent_pid = process.pid;
+  parent.lineage = {process.pid, process.parent_pid};
+  parent.child_tid_address = child_tid_address;
   parent.process_group = process.process_group;
   parent.session = process.session;
   parent.image = process.image;
@@ -349,8 +467,10 @@ void restore_parent(TrapFrame& frame, u32 status) {
 #ifdef MIKOS_TRIBE_INTERACTIVE
   write_text("MIKOS:CLONE_DONE\n");
 #endif
-  process.pid = parent.child_pid;
-  process.parent_pid = parent.parent_pid;
+  const auto child_lineage = process_model::fork_lineage(
+      parent.lineage, parent.child_pid);
+  process.pid = child_lineage.pid;
+  process.parent_pid = child_lineage.parent_pid;
   child_tid_address =
       (flags & clone_child_cleartid) != 0 ? child_tid : 0;
   if ((flags & clone_child_settid) != 0) {
@@ -399,9 +519,11 @@ struct Node {
   Kind kind{Kind::none};
   drivers::fs::root::Node file{};
   PseudoFilesystem::Node pseudo_node{PseudoFilesystem::Node::none};
+  u8 pty_number{0xff};
 
   constexpr Node() = default;
   constexpr Node(Kind value) : kind(value) {}
+  constexpr Node(Kind value, u8 number) : kind(value), pty_number(number) {}
   constexpr Node(const drivers::fs::root::Node& value)
       : kind(Kind::filesystem), file(value) {}
   constexpr Node(PseudoFilesystem::Node value)
@@ -427,8 +549,59 @@ Descriptor parent_descriptors[13]{};
 Descriptor parent_standard_redirects[3]{};
 Descriptor background_descriptors[13]{};
 Descriptor background_standard_redirects[3]{};
-process_model::PipeTable<4> pipes{};
+Descriptor nested_ancestor_descriptors[nested_ancestor_capacity][13]{};
+Descriptor nested_ancestor_standard_redirects[nested_ancestor_capacity][3]{};
+Descriptor interactive_child_descriptors[13]{};
+Descriptor interactive_child_standard_redirects[3]{};
+// A Dropbear command session holds its signal pipe and listener child-status
+// pipe while creating stdin, stdout, and stderr pipes for the remote command.
+// Keep spare bounded slots for cleanup/reaping paths and future PTY helpers.
+process_model::PipeTable<8> pipes{};
 process_model::PtyTable<4> ptys{};
+
+[[nodiscard]] u32 queue_process_group_signal(u32 process_group, u8 signal) {
+  if (process_group == 0 || !process_model::SignalState::valid(signal)) {
+    return 0;
+  }
+  u32 delivered_pids[nested_ancestor_capacity + 4]{};
+  u32 delivered = 0;
+  const auto queue = [&](u32 pid, u32 group,
+                         process_model::SignalState& state) {
+    if (pid == 0 || group != process_group) {
+      return;
+    }
+    for (u32 i = 0; i < delivered; ++i) {
+      if (delivered_pids[i] == pid) {
+        return;
+      }
+    }
+    if (state.queue(signal) == process_model::SignalStatus::success) {
+      delivered_pids[delivered++] = pid;
+    }
+  };
+
+  queue(process.pid, process.process_group, signals);
+  if (parent.active) {
+    queue(parent.lineage.pid, parent.process_group, parent.signals);
+  }
+  for (auto& ancestor : nested_ancestors) {
+    if (ancestor.active) {
+      queue(ancestor.lineage.pid, ancestor.process_group, ancestor.signals);
+    }
+  }
+  // A shell that has run an external command can remain represented in the
+  // background handoff metadata after it subsequently parks on its PTY. The
+  // interactive snapshot is then authoritative; visit it first so PID
+  // de-duplication cannot queue a terminal signal into the stale copy.
+  if (interactive_child.used) {
+    queue(interactive_child.pid, interactive_child.process_group,
+          interactive_child.signals);
+  }
+  if (background.used) {
+    queue(background.pid, background.process_group, background.signals);
+  }
+  return delivered;
+}
 
 [[nodiscard]] bool retain_descriptor(const Descriptor& descriptor) {
   if (descriptor.node == Node::network_socket) {
@@ -549,6 +722,208 @@ void move_saved_descriptors(Descriptor* saved, Descriptor* saved_standard) {
   }
 }
 
+[[nodiscard]] bool save_interactive_child_memory() {
+  interactive_child.mutable_size =
+      interactive_child.brk - interactive_child.mutable_begin;
+  interactive_child.mmap_size =
+      interactive_child.mmap_cursor - interactive_child.mmap_begin;
+  interactive_child.stack_size =
+      user_stack_top - interactive_child.stack_begin;
+  const u64 total = static_cast<u64>(interactive_child.mutable_size) +
+                    interactive_child.mmap_size +
+                    interactive_child.stack_size;
+  if (interactive_child.mutable_begin > interactive_child.brk ||
+      interactive_child.mmap_cursor < interactive_child.mmap_begin ||
+      interactive_child.stack_begin > user_stack_top ||
+      total > ~u32{0} ||
+      !allocate_snapshot(static_cast<u32>(total),
+                         interactive_child.snapshot)) {
+    return false;
+  }
+  auto* snapshot = reinterpret_cast<u8*>(interactive_child.snapshot.address);
+  u32 cursor = 0;
+  memcpy(snapshot + cursor,
+         reinterpret_cast<const void*>(interactive_child.mutable_begin),
+         interactive_child.mutable_size);
+  cursor += interactive_child.mutable_size;
+  memcpy(snapshot + cursor,
+         reinterpret_cast<const void*>(interactive_child.mmap_begin),
+         interactive_child.mmap_size);
+  cursor += interactive_child.mmap_size;
+  memcpy(snapshot + cursor,
+         reinterpret_cast<const void*>(interactive_child.stack_begin),
+         interactive_child.stack_size);
+  return true;
+}
+
+void capture_interactive_child(TrapFrame& frame,
+                               process_model::PtyHandle wait_pty,
+                               process_model::PtyEnd wait_end) {
+  interactive_child.frame = frame;
+  interactive_child.brk = process.brk;
+  interactive_child.mmap_begin = process.mmap_begin;
+  interactive_child.mmap_cursor = process.mmap_cursor;
+  interactive_child.mutable_begin = process.mutable_begin;
+  interactive_child.stack_begin =
+      align_down(frame.x[2], static_cast<u32>(16));
+  interactive_child.pid = process.pid;
+  interactive_child.parent_pid = process.parent_pid;
+  interactive_child.process_group = process.process_group;
+  interactive_child.session = process.session;
+  interactive_child.image = process.image;
+  interactive_child.child_tid_address = child_tid_address;
+  interactive_child.signals = signals;
+  interactive_child.signal_frame = active_signal_frame;
+  interactive_child.file_creation_mask = file_creation_mask;
+  memcpy(interactive_child.current_directory, process.current_directory,
+         sizeof(interactive_child.current_directory));
+  memcpy(interactive_child.executable_path, process.executable_path,
+         sizeof(interactive_child.executable_path));
+  interactive_child.wait_pty = wait_pty;
+  interactive_child.wait_end = wait_end;
+  interactive_child.used = true;
+}
+
+[[nodiscard]] bool park_interactive_child(
+    TrapFrame& frame, process_model::PtyHandle wait_pty,
+    process_model::PtyEnd wait_end) {
+  if (!process_model::pty_child_can_park(
+          interactive_child.used, parent.active,
+          wait_end == process_model::PtyEnd::slave)) {
+    return false;
+  }
+  capture_interactive_child(frame, wait_pty, wait_end);
+  if (!save_interactive_child_memory()) {
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    write_text("MIKOS:PTY_CHILD_PARK_ENOMEM mutable=");
+    write_u32(interactive_child.mutable_size);
+    write_text(" mmap=");
+    write_u32(interactive_child.mmap_size);
+    write_text(" stack=");
+    write_u32(interactive_child.stack_size);
+    write_text("\n");
+#endif
+    interactive_child = {};
+    return false;
+  }
+  move_active_descriptors(interactive_child_descriptors,
+                          interactive_child_standard_redirects);
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:PTY_CHILD_PARK child=");
+  write_u32(interactive_child.pid);
+  write_text(" parent=");
+  write_u32(interactive_child.parent_pid);
+  write_text(" bytes=");
+  write_u32(interactive_child.mutable_size + interactive_child.mmap_size +
+            interactive_child.stack_size);
+  write_text("\n");
+#endif
+  // Return to the immediate Dropbear parent but keep the older suspended
+  // listener/shell ancestry stacked. The child will replay this read syscall
+  // once the parent has delivered bytes to the PTY master.
+  const bool first_park =
+      parent.frame.x[17] == static_cast<u32>(Syscall::clone);
+  resume_parent(frame, 0, false, first_park);
+  return true;
+}
+
+[[nodiscard]] bool resume_interactive_child_if_ready(TrapFrame& frame) {
+  const bool slave_readable =
+      interactive_child.used &&
+      ptys.readable(interactive_child.wait_pty, interactive_child.wait_end);
+  const bool wait_interrupted =
+      interactive_child.used &&
+      interactive_child.signals.has_deliverable();
+  if (!process_model::pty_child_can_resume(
+          interactive_child.used, process.pid, interactive_child.parent_pid,
+          parent.active, slave_readable, wait_interrupted) ||
+      !save_parent_descriptors()) {
+    return false;
+  }
+
+  parent.frame = frame;
+  parent.brk = process.brk;
+  parent.mmap_begin = process.mmap_begin;
+  parent.mmap_cursor = process.mmap_cursor;
+  parent.mutable_begin = process.mutable_begin;
+  parent.stack_begin = align_down(frame.x[2], static_cast<u32>(16));
+  parent.child_pid = interactive_child.pid;
+  parent.lineage = {process.pid, process.parent_pid};
+  parent.child_tid_address = child_tid_address;
+  parent.process_group = process.process_group;
+  parent.session = process.session;
+  parent.image = process.image;
+  parent.signals = signals;
+  parent.signal_frame = active_signal_frame;
+  parent.file_creation_mask = file_creation_mask;
+  memcpy(parent.current_directory, process.current_directory,
+         sizeof(parent.current_directory));
+  memcpy(parent.executable_path, process.executable_path,
+         sizeof(parent.executable_path));
+  parent.active = true;
+  parent.memory_saved = false;
+  if (!save_parent_memory()) {
+    parent.active = false;
+    discard_parent_descriptors();
+    return false;
+  }
+
+  const u32 child_pid = interactive_child.pid;
+  const u32 child_parent_pid = interactive_child.parent_pid;
+  reset_descriptors();
+  if (process.image != interactive_child.image &&
+      !restore_executable_image(interactive_child.executable_path)) {
+    write_text("MIKOS:PTY_CHILD_IMAGE_RESTORE_FAIL\n");
+    shutdown(9);
+  }
+  const auto* snapshot =
+      reinterpret_cast<const u8*>(interactive_child.snapshot.address);
+  u32 cursor = 0;
+  memcpy(reinterpret_cast<void*>(interactive_child.mutable_begin),
+         snapshot + cursor, interactive_child.mutable_size);
+  cursor += interactive_child.mutable_size;
+  memcpy(reinterpret_cast<void*>(interactive_child.mmap_begin),
+         snapshot + cursor, interactive_child.mmap_size);
+  cursor += interactive_child.mmap_size;
+  memcpy(reinterpret_cast<void*>(interactive_child.stack_begin),
+         snapshot + cursor, interactive_child.stack_size);
+  release_snapshot(interactive_child.snapshot);
+  move_saved_descriptors(interactive_child_descriptors,
+                         interactive_child_standard_redirects);
+  frame = interactive_child.frame;
+  if (wait_interrupted) {
+    frame.x[10] = static_cast<u32>(error(Errno::interrupted));
+    frame.mepc += 4;
+  }
+  process.brk = interactive_child.brk;
+  process.mmap_begin = interactive_child.mmap_begin;
+  process.mmap_cursor = interactive_child.mmap_cursor;
+  process.mutable_begin = interactive_child.mutable_begin;
+  process.pid = child_pid;
+  process.parent_pid = child_parent_pid;
+  process.process_group = interactive_child.process_group;
+  process.session = interactive_child.session;
+  process.image = interactive_child.image;
+  child_tid_address = interactive_child.child_tid_address;
+  signals = interactive_child.signals;
+  active_signal_frame = interactive_child.signal_frame;
+  file_creation_mask = interactive_child.file_creation_mask;
+  memcpy(process.current_directory, interactive_child.current_directory,
+         sizeof(process.current_directory));
+  memcpy(process.executable_path, interactive_child.executable_path,
+         sizeof(process.executable_path));
+  process.image_replaced = true;
+  interactive_child = {};
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  write_text("MIKOS:PTY_CHILD_RESUME child=");
+  write_u32(child_pid);
+  write_text(" parent=");
+  write_u32(child_parent_pid);
+  write_text("\n");
+#endif
+  return true;
+}
+
 [[nodiscard]] bool save_background_memory() {
   background.mutable_size = background.brk - background.mutable_begin;
   background.mmap_size = background.mmap_cursor - background.mmap_begin;
@@ -558,19 +933,21 @@ void move_saved_descriptors(Descriptor* saved, Descriptor* saved_standard) {
   if (background.mutable_begin > background.brk ||
       background.mmap_cursor < background.mmap_begin ||
       background.stack_begin > user_stack_top ||
-      total > parent_backup_capacity) {
+      total > ~u32{0} ||
+      !allocate_snapshot(static_cast<u32>(total), background.snapshot)) {
     return false;
   }
+  auto* snapshot = reinterpret_cast<u8*>(background.snapshot.address);
   u32 cursor = 0;
-  memcpy(background_backup + cursor,
+  memcpy(snapshot + cursor,
          reinterpret_cast<const void*>(background.mutable_begin),
          background.mutable_size);
   cursor += background.mutable_size;
-  memcpy(background_backup + cursor,
+  memcpy(snapshot + cursor,
          reinterpret_cast<const void*>(background.mmap_begin),
          background.mmap_size);
   cursor += background.mmap_size;
-  memcpy(background_backup + cursor,
+  memcpy(snapshot + cursor,
          reinterpret_cast<const void*>(background.stack_begin),
          background.stack_size);
   return true;
@@ -588,6 +965,7 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
   background.process_group = process.process_group;
   background.session = process.session;
   background.image = process.image;
+  background.child_tid_address = child_tid_address;
   background.signals = signals;
   background.signal_frame = active_signal_frame;
   background.file_creation_mask = file_creation_mask;
@@ -601,36 +979,37 @@ void capture_background(TrapFrame& frame, u8 wait_socket) {
 }
 
 [[nodiscard]] bool stack_suspended_ancestor() {
-  if (!parent.active || nested_ancestor_saved) {
+  if (!parent.active || !parent.memory_saved || !parent.snapshot.valid() ||
+      background.snapshot.valid() ||
+      nested_ancestor_depth == nested_ancestor_capacity) {
     return false;
   }
-  const u64 total = static_cast<u64>(parent.mutable_size) + parent.mmap_size +
-                    parent.stack_size;
-  if (!parent.memory_saved || total > parent_backup_capacity) {
-    return false;
-  }
-
-  nested_ancestor = parent;
-  memcpy(background_backup, parent_backup, static_cast<u32>(total));
+  const u32 level = nested_ancestor_depth;
+  // Transfer ownership of the exact-sized allocation. No address-space bytes
+  // are copied merely to add another fork level.
+  nested_ancestors[level] = parent;
   for (u32 i = 0; i < 13; ++i) {
-    background_descriptors[i] = parent_descriptors[i];
+    nested_ancestor_descriptors[level][i] = parent_descriptors[i];
     parent_descriptors[i] = {};
   }
   for (u32 i = 0; i < 3; ++i) {
-    background_standard_redirects[i] = parent_standard_redirects[i];
+    nested_ancestor_standard_redirects[level][i] =
+        parent_standard_redirects[i];
     parent_standard_redirects[i] = {};
   }
   parent = {};
   background = {};
-  nested_ancestor_saved = true;
+  ++nested_ancestor_depth;
 #ifdef MIKOS_TRIBE_INTERACTIVE
-  write_text("MIKOS:NESTED_CLONE_STACK\n");
+  write_text("MIKOS:NESTED_CLONE_STACK depth=");
+  write_u32(nested_ancestor_depth);
+  write_text("\n");
 #endif
   return true;
 }
 
 void reinstate_suspended_ancestor(TrapFrame& frame) {
-  if (!nested_ancestor_saved) {
+  if (nested_ancestor_depth == 0) {
     return;
   }
 
@@ -639,28 +1018,33 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   // exit, then put the original shell suspension back underneath it.
   capture_background(frame, network::invalid_socket);
   background.wait = BackgroundWait::none;
-  parent = nested_ancestor;
-  nested_ancestor = {};
-  const u32 total = parent.mutable_size + parent.mmap_size + parent.stack_size;
-  memcpy(parent_backup, background_backup, total);
+  const u32 level = --nested_ancestor_depth;
+  parent = nested_ancestors[level];
+  nested_ancestors[level] = {};
   for (u32 i = 0; i < 13; ++i) {
-    parent_descriptors[i] = background_descriptors[i];
-    background_descriptors[i] = {};
+    parent_descriptors[i] = nested_ancestor_descriptors[level][i];
+    nested_ancestor_descriptors[level][i] = {};
   }
   for (u32 i = 0; i < 3; ++i) {
-    parent_standard_redirects[i] = background_standard_redirects[i];
-    background_standard_redirects[i] = {};
+    parent_standard_redirects[i] =
+        nested_ancestor_standard_redirects[level][i];
+    nested_ancestor_standard_redirects[level][i] = {};
   }
-  nested_ancestor_saved = false;
 #ifdef MIKOS_TRIBE_INTERACTIVE
-  write_text("MIKOS:NESTED_CLONE_UNSTACK\n");
+  write_text("MIKOS:NESTED_CLONE_UNSTACK depth=");
+  write_u32(nested_ancestor_depth);
+  write_text("\n");
 #endif
 }
 
 [[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket) {
   if (!parent.active) {
 #ifdef MIKOS_TRIBE_INTERACTIVE
-    write_text("MIKOS:BACKGROUND_PARK_NO_PARENT\n");
+    static bool reported_no_parent = false;
+    if (!reported_no_parent) {
+      reported_no_parent = true;
+      write_text("MIKOS:BACKGROUND_PARK_NO_PARENT\n");
+    }
 #endif
     return false;
   }
@@ -668,7 +1052,10 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   // Once a background service has accepted a connection, keep its image
   // resident while it waits for the peer. Swapping back to the shell here
   // would reload BusyBox from simulated SD, then reload the service for the
-  // very next SSH packet. UART input remains an explicit preemption point.
+  // very next SSH packet. UART input is a safe preemption point only when the
+  // connection is directly parented by the shell. A nested session child
+  // would otherwise resume its listener, occupy the one background slot, and
+  // lose the suspended shell/listener ancestry.
   const auto* waiting = network::socket_slot(wait_socket);
   if (waiting != nullptr &&
       waiting->state != network::SocketState::listening) {
@@ -679,8 +1066,11 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
       write_u32(process.pid);
       write_text("\n");
     }
+    const bool uart_can_preempt =
+        process_model::connection_wait_can_yield_to_uart(
+            nested_ancestor_depth);
     while (!network::socket_readable(wait_socket) &&
-           !drivers::uart::ready()) {
+           (!uart_can_preempt || !drivers::uart::ready())) {
       network::poll();
     }
     if (network::socket_readable(wait_socket)) {
@@ -697,7 +1087,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   capture_background(frame, wait_socket);
   if (!save_background_memory()) {
 #ifdef MIKOS_TRIBE_INTERACTIVE
-    write_text("MIKOS:BACKGROUND_PARK_TOO_LARGE mutable=");
+    write_text("MIKOS:BACKGROUND_PARK_ENOMEM mutable=");
     write_u32(background.mutable_size);
     write_text(" mmap=");
     write_u32(background.mmap_size);
@@ -743,7 +1133,8 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   parent.mutable_begin = process.mutable_begin;
   parent.stack_begin = align_down(frame.x[2], static_cast<u32>(16));
   parent.child_pid = background.pid;
-  parent.parent_pid = process.pid;
+  parent.lineage = {process.pid, process.parent_pid};
+  parent.child_tid_address = child_tid_address;
   parent.process_group = process.process_group;
   parent.session = process.session;
   parent.image = process.image;
@@ -766,16 +1157,19 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
     write_text("MIKOS:BACKGROUND_IMAGE_RESTORE_FAIL\n");
     shutdown(9);
   }
+  const auto* snapshot =
+      reinterpret_cast<const u8*>(background.snapshot.address);
   u32 cursor = 0;
   memcpy(reinterpret_cast<void*>(background.mutable_begin),
-         background_backup + cursor, background.mutable_size);
+         snapshot + cursor, background.mutable_size);
   cursor += background.mutable_size;
   memcpy(reinterpret_cast<void*>(background.mmap_begin),
-         background_backup + cursor,
+         snapshot + cursor,
          background.mmap_size);
   cursor += background.mmap_size;
   memcpy(reinterpret_cast<void*>(background.stack_begin),
-         background_backup + cursor, background.stack_size);
+         snapshot + cursor, background.stack_size);
+  release_snapshot(background.snapshot);
   move_saved_descriptors(background_descriptors,
                          background_standard_redirects);
   frame = background.frame;
@@ -788,6 +1182,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   process.process_group = background.process_group;
   process.session = background.session;
   process.image = background.image;
+  child_tid_address = background.child_tid_address;
   signals = background.signals;
   active_signal_frame = background.signal_frame;
   file_creation_mask = background.file_creation_mask;
@@ -838,6 +1233,12 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   char* path = canonical == nullptr ? local : canonical;
   if (!canonicalize_path(address, base, path, 256)) {
     return Node::none;
+  }
+  const u32 pty_number =
+      path::numbered_suffix(path, "/dev/pts/", 4);
+  if (pty_number != path::invalid_number &&
+      ptys.active(static_cast<u8>(pty_number))) {
+    return Node{Node::pty, static_cast<u8>(pty_number)};
   }
   const auto pseudo_node = PseudoFilesystem::lookup(path);
   if (pseudo_node != PseudoFilesystem::Node::none) {
@@ -939,6 +1340,20 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   return static_cast<i32>(previous);
 }
 
+[[nodiscard]] i32 fchmodat(u32 directory_descriptor, u32 address, u32 mode) {
+  const Node node = path_node_at(directory_descriptor, address);
+  if (node == Node::none) {
+    return error(Errno::no_entry);
+  }
+  if (node != Node::pty || node.pty_number == 0xff) {
+    return error(Errno::read_only_filesystem);
+  }
+  return ptys.set_mode(node.pty_number, static_cast<u16>(mode)) ==
+                 process_model::PtyStatus::success
+             ? 0
+             : error(Errno::no_entry);
+}
+
 [[maybe_unused, nodiscard]] i32 openat(u32 directory_descriptor, u32 path,
                                       u32 flags) {
   constexpr u32 access_mode = 3;
@@ -948,22 +1363,21 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   constexpr u32 append = 0x400;
   char canonical[path::capacity]{};
   Node node = path_node_at(directory_descriptor, path, canonical);
-  bool pty_path = text_is(canonical, "/dev/ptmx");
+  const bool controlling_pty_path = text_is(canonical, "/dev/tty");
+  bool pty_path = text_is(canonical, "/dev/ptmx") || controlling_pty_path;
   bool pty_slave = false;
   u8 pty_number = 0;
-  constexpr const char* pts_prefix = "/dev/pts/";
   if (!pty_path) {
-    u32 index = 0;
-    while (pts_prefix[index] != '\0' &&
-           canonical[index] == pts_prefix[index]) {
-      ++index;
-    }
-    if (pts_prefix[index] == '\0' && canonical[index] >= '0' &&
-        canonical[index] <= '3' && canonical[index + 1] == '\0') {
+    const u32 number =
+        path::numbered_suffix(canonical, "/dev/pts/", 4);
+    if (number != path::invalid_number) {
       pty_path = true;
       pty_slave = true;
-      pty_number = static_cast<u8>(canonical[index] - '0');
+      pty_number = static_cast<u8>(number);
     }
+  }
+  if (controlling_pty_path) {
+    pty_slave = true;
   }
   if (pty_path) {
     u32 descriptor = 3;
@@ -974,8 +1388,10 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
     if (descriptor == 16) {
       return error(Errno::no_memory);
     }
-    const auto opened = pty_slave ? ptys.open_slave(pty_number)
-                                  : ptys.open_master();
+    const auto opened = controlling_pty_path
+                            ? ptys.open_controlling_slave(process.session)
+                        : pty_slave ? ptys.open_slave(pty_number)
+                                    : ptys.open_master();
     if (opened.status != process_model::PtyStatus::success) {
       return opened.status == process_model::PtyStatus::no_space
                  ? error(Errno::no_memory)
@@ -1135,8 +1551,10 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
     return pipes.hung_up(slot->pipe, slot->pipe_end);
   }
   if (slot != nullptr && slot->node == Node::pty) {
-    return ptys.readable(slot->pty, slot->pty_end) &&
-           !ptys.writable(slot->pty, slot->pty_end);
+    // A closed PTY peer is readable EOF (and may still have buffered bytes),
+    // not select(2) exceptional data. Reporting it in exceptfds makes
+    // Dropbear tear down the channel before draining the final command output.
+    return false;
   }
   if (slot == nullptr || slot->node != Node::network_socket) {
     return false;
@@ -1724,6 +2142,9 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
         return static_cast<i32>(frame.x[10]);
       }
       network::poll();
+      if (resume_interactive_child_if_ready(frame)) {
+        return static_cast<i32>(frame.x[10]);
+      }
     }
   }
   if (slot.node == Node::pipe) {
@@ -1754,13 +2175,42 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   if (slot.node == Node::pty) {
     const auto result =
         ptys.read(slot.pty, slot.pty_end, reinterpret_cast<u8*>(address), size);
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    static u32 pty_read_reports = 0;
+    if (pty_read_reports < 16 &&
+        (result.status != process_model::PtyStatus::would_block ||
+         result.size != 0)) {
+      ++pty_read_reports;
+      write_text("MIKOS:PTY_READ pid=");
+      write_u32(process.pid);
+      write_text(" fd=");
+      write_u32(descriptor);
+      write_text(" end=");
+      write_text(slot.pty_end == process_model::PtyEnd::master ? "master"
+                                                               : "slave");
+      write_text(" status=");
+      write_u32(static_cast<u32>(result.status));
+      write_text(" size=");
+      write_u32(result.size);
+      write_text("\n");
+    }
+#endif
     switch (result.status) {
       case process_model::PtyStatus::success:
         return static_cast<i32>(result.size);
       case process_model::PtyStatus::end_of_file:
         return 0;
-      case process_model::PtyStatus::would_block:
+      case process_model::PtyStatus::would_block: {
+        constexpr u32 nonblock = 0x800;
+        if ((slot.flags & nonblock) == 0) {
+          const auto wait_pty = slot.pty;
+          const auto wait_end = slot.pty_end;
+          if (park_interactive_child(frame, wait_pty, wait_end)) {
+            return static_cast<i32>(frame.x[10]);
+          }
+        }
         return error(Errno::try_again);
+      }
       case process_model::PtyStatus::io_error:
         return error(Errno::io);
       default:
@@ -1970,7 +2420,9 @@ static_assert(sizeof(Stat64) == 128);
   Stat64 value{};
   constexpr u32 directory_mode = 0040000 | 0755;
   constexpr u32 regular_mode = 0100000 | 0444;
-  constexpr u32 character_mode = 0020000 | 0666;
+  const u32 character_mode =
+      0020000 | (node.pty_number == 0xff ? 0666
+                                         : ptys.mode(node.pty_number));
   constexpr u32 fifo_mode = 0010000 | 0666;
   value.inode =
       node == Node::filesystem
@@ -2001,7 +2453,11 @@ static_assert(sizeof(Stat64) == 128);
   if (descriptor >= 16 || descriptors[descriptor - 3].node == Node::none) {
     return error(Errno::bad_file_descriptor);
   }
-  return write_stat(descriptors[descriptor - 3].node, address);
+  Node node = descriptors[descriptor - 3].node;
+  if (node == Node::pty) {
+    node.pty_number = descriptors[descriptor - 3].pty.slot;
+  }
+  return write_stat(node, address);
 }
 
 struct [[gnu::packed]] Statx {
@@ -2031,13 +2487,22 @@ static_assert(sizeof(Statx) == 256);
   }
   constexpr u16 directory_mode = 0040000 | 0755;
   constexpr u16 regular_mode = 0100000 | 0444;
+  const u16 character_mode = static_cast<u16>(
+      0020000 | (node.pty_number == 0xff ? 0666
+                                         : ptys.mode(node.pty_number)));
   Statx value{};
   value.mask = 0x7ff;
   value.block_size = 4096;
   value.links = directory(node) ? 2 : 1;
-  value.mode = node == Node::filesystem
-                   ? node.file.mode
-                   : (directory(node) ? directory_mode : regular_mode);
+  // Keep statx() consistent with fstat64(). Static glibc's ttyname_r() uses
+  // fstat64() on the open slave and statx() for the /dev/pts/N pathname, then
+  // rejects the name unless both describe the same character device.
+  value.mode = node == Node::pty
+                   ? character_mode
+                   : (node == Node::filesystem
+                          ? node.file.mode
+                          : (directory(node) ? directory_mode
+                                             : regular_mode));
   value.inode =
       node == Node::filesystem
           ? node.file.inode
@@ -2054,10 +2519,20 @@ static_assert(sizeof(Statx) == 256);
                                           u32 address, u32 size) {
   char canonical[256]{};
   static_cast<void>(path_node_at(directory_descriptor, path, canonical));
-  if (!text_is(canonical, "/proc/self/exe")) {
-    return error(Errno::no_entry);
+  const char* target = nullptr;
+  if (text_is(canonical, "/proc/self/exe")) {
+    target = process.executable_path;
+  } else {
+    const u32 descriptor =
+        path::numbered_suffix(canonical, "/proc/self/fd/", 16);
+    const Descriptor* slot =
+        descriptor == path::invalid_number ? nullptr
+                                           : descriptor_slot(descriptor);
+    if (slot == nullptr || slot->node == Node::none || slot->path[0] == '\0') {
+      return error(Errno::no_entry);
+    }
+    target = slot->path;
   }
-  const char* target = process.executable_path;
   const u32 target_size = text_size(target);
   const u32 count = size < target_size ? size : target_size;
   if (!user_memory.contains(address, count)) {
@@ -2101,6 +2576,17 @@ static_assert(sizeof(Statx) == 256);
   auto* poll_descriptors = reinterpret_cast<Pollfd32*>(address);
   for (;;) {
     network::poll();
+    if (resume_interactive_child_if_ready(frame)) {
+      return static_cast<i32>(frame.x[10]);
+    }
+    // The foreground interactive shell normally blocks in ppoll() before it
+    // reads UART input.  A parked listener can become ready while the shell is
+    // here, so give it the same restoration point as the blocking read path.
+    // Without this check the TCP handshake completes, but the listener never
+    // returns from accept() and the SSH peer eventually times out.
+    if (resume_background_if_ready(frame)) {
+      return static_cast<i32>(frame.x[10]);
+    }
     i32 ready_count = 0;
     for (u32 i = 0; i < count; ++i) {
       poll_descriptors[i].returned_events = 0;
@@ -2159,6 +2645,13 @@ static_assert(sizeof(Statx) == 256);
           park_background(frame, slot->socket)) {
         return static_cast<i32>(frame.x[10]);
       }
+      if (slot != nullptr && slot->node == Node::pty) {
+        const auto wait_pty = slot->pty;
+        const auto wait_end = slot->pty_end;
+        if (park_interactive_child(frame, wait_pty, wait_end)) {
+          return static_cast<i32>(frame.x[10]);
+        }
+      }
     }
   }
 }
@@ -2210,6 +2703,15 @@ static_assert(sizeof(Statx) == 256);
   }
   for (;;) {
     network::poll();
+    if (resume_interactive_child_if_ready(frame)) {
+      return static_cast<i32>(frame.x[10]);
+    }
+    // BusyBox and other foreground programs may use pselect() rather than a
+    // direct UART read while a background service is parked.  Network
+    // readiness must preempt that wait just as it preempts read() and ppoll().
+    if (resume_background_if_ready(frame)) {
+      return static_cast<i32>(frame.x[10]);
+    }
     u32 ready_read = 0;
     u32 ready_write = 0;
     u32 ready_error = 0;
@@ -2269,6 +2771,13 @@ static_assert(sizeof(Statx) == 256);
           park_background(frame, slot->socket)) {
         return static_cast<i32>(frame.x[10]);
       }
+      if (slot != nullptr && slot->node == Node::pty) {
+        const auto wait_pty = slot->pty;
+        const auto wait_end = slot->pty_end;
+        if (park_interactive_child(frame, wait_pty, wait_end)) {
+          return static_cast<i32>(frame.x[10]);
+        }
+      }
     }
   }
 }
@@ -2286,7 +2795,7 @@ static_assert(sizeof(Statx) == 256);
   return 0;
 }
 
-[[nodiscard]] i32 execve(TrapFrame& frame, u32 path, u32 argv) {
+[[nodiscard]] i32 execve(TrapFrame& frame, u32 path, u32 argv, u32 envp) {
   char canonical[256]{};
   Node node = path_node(path, canonical);
   if (text_is(canonical, "/proc/self/exe")) {
@@ -2300,7 +2809,8 @@ static_assert(sizeof(Statx) == 256);
     const auto executable = drivers::fs::root::lookup(canonical);
     node = executable ? Node{executable.value} : Node{Node::none};
   }
-  if (!user_memory.aligned(argv, alignof(u32))) {
+  if (!user_memory.aligned(argv, alignof(u32)) ||
+      (envp != 0 && !user_memory.aligned(envp, alignof(u32)))) {
     return error(Errno::invalid_argument);
   }
   if (node == Node::none || node != Node::filesystem ||
@@ -2327,8 +2837,12 @@ static_assert(sizeof(Statx) == 256);
 #endif
   constexpr u32 max_arguments = 16;
   constexpr u32 max_argument_size = 128;
+  constexpr u32 max_environment = 16;
+  constexpr u32 max_environment_size = 128;
   char argument_storage[max_arguments][max_argument_size]{};
   const char* arguments[max_arguments]{};
+  char environment_storage[max_environment][max_environment_size]{};
+  const char* environment[max_environment]{};
   u32 count = 0;
   for (; count < max_arguments; ++count) {
     const u32 slot = argv + count * sizeof(u32);
@@ -2349,7 +2863,49 @@ static_assert(sizeof(Statx) == 256);
       (parent.active && !save_parent_memory())) {
     return error(Errno::no_memory);
   }
-  if (!replace_with_executable(frame, canonical, arguments, count)) {
+  u32 environment_count = 0;
+  if (envp != 0) {
+    for (; environment_count < max_environment; ++environment_count) {
+      const u32 slot = envp + environment_count * sizeof(u32);
+      if (!user_memory.contains(slot, sizeof(u32))) {
+        return error(Errno::bad_address);
+      }
+      const u32 address = *reinterpret_cast<const u32*>(slot);
+      if (address == 0) {
+        break;
+      }
+      if (!copy_user_string(address, environment_storage[environment_count],
+                            max_environment_size)) {
+        return error(Errno::bad_address);
+      }
+      environment[environment_count] =
+          environment_storage[environment_count];
+    }
+    if (environment_count == max_environment) {
+      return error(Errno::no_memory);
+    }
+  }
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  static u32 exec_reports = 0;
+  if (exec_reports < 12) {
+    ++exec_reports;
+    write_text("MIKOS:EXEC pid=");
+    write_u32(process.pid);
+    write_text(" path=");
+    write_text(canonical);
+    write_text(" argc=");
+    write_u32(count);
+    for (u32 i = 0; i < count; ++i) {
+      write_text(" argv");
+      write_u32(i);
+      write_text("=");
+      write_text(argument_storage[i]);
+    }
+    write_text("\n");
+  }
+#endif
+  if (!replace_with_executable(frame, canonical, arguments, count,
+                               environment, environment_count)) {
     return error(Errno::exec_format);
   }
   return 0;
@@ -2665,7 +3221,7 @@ void deliver_pending_signal_impl(TrapFrame& frame) {
   }
   const bool current = pid == 0 || pid == process.pid || pid == ~u32{0};
   const bool suspended_parent =
-      parent.active && pid == parent.parent_pid;
+      parent.active && pid == parent.lineage.pid;
   if (!current && !suspended_parent) {
     return error(Errno::no_entry);
   }
@@ -2709,7 +3265,7 @@ void deliver_pending_signal_impl(TrapFrame& frame) {
   if (pid == 0 || pid == process.pid) {
     return static_cast<i32>(session ? process.session : process.process_group);
   }
-  if (parent.active && pid == parent.parent_pid) {
+  if (parent.active && pid == parent.lineage.pid) {
     return static_cast<i32>(session ? parent.session : parent.process_group);
   }
   for (const auto& child : waitable_children) {
@@ -2738,6 +3294,17 @@ struct [[gnu::packed]] Termios32 {
   u8 control_character[19];
 };
 
+struct [[gnu::packed]] Termios2 {
+  u32 input_flags;
+  u32 output_flags;
+  u32 control_flags;
+  u32 local_flags;
+  u8 line;
+  u8 control_character[19];
+  u32 input_speed;
+  u32 output_speed;
+};
+
 struct [[gnu::packed]] Winsize {
   u16 rows;
   u16 columns;
@@ -2746,6 +3313,7 @@ struct [[gnu::packed]] Winsize {
 };
 
 static_assert(sizeof(Termios32) == sizeof(process_model::TermiosState));
+static_assert(sizeof(Termios2) == 44);
 static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
 
 [[nodiscard]] TickTime tick_time() {
@@ -2945,6 +3513,49 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   if (slot.node == Node::pty) {
     const auto result = ptys.write(slot.pty, slot.pty_end,
                                    reinterpret_cast<const u8*>(address), size);
+    if (slot.pty_end == process_model::PtyEnd::master &&
+        result.generated_signals != 0) {
+      const u32 foreground_group = ptys.foreground_group(slot.pty);
+      for (u8 signal = 1; signal <= process_model::signal_max; ++signal) {
+        if ((result.generated_signals &
+             process_model::SignalState::bit(signal)) == 0) {
+          continue;
+        }
+        const u32 targets =
+            queue_process_group_signal(foreground_group, signal);
+#ifdef MIKOS_TRIBE_INTERACTIVE
+        write_text("MIKOS:PTY_SIGNAL signal=");
+        write_u32(signal);
+        write_text(" group=");
+        write_u32(foreground_group);
+        write_text(" targets=");
+        write_u32(targets);
+        write_text("\n");
+#else
+        static_cast<void>(targets);
+#endif
+      }
+    }
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    static u32 pty_write_reports = 0;
+    if (pty_write_reports < 16) {
+      ++pty_write_reports;
+      write_text("MIKOS:PTY_WRITE pid=");
+      write_u32(process.pid);
+      write_text(" fd=");
+      write_u32(descriptor);
+      write_text(" end=");
+      write_text(slot.pty_end == process_model::PtyEnd::master ? "master"
+                                                               : "slave");
+      write_text(" status=");
+      write_u32(static_cast<u32>(result.status));
+      write_text(" requested=");
+      write_u32(size);
+      write_text(" size=");
+      write_u32(result.size);
+      write_text("\n");
+    }
+#endif
     switch (result.status) {
       case process_model::PtyStatus::success:
         return static_cast<i32>(result.size);
@@ -3017,29 +3628,17 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   u8 data{};
   while (!drivers::uart::receive(data)) {
     network::poll();
+    if (resume_interactive_child_if_ready(frame)) {
+      return static_cast<i32>(frame.x[10]);
+    }
     if (resume_background_if_ready(frame)) {
       return static_cast<i32>(frame.x[10]);
     }
   }
-#ifdef MIKOS_TRIBE_INTERACTIVE
-  auto echo_input = [](u8 value) {
-    if (value == 0x7f || value == 0x08) {
-      uart_put('\b');
-      uart_put(' ');
-      uart_put('\b');
-    } else {
-      uart_put(static_cast<char>(value));
-    }
-  };
-  echo_input(data);
-#endif
   auto* output = reinterpret_cast<u8*>(address);
   output[0] = data;
   u32 count = 1;
   while (count < size && drivers::uart::receive(data)) {
-#ifdef MIKOS_TRIBE_INTERACTIVE
-    echo_input(data);
-#endif
     output[count++] = data;
   }
   return static_cast<i32>(count);
@@ -3064,6 +3663,10 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   constexpr u32 tcsets = 0x5402;
   constexpr u32 tcsetsw = 0x5403;
   constexpr u32 tcsetsf = 0x5404;
+  constexpr u32 tcgets2 = 0x802c542a;
+  constexpr u32 tcsets2 = 0x402c542b;
+  constexpr u32 tcsetsw2 = 0x402c542c;
+  constexpr u32 tcsetsf2 = 0x402c542d;
   constexpr u32 tiocgwinsz = 0x5413;
   if (request == tcgets) {
     if (!user_memory.contains(address, sizeof(Termios32))) {
@@ -3080,8 +3683,30 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
     memcpy(reinterpret_cast<void*>(address), &terminal, sizeof(terminal));
     return 0;
   }
+  if (request == tcgets2) {
+    if (!user_memory.contains(address, sizeof(Termios2))) {
+      return error(Errno::bad_address);
+    }
+    constexpr Termios2 terminal{
+        0x00000500,  // ICRNL | IXON
+        0x00000005,  // OPOST | ONLCR
+        0x000000bf,  // B38400 | CS8 | CREAD
+        0x0000803b,  // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
+        0,
+        {3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0,
+         0},
+        38400,
+        38400};
+    memcpy(reinterpret_cast<void*>(address), &terminal, sizeof(terminal));
+    return 0;
+  }
   if (request == tcsets || request == tcsetsw || request == tcsetsf) {
     return user_memory.contains(address, sizeof(Termios32))
+               ? 0
+               : error(Errno::bad_address);
+  }
+  if (request == tcsets2 || request == tcsetsw2 || request == tcsetsf2) {
+    return user_memory.contains(address, sizeof(Termios2))
                ? 0
                : error(Errno::bad_address);
   }
@@ -3102,6 +3727,10 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   constexpr u32 tcsets = 0x5402;
   constexpr u32 tcsetsw = 0x5403;
   constexpr u32 tcsetsf = 0x5404;
+  constexpr u32 tcgets2 = 0x802c542a;
+  constexpr u32 tcsets2 = 0x402c542b;
+  constexpr u32 tcsetsw2 = 0x402c542c;
+  constexpr u32 tcsetsf2 = 0x402c542d;
   constexpr u32 tiocsctty = 0x540e;
   constexpr u32 tiocgpgrp = 0x540f;
   constexpr u32 tiocspgrp = 0x5410;
@@ -3138,8 +3767,32 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
     memcpy(reinterpret_cast<void*>(address), state, sizeof(Termios32));
     return 0;
   }
+  if (request == tcgets2) {
+    const auto* state = ptys.termios(slot.pty);
+    if (state == nullptr ||
+        !user_memory.contains(address, sizeof(Termios2))) {
+      return error(Errno::bad_address);
+    }
+    Termios2 value{};
+    memcpy(&value, state, sizeof(Termios32));
+    value.input_speed = 38400;
+    value.output_speed = 38400;
+    memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+    return 0;
+  }
   if (request == tcsets || request == tcsetsw || request == tcsetsf) {
     if (!user_memory.contains(address, sizeof(Termios32))) {
+      return error(Errno::bad_address);
+    }
+    process_model::TermiosState state{};
+    memcpy(&state, reinterpret_cast<const void*>(address), sizeof(state));
+    return ptys.set_termios(slot.pty, state) ==
+                   process_model::PtyStatus::success
+               ? 0
+               : error(Errno::bad_file_descriptor);
+  }
+  if (request == tcsets2 || request == tcsetsw2 || request == tcsetsf2) {
+    if (!user_memory.contains(address, sizeof(Termios2))) {
       return error(Errno::bad_address);
     }
     process_model::TermiosState state{};
@@ -3473,6 +4126,8 @@ i32 dispatch_syscall(TrapFrame& frame) {
       return chdir(a0);
     case Syscall::faccessat:
       return path_node_at(a0, a1) == Node::none ? error(Errno::no_entry) : 0;
+    case Syscall::fchmodat:
+      return fchmodat(a0, a1, a2);
     case Syscall::openat:
       return openat(a0, a1, a2);
     case Syscall::close:
@@ -3564,9 +4219,7 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::gettid:
       return static_cast<i32>(process.pid);
     case Syscall::getppid:
-      return parent.active && process.pid == parent.child_pid
-                 ? static_cast<i32>(parent.parent_pid)
-                 : 0;
+      return static_cast<i32>(process.parent_pid);
     case Syscall::getuid:
     case Syscall::geteuid:
     case Syscall::getgid:
@@ -3583,7 +4236,7 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::clone:
       return clone(frame, a0, a1, a4);
     case Syscall::execve:
-      return execve(frame, a0, a1);
+      return execve(frame, a0, a1, a2);
     case Syscall::wait4:
       return wait4(a0, a1);
     case Syscall::mmap2:
@@ -3702,9 +4355,10 @@ i32 dispatch_syscall(TrapFrame& frame) {
     case Syscall::readlinkat:
       return readlinkat(a0, a1, a2, a3);
     case Syscall::fstatat64: {
-      const Node node = user_string_is(a1, "") && a0 >= 3 && a0 < 16
-                            ? descriptors[a0 - 3].node
-                            : path_node_at(a0, a1);
+      const bool descriptor_path =
+          user_string_is(a1, "") && a0 >= 3 && a0 < 16;
+      const Node node = descriptor_path ? descriptors[a0 - 3].node
+                                        : path_node_at(a0, a1);
       return node == Node::none ? error(Errno::no_entry)
                                 : write_stat(node, a2);
     }

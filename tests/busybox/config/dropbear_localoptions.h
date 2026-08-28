@@ -48,8 +48,8 @@
  * remaining guest work in a cycle-accurate RV32 simulator. */
 #define AUTH_TIMEOUT 7200
 
-/* MikOS currently serializes a background child against its shell parent.
- * Handle one accepted SSH connection in the listener process so transport
- * and the public-key authentication protocol can be exercised before nested
- * fork lands. */
-#define DEBUG_NOFORK 1
+/* MikOS serializes the listener and its children, but retains enough nested
+ * address-space snapshots for listener -> SSH session -> remote command.
+ * Keep Dropbear's normal connection fork so the listener survives and can
+ * accept subsequent sessions. */
+#define DEBUG_NOFORK 0

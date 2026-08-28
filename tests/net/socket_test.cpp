@@ -69,7 +69,7 @@ int main() {
 
   const mikos::u8 hello[]{'h', 'e', 'l', 'l', 'o'};
   MIKOS_CHECK(suite,
-              sockets.receive(accepted.handle, 999, hello, sizeof(hello), false)
+              sockets.receive(accepted.handle, 996, hello, sizeof(hello), false)
                       .result == SocketResult::success);
   const auto received = sockets.receive(accepted.handle, 1001, hello,
                                         sizeof(hello), false);
@@ -87,8 +87,19 @@ int main() {
   MIKOS_CHECK(suite, sockets.read(accepted.handle, rest, sizeof(rest)).result ==
                          SocketResult::would_block);
 
+  // A retransmission may start before receive_next yet contain an unseen tail.
+  // Dropping it wholesale permanently wedges TCP after a partial-window read.
+  const mikos::u8 overlapping[]{'l', 'l', 'o', '!'};
+  const auto overlap = sockets.receive(accepted.handle, 1003, overlapping,
+                                       sizeof(overlapping), false);
+  MIKOS_CHECK(suite, overlap.result == SocketResult::success);
+  MIKOS_CHECK(suite, overlap.size == 1);
+  MIKOS_CHECK(suite, sockets.read(accepted.handle, rest, sizeof(rest)).size ==
+                         1);
+  MIKOS_CHECK(suite, rest[0] == '!');
+
   MIKOS_CHECK(suite,
-              sockets.receive(accepted.handle, 1006, nullptr, 0, true).result ==
+              sockets.receive(accepted.handle, 1007, nullptr, 0, true).result ==
                   SocketResult::success);
   MIKOS_CHECK(suite, sockets.read(accepted.handle, rest, sizeof(rest)).result ==
                          SocketResult::end_of_file);
@@ -114,13 +125,13 @@ int main() {
       100, 200);
   MIKOS_CHECK(suite, reordered.establish(reordered_child.handle, 201) ==
                          SocketResult::success);
-  const mikos::u8 tail[]{'l', 'o'};
+  const mikos::u8 tail[]{'l', 'l', 'o'};
   MIKOS_CHECK(
       suite,
-      reordered.receive(reordered_child.handle, 104, tail, sizeof(tail), true)
+      reordered.receive(reordered_child.handle, 103, tail, sizeof(tail), true)
               .result == SocketResult::success);
   MIKOS_CHECK(suite, !reordered.readable(reordered_child.handle));
-  const mikos::u8 head[]{'h', 'e', 'l'};
+  const mikos::u8 head[]{'h', 'e', 'l', 'l'};
   const auto assembled = reordered.receive(reordered_child.handle, 101, head,
                                            sizeof(head), false);
   MIKOS_CHECK(suite, assembled.result == SocketResult::success);
@@ -201,6 +212,42 @@ int main() {
   MIKOS_CHECK(suite,
               reset_table.read(reset_accepted.handle, &reset_output, 1).result ==
                   SocketResult::reset);
+
+  // Fill the receive window with all but the last byte of one TCP segment,
+  // drain it, then retransmit the original segment. Only its unseen tail must
+  // be appended; this is the overlap case that matters for SSH bursts.
+  mikos::network::SocketTable saturated;
+  const auto saturated_listener = saturated.open(Type::stream);
+  MIKOS_CHECK(suite, saturated.bind(saturated_listener.handle, {any, 25}) ==
+                         SocketResult::success);
+  MIKOS_CHECK(suite, saturated.listen(saturated_listener.handle, 1) ==
+                         SocketResult::success);
+  const auto saturated_child = saturated.begin_connection(
+      saturated_listener.handle, {local_ip, 25}, {peer_ip, 43000}, peer_mac,
+      1000, 5000);
+  MIKOS_CHECK(suite, saturated.establish(saturated_child.handle, 5001) ==
+                         SocketResult::success);
+  mikos::u8 large_segment[mikos::network::socket_receive_capacity + 1]{};
+  large_segment[mikos::network::socket_receive_capacity] = 0x5a;
+  const auto partial = saturated.receive(
+      saturated_child.handle, 1001, large_segment, sizeof(large_segment),
+      false);
+  MIKOS_CHECK(suite, partial.size ==
+                         mikos::network::socket_receive_capacity);
+  mikos::u8 drained[mikos::network::socket_receive_capacity]{};
+  MIKOS_CHECK(suite,
+              saturated
+                      .read(saturated_child.handle, drained, sizeof(drained))
+                      .size == mikos::network::socket_receive_capacity);
+  const auto tail_after_retry = saturated.receive(
+      saturated_child.handle, 1001, large_segment, sizeof(large_segment),
+      false);
+  MIKOS_CHECK(suite, tail_after_retry.result == SocketResult::success);
+  MIKOS_CHECK(suite, tail_after_retry.size == 1);
+  MIKOS_CHECK(suite,
+              saturated.read(saturated_child.handle, &reset_output, 1).size ==
+                  1);
+  MIKOS_CHECK(suite, reset_output == 0x5a);
 
   mikos::network::SocketTable capacity;
   for (mikos::u32 i = 0; i < mikos::network::socket_capacity; ++i) {

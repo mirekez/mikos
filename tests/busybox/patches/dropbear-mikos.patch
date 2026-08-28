@@ -189,6 +189,20 @@
 +			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_RESEED_START");
 @@ -303,0 +305 @@
 +			dropbear_log(LOG_INFO, "MIKOS_DROPBEAR_RESEED_DONE");
+--- a/src/dbrandom.c
++++ b/src/dbrandom.c
+@@ -223,0 +224,11 @@ void seedrandom() {
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++	/* This explicitly insecure simulator profile already uses deterministic
++	 * none-cipher key exchange and transcript proofs. Avoid repeatedly walking
++	 * pseudo-files and hashing random-device state on a cycle-level CPU. */
++	if (!donerandinit) {
++		memset(hashpool, 0x4d, sizeof(hashpool));
++		counter = 0;
++		donerandinit = 1;
++	}
++	return;
++#endif
 --- a/src/svr-auth.c
 +++ b/src/svr-auth.c
 @@ -313,0 +314,7 @@ static int checkusername(const char *username, unsigned int userlen) {
@@ -465,3 +479,68 @@
 +#if !DROPBEAR_MIKOS_TEST_ACCOUNT
 @@ -531,0 +544 @@
 +#endif
+--- a/src/svr-chansession.c
++++ b/src/svr-chansession.c
+@@ -80,0 +81,9 @@ static int sesscheckclose(struct Channel *channel) {
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++		/* MikOS serializes forked address spaces, so SIGCHLD is observed
++		 * before the restored parent can poll a newly installed PTY master.
++		 * Give channelio() one loop to drain buffered output (and a following
++		 * loop to observe EOF) before flushing closes the shared master fd. */
++		if (channel->readfd >= 0 && fd_read_pending(channel->readfd)) {
++			return 0;
++		}
++#endif
+@@ -625,3 +625,11 @@
+-	pw = getpwnam(ses.authstate.pw_name);
+-	if (!pw)
+-		dropbear_exit("getpwnam failed after succeeding previously");
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++	if (strcmp(ses.authstate.pw_name, "root") == 0) {
++		static struct passwd mikos_test_pw = { .pw_uid = 0, .pw_gid = 0 };
++		pw = &mikos_test_pw;
++	} else
++#endif
++	{
++		pw = getpwnam(ses.authstate.pw_name);
++		if (!pw)
++			dropbear_exit("getpwnam failed after succeeding previously");
++	}
+--- a/src/loginrec.c
++++ b/src/loginrec.c
+@@ -270,5 +270,12 @@
+-		pw = getpwnam(li->username);
+-		if (pw == NULL)
+-			dropbear_exit("login_init_entry: Cannot find user \"%s\"",
+-					li->username);
+-		li->uid = pw->pw_uid;
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++		if (strcmp(li->username, "root") == 0) {
++			li->uid = 0;
++		} else
++#endif
++		{
++			pw = getpwnam(li->username);
++			if (pw == NULL)
++				dropbear_exit("login_init_entry: Cannot find user \"%s\"",
++						li->username);
++			li->uid = pw->pw_uid;
++		}
+--- a/src/common-channel.c
++++ b/src/common-channel.c
+@@ -1063,0 +1064,13 @@ static void close_chan_fd(struct Channel *channel, int fd, int how) {
++#if DROPBEAR_MIKOS_TEST_ACCOUNT
++		/* A PTY master is one fd used for both channel directions, but it
++		 * cannot be half-closed with shutdown().  MikOS runs a fork child to
++		 * completion before restoring its parent, so the slave can disappear
++		 * while output from that child is still buffered in the master.  Keep
++		 * the read direction alive when a late input write gets EIO; channelio
++		 * will drain the buffered output and close the fd after observing EOF. */
++		if (how == SHUT_WR && fd >= 0 && fd == channel->readfd &&
++				fd == channel->writefd && fd_read_pending(fd)) {
++			closein = 1;
++		} else
++#endif
++		{
+@@ -1066,0 +1080 @@ static void close_chan_fd(struct Channel *channel, int fd, int how) {
++		}

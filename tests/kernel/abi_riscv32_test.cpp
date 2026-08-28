@@ -11,6 +11,7 @@ int main() {
   using mikos::abi::riscv32::Syscall;
 
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::mkdirat) == 34);
+  MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::fchmodat) == 53);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::pipe2) == 59);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::write) == 64);
   MIKOS_CHECK(suite, static_cast<mikos::u32>(Syscall::exit_group) == 94);
@@ -34,6 +35,8 @@ int main() {
               std::string{mikos::abi::riscv32::name(64)} == "write");
   MIKOS_CHECK(suite,
               std::string{mikos::abi::riscv32::name(34)} == "mkdirat");
+  MIKOS_CHECK(suite,
+              std::string{mikos::abi::riscv32::name(53)} == "fchmodat");
   MIKOS_CHECK(
       suite, std::string{mikos::abi::riscv32::name(123)} ==
                  "sched_getaffinity");

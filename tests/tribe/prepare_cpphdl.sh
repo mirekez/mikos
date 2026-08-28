@@ -82,6 +82,16 @@ git -C "$source_tree" apply \
 git -C "$source_tree" apply \
   "$root/tests/tribe/patches/preserve-host-control-frames.patch"
 git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/tcp-rx-burst-backlog.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/reliable-eth-queues.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/coalesce-tcp-ingress.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/ssh-kex-rx-burst-capacity.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/coalesce-completed-tcp-ingress.patch"
+git -C "$source_tree" apply \
   "$root/tests/tribe/patches/full-ethernet-frame-rx.patch"
 git -C "$source_tree" apply \
   "$root/tests/tribe/patches/verilator-memory-config.patch"
@@ -89,6 +99,8 @@ git -C "$source_tree" apply \
   "$root/tests/tribe/patches/multicore-clint-hart0.patch"
 git -C "$source_tree" apply \
   "$root/tests/tribe/patches/native-port-cache-fast-path.patch"
+git -C "$source_tree" apply \
+  "$root/tests/tribe/patches/cache-eth-dma-trace-toggle.patch"
 
 "$toolchain/bin/cmake" -S "$source_tree" -B "$build_tree" \
   -G "Unix Makefiles" \

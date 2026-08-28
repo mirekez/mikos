@@ -14,6 +14,10 @@ inline constexpr u32 reassembly_capacity = 16;
 inline constexpr u32 reassembly_segment_capacity = 1500;
 inline constexpr u32 transmit_capacity = 16;
 inline constexpr u32 transmit_segment_capacity = 1024;
+// poll() is a tight loop in the cycle-level Tribe model. Retrying after only a
+// few hundred calls can monopolize its single TX/RX datapath and prevent the
+// peer's cumulative ACK or next SSH record from reaching the guest.
+inline constexpr u32 transmit_initial_retry_polls = 4096;
 
 enum class SocketState : u8 {
   free,
@@ -61,10 +65,8 @@ struct SocketSlot {
   u16 references{};
   u8 listener{invalid_socket};
   u8 backlog{};
-  // Keep one delayed duplicate ACK after the immediate ACK. This makes the
-  // polling-only Tribe transport robust when its single TX descriptor is busy
-  // at the instant inbound data is handled, without reaching TCP's three-DUPACK
-  // fast-retransmit threshold.
+  // Number of pending ACK send attempts. A successful immediate send clears
+  // this; a busy TX descriptor leaves it set for the next poll.
   u8 acknowledgement_retries{};
   bool accepted{};
   bool send_closed{};
@@ -335,10 +337,19 @@ class SocketTable {
                                                  : SocketResult::not_connected,
               0};
     }
-    const i32 distance = static_cast<i32>(sequence - value->receive_next);
+    i32 distance = static_cast<i32>(sequence - value->receive_next);
     if (distance < 0) {
-      // A retransmission of data already acknowledged only needs another ACK.
-      return {SocketResult::success, 0};
+      // Do not discard an entire retransmission merely because its prefix was
+      // acknowledged. This occurs when the receive buffer accepted only part
+      // of a segment: trim the overlap and retain the unseen tail (or FIN).
+      const u32 acknowledged = value->receive_next - sequence;
+      if (acknowledged > size || (acknowledged == size && !finish)) {
+        return {SocketResult::success, 0};
+      }
+      data += acknowledged;
+      size -= acknowledged;
+      sequence += acknowledged;
+      distance = 0;
     }
     if (distance > 0) {
       return {store_reassembly(handle, sequence, data, size, finish), 0};
@@ -349,23 +360,10 @@ class SocketTable {
     if (immediate.result != SocketResult::success || immediate.size != size) {
       return {immediate.result, total};
     }
-    for (;;) {
-      ReassemblySegment* queued =
-          reassembly_.find({handle, value->receive_next});
-      if (queued == nullptr ||
-          queued->size > socket_receive_capacity - value->receive_size) {
-        break;
-      }
-      const u32 queued_sequence = value->receive_next;
-      const auto drained =
-          append_received(*value, queued->data, queued->size, queued->finish);
-      total += drained.size;
-      const u32 queued_size = queued->size;
-      static_cast<void>(reassembly_.erase({handle, queued_sequence}));
-      if (drained.result != SocketResult::success ||
-          drained.size != queued_size) {
-        break;
-      }
+    const auto drained = drain_reassembly(handle, *value);
+    total += drained.size;
+    if (drained.result != SocketResult::success) {
+      return {drained.result, total};
     }
     return {SocketResult::success, total};
   }
@@ -542,6 +540,52 @@ class SocketTable {
       available->data[i] = data[i];
     }
     return SocketResult::success;
+  }
+
+  [[nodiscard]] ReadResult drain_reassembly(u8 handle, SocketSlot& value) {
+    u32 total = 0;
+    for (;;) {
+      ReassemblyKey selected{};
+      bool found = false;
+      reassembly_.for_each([&](ReassemblyKey key, ReassemblySegment&) {
+        if (key.handle != handle ||
+            static_cast<i32>(key.sequence - value.receive_next) > 0) {
+          return;
+        }
+        // Prefer the closest segment at or before receive_next. Older fully
+        // covered entries are removed on subsequent iterations.
+        if (!found || static_cast<i32>(key.sequence - selected.sequence) > 0) {
+          selected = key;
+          found = true;
+        }
+      });
+      if (!found) {
+        break;
+      }
+      auto* queued = reassembly_.find(selected);
+      if (queued == nullptr) {
+        break;
+      }
+      const u32 acknowledged = value.receive_next - selected.sequence;
+      if (acknowledged > queued->size ||
+          (acknowledged == queued->size && !queued->finish)) {
+        static_cast<void>(reassembly_.erase(selected));
+        continue;
+      }
+      const u32 remaining = queued->size - acknowledged;
+      if (remaining > socket_receive_capacity - value.receive_size) {
+        break;
+      }
+      const auto appended = append_received(
+          value, queued->data + acknowledged, remaining, queued->finish);
+      total += appended.size;
+      static_cast<void>(reassembly_.erase(selected));
+      if (appended.result != SocketResult::success ||
+          appended.size != remaining) {
+        return {appended.result, total};
+      }
+    }
+    return {SocketResult::success, total};
   }
 
   void clear_reassembly(u8 handle) {

@@ -278,12 +278,21 @@ void copy_path(char* output, const char* input) {
 
 [[nodiscard]] u32 make_initial_stack(const Image& image,
                                      const char* const* arguments,
-                                     u32 argument_count) {
+                                     u32 argument_count,
+                                     const char* const* environment = nullptr,
+                                     u32 environment_count = 0) {
   u32 cursor = user_stack_top;
   u32 argument_addresses[16]{};
-  if (argument_count == 0 || argument_count > 16) {
+  u32 environment_addresses[16]{};
+  if (argument_count == 0 || argument_count > 16 ||
+      environment_count > 16 ||
+      (environment_count != 0 && environment == nullptr)) {
     write_text("MIKOS:BAD_ARGUMENTS\n");
     shutdown(6);
+  }
+  for (u32 i = environment_count; i != 0; --i) {
+    cursor = copy_string_down(cursor, environment[i - 1]);
+    environment_addresses[i - 1] = cursor;
   }
   for (u32 i = argument_count; i != 0; --i) {
     cursor = copy_string_down(cursor, arguments[i - 1]);
@@ -310,7 +319,8 @@ void copy_path(char* output, const char* input) {
       {0, 0},
   };
   const u32 words =
-      1 + argument_count + 1 + 1 + sizeof(aux) / sizeof(aux[0]) * 2;
+      1 + argument_count + 1 + environment_count + 1 +
+      sizeof(aux) / sizeof(aux[0]) * 2;
   const u32 stack = align_down(
       cursor - words * sizeof(u32), static_cast<u32>(16));
   auto* out = reinterpret_cast<u32*>(stack);
@@ -319,6 +329,9 @@ void copy_path(char* output, const char* input) {
     *out++ = argument_addresses[i];
   }
   *out++ = null;
+  for (u32 i = 0; i < environment_count; ++i) {
+    *out++ = environment_addresses[i];
+  }
   *out++ = null;
   for (const auto item : aux) {
     *out++ = item.type;
@@ -375,8 +388,12 @@ Scheduler scheduler{};
 
 bool replace_with_executable(TrapFrame& frame, const char* path,
                              const char* const* arguments,
-                             u32 argument_count) {
-  if (path == nullptr || argument_count == 0 || argument_count > 16) {
+                             u32 argument_count,
+                             const char* const* environment,
+                             u32 environment_count) {
+  if (path == nullptr || argument_count == 0 || argument_count > 16 ||
+      environment_count > 16 ||
+      (environment_count != 0 && environment == nullptr)) {
     return false;
   }
   const auto node = drivers::fs::root::lookup(path);
@@ -421,7 +438,8 @@ bool replace_with_executable(TrapFrame& frame, const char* path,
                                   static_cast<u32>(4096));
   }
   process.mmap_cursor = process.mmap_begin;
-  const u32 stack = make_initial_stack(image, arguments, argument_count);
+  const u32 stack = make_initial_stack(image, arguments, argument_count,
+                                       environment, environment_count);
   for (auto& value : frame.x) {
     value = 0;
   }

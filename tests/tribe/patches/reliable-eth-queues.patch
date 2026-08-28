@@ -1,0 +1,313 @@
+diff --git a/tribe/TribeDebug.h b/tribe/TribeDebug.h
+--- a/tribe/TribeDebug.h
++++ b/tribe/TribeDebug.h
+@@ -152,6 +152,40 @@ inline bool eth_tap_supports_mikos_frame(const std::vector<uint8_t>& frame)
+         (frame[13] == 0x00u || frame[13] == 0x06u);
+ }
+ 
++inline bool eth_tap_frame_has_priority(const std::vector<uint8_t>& frame)
++{
++    if (frame.size() < 14) {
++        return false;
++    }
++    // ARP is required to establish the link and must not be displaced by
++    // background IPv4 traffic.
++    if (frame[12] == 0x08u && frame[13] == 0x06u) {
++        return true;
++    }
++    if (frame[12] != 0x08u || frame[13] != 0x00u || frame.size() < 34) {
++        return false;
++    }
++    const size_t ip_header = (frame[14] & 0x0fu) * 4u;
++    if (ip_header < 20 || frame.size() < 14 + ip_header || frame[23] != 6) {
++        return false;
++    }
++    const uint16_t ip_length = (uint16_t(frame[16]) << 8) | frame[17];
++    if (ip_length < ip_header + 20 || frame.size() < 14 + ip_length) {
++        return false;
++    }
++    const size_t tcp = 14 + ip_header;
++    const size_t tcp_header = (frame[tcp + 12] >> 4) * 4u;
++    if (tcp_header < 20 || ip_length < ip_header + tcp_header) {
++        return false;
++    }
++    const uint8_t flags = frame[tcp + 13];
++    const size_t payload = ip_length - ip_header - tcp_header;
++    // Preserve TCP data and connection state. Pure ACK/window-update packets
++    // are recoverable and may be displaced when the real-time host outruns
++    // the cycle-level receiver.
++    return payload != 0 || (flags & 0x07u) != 0;
++}
++
+ class EthGigTapSocket
+ {
+ #if defined(__linux__)
+@@ -337,6 +371,11 @@ public:
+             std::print("can't create eth tap socket: {}\n", std::strerror(errno));
+             return false;
+         }
++        constexpr int socket_buffer_bytes = 4 * 1024 * 1024;
++        (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
++            &socket_buffer_bytes, sizeof(socket_buffer_bytes));
++        (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
++            &socket_buffer_bytes, sizeof(socket_buffer_bytes));
+         ::unlink(local_path.c_str());
+         if (::bind(fd, reinterpret_cast<sockaddr*>(&local_addr), sizeof(local_addr)) != 0) {
+             std::print("can't bind eth tap socket '{}': {}\n", local_path, std::strerror(errno));
+@@ -421,8 +460,9 @@ public:
+                     // frame; keeping stale duplicates instead can deadlock SSH.
+                     bool evicted = false;
+                     std::vector<uint8_t> wire_frame = tap_frame_to_wire(tap_frame);
+-                    if (rgmii.push_rx_packet_recent_limited(
+-                            wire_frame, MAX_RX_BACKLOG_PACKETS, evicted)) {
++                    if (rgmii.push_rx_packet_priority_limited(
++                            wire_frame, MAX_RX_BACKLOG_PACKETS,
++                            eth_tap_frame_has_priority(tap_frame), evicted)) {
+                         rx_backlog_drop_count += evicted ? 1 : 0;
+                         trace("tap->wire", tap_frame);
+                     }
+@@ -435,16 +475,18 @@ public:
+         trace_rx_backlog_drops(rgmii.pending_rx_packets());
+ 
+         while (rgmii.has_tx_packet()) {
+-            std::vector<uint8_t> wire_frame = rgmii.pop_tx_packet();
++            const std::vector<uint8_t>& wire_frame = rgmii.front_tx_packet();
+             std::vector<uint8_t> tap_frame;
+             if (!wire_frame_to_tap(wire_frame, tap_frame)) {
+                 trace("drop-bad-wire", wire_frame);
++                rgmii.pop_tx_packet();
+                 continue;
+             }
+             trace("wire->tap", tap_frame);
+             if (!send_frame(tap_frame)) {
+                 break;
+             }
++            rgmii.pop_tx_packet();
+         }
+ #else
+         (void)rgmii;
+diff --git a/tribe/verif/RGMIIVerif.h b/tribe/verif/RGMIIVerif.h
+--- a/tribe/verif/RGMIIVerif.h
++++ b/tribe/verif/RGMIIVerif.h
+@@ -11,6 +11,7 @@ using namespace cpphdl;
+ class RGMIIVerif
+ {
+     std::deque<std::vector<uint8_t>> rx_packets;
++    std::deque<bool> rx_packet_priority;
+     std::vector<uint8_t> tx_packet;
+     std::vector<std::vector<uint8_t>> tx_packets;
+     bool rx_have_low = false;
+@@ -30,28 +31,40 @@ public:
+     void push_rx_packet(const std::vector<uint8_t>& packet)
+     {
+         rx_packets.push_back(packet);
++        rx_packet_priority.push_back(true);
+         ++rx_packet_count;
+     }
+ 
+-    bool push_rx_packet_recent_limited(const std::vector<uint8_t>& packet,
+-        size_t max_packets, bool& evicted)
++    bool push_rx_packet_priority_limited(const std::vector<uint8_t>& packet,
++        size_t max_packets, bool priority, bool& evicted)
+     {
+         evicted = false;
+         if (max_packets != 0 && rx_packets.size() >= max_packets) {
+-            auto oldest_pending = rx_packets.begin();
++            size_t first_pending = rx_packet_started ? 1 : 0;
+             // Never remove the front packet after any of it has reached
+             // RGMII. tx_high alone is insufficient: it is false between
+             // every pair of byte nibbles, while the frame is still active.
+-            if (rx_packet_started) {
+-                ++oldest_pending;
++            size_t victim = rx_packets.size();
++            for (size_t index = first_pending; index < rx_packets.size(); ++index) {
++                if (!rx_packet_priority[index]) {
++                    victim = index;
++                    break;
++                }
+             }
+-            if (oldest_pending == rx_packets.end()) {
++            if (victim == rx_packets.size() && priority &&
++                first_pending < rx_packets.size()) {
++                victim = first_pending;
++            }
++            if (victim == rx_packets.size()) {
+                 return false;
+             }
+-            rx_packets.erase(oldest_pending);
++            rx_packets.erase(rx_packets.begin() + victim);
++            rx_packet_priority.erase(rx_packet_priority.begin() + victim);
+             evicted = true;
+         }
+-        push_rx_packet(packet);
++        rx_packets.push_back(packet);
++        rx_packet_priority.push_back(priority);
++        ++rx_packet_count;
+         return true;
+     }
+ 
+@@ -72,6 +85,11 @@ public:
+         return packet;
+     }
+ 
++    const std::vector<uint8_t>& front_tx_packet() const
++    {
++        return tx_packets.front();
++    }
++
+     const std::vector<std::vector<uint8_t>>& transmitted_packets() const
+     {
+         return tx_packets;
+@@ -102,6 +120,7 @@ public:
+                     tx_high = false;
+                     if (packet.empty()) {
+                         rx_packets.pop_front();
++                        rx_packet_priority.pop_front();
+                         rx_packet_started = false;
+                     }
+                 }
+@@ -148,10 +167,11 @@ public:
+         verif.push_rx_packet(packet);
+     }
+ 
+-    bool push_rx_packet_recent_limited(const std::vector<uint8_t>& packet,
+-        size_t max_packets, bool& evicted)
++    bool push_rx_packet_priority_limited(const std::vector<uint8_t>& packet,
++        size_t max_packets, bool priority, bool& evicted)
+     {
+-        return verif.push_rx_packet_recent_limited(packet, max_packets, evicted);
++        return verif.push_rx_packet_priority_limited(
++            packet, max_packets, priority, evicted);
+     }
+ 
+     size_t pending_rx_packets() const
+@@ -169,6 +189,11 @@ public:
+         return verif.pop_tx_packet();
+     }
+ 
++    const std::vector<uint8_t>& front_tx_packet() const
++    {
++        return verif.front_tx_packet();
++    }
++
+     void _assign() {}
+ 
+     void _work(bool reset)
+diff --git a/tribe/tests/EthGigCPU_test.cpp b/tribe/tests/EthGigCPU_test.cpp
+--- a/tribe/tests/EthGigCPU_test.cpp
++++ b/tribe/tests/EthGigCPU_test.cpp
+@@ -169,7 +169,7 @@ static bool check_rx_backlog_preserves_inflight_frame()
+     }
+ 
+     bool evicted = false;
+-    if (!verif.push_rx_packet_recent_limited({0x51}, 4, evicted) || !evicted) {
++    if (!verif.push_rx_packet_priority_limited({0x51}, 4, true, evicted) || !evicted) {
+         std::print("EthGig RX backlog ERROR: full queue did not retain newest frame\n");
+         ok = false;
+     }
+@@ -207,16 +207,95 @@ static bool check_rx_protocol_filter()
+     std::vector<uint8_t> ipv6 = ipv4;
+     ipv6[12] = 0x86;
+     ipv6[13] = 0xdd;
++    std::vector<uint8_t> tcp_ack(54);
++    tcp_ack[12] = 0x08;
++    tcp_ack[13] = 0x00;
++    tcp_ack[14] = 0x45;
++    tcp_ack[16] = 0;
++    tcp_ack[17] = 40;
++    tcp_ack[23] = 6;
++    tcp_ack[46] = 0x50;
++    tcp_ack[47] = 0x10;
++    std::vector<uint8_t> tcp_data = tcp_ack;
++    tcp_data.push_back(0x42);
++    tcp_data[17] = 41;
++    std::vector<uint8_t> tcp_syn = tcp_ack;
++    tcp_syn[47] = 0x02;
+     if (!eth_tap_supports_mikos_frame(ipv4) ||
+         !eth_tap_supports_mikos_frame(arp) ||
+         eth_tap_supports_mikos_frame(ipv6) ||
+-        eth_tap_supports_mikos_frame(std::vector<uint8_t>(13))) {
++        eth_tap_supports_mikos_frame(std::vector<uint8_t>(13)) ||
++        eth_tap_frame_has_priority(tcp_ack) ||
++        !eth_tap_frame_has_priority(tcp_data) ||
++        !eth_tap_frame_has_priority(tcp_syn)) {
+         std::print("EthGig RX protocol filter ERROR\n");
+         ok = false;
+     }
+     return ok;
+ }
+ 
++static bool check_rx_backlog_preserves_payload()
++{
++    bool ok = true;
++    bool evicted = false;
++    RGMIIVerif verif;
++    if (!verif.push_rx_packet_priority_limited({0xa1}, 4, true, evicted) ||
++        !verif.push_rx_packet_priority_limited({0xb1}, 4, true, evicted) ||
++        !verif.push_rx_packet_priority_limited({0xc1}, 4, true, evicted) ||
++        !verif.push_rx_packet_priority_limited({0xd1}, 4, true, evicted)) {
++        std::print("EthGig RX priority ERROR: initial queue failed\n");
++        return false;
++    }
++    // A recoverable ACK cannot displace queued payload.
++    if (verif.push_rx_packet_priority_limited({0xe1}, 4, false, evicted) ||
++        evicted) {
++        std::print("EthGig RX priority ERROR: ACK displaced payload\n");
++        ok = false;
++    }
++    RGMIIVerif mixed;
++    if (!mixed.push_rx_packet_priority_limited({0xa1}, 4, false, evicted) ||
++        !mixed.push_rx_packet_priority_limited({0xb1}, 4, true, evicted) ||
++        !mixed.push_rx_packet_priority_limited({0xc1}, 4, true, evicted) ||
++        !mixed.push_rx_packet_priority_limited({0xd1}, 4, true, evicted)) {
++        std::print("EthGig RX priority ERROR: mixed queue failed\n");
++        return false;
++    }
++    // New payload first evicts the queued low-priority ACK.
++    if (!mixed.push_rx_packet_priority_limited({0xf1}, 4, true, evicted) ||
++        !evicted) {
++        std::print("EthGig RX priority ERROR: payload was not retained\n");
++        ok = false;
++    }
++    mixed.step(false, 0, false);
++    if (!mixed.rgmii_rx_ctl || mixed.rgmii_rxd != 0x1) {
++        std::print("EthGig RX priority ERROR: wrong packet was evicted\n");
++        ok = false;
++    }
++    return ok;
++}
++
++static bool check_tx_packet_requires_commit()
++{
++    RGMIIVerif verif;
++    verif.step(true, 0x0a, false);
++    verif.step(true, 0x0b, true);
++    if (!verif.has_tx_packet() || verif.front_tx_packet().size() != 1 ||
++        verif.front_tx_packet()[0] != 0xba) {
++        std::print("EthGig TX queue ERROR: packet unavailable before commit\n");
++        return false;
++    }
++    if (!verif.has_tx_packet()) {
++        std::print("EthGig TX queue ERROR: inspection removed packet\n");
++        return false;
++    }
++    verif.pop_tx_packet();
++    if (verif.has_tx_packet()) {
++        std::print("EthGig TX queue ERROR: commit did not remove packet\n");
++        return false;
++    }
++    return true;
++}
++
+ int main(int argc, char** argv)
+ {
+     bool noveril = false;
+@@ -237,6 +316,8 @@ int main(int argc, char** argv)
+     bool ok = check_eth_dma_cache_invalidate_policy();
+     ok = check_rx_backlog_preserves_inflight_frame() && ok;
+     ok = check_rx_protocol_filter() && ok;
++    ok = check_rx_backlog_preserves_payload() && ok;
++    ok = check_tx_packet_requires_commit() && ok;
+     if (policy_only) {
+         return ok ? 0 : 1;
+     }

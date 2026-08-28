@@ -20,6 +20,7 @@ enum class Syscall : u32 {
   statfs64 = 43,
   faccessat = 48,
   chdir = 49,
+  fchmodat = 53,
   openat = 56,
   close = 57,
   pipe2 = 59,
@@ -99,6 +100,7 @@ enum class Syscall : u32 {
 
 enum class Errno : i32 {
   no_entry = 2,
+  interrupted = 4,
   io = 5,
   exec_format = 8,
   bad_file_descriptor = 9,
@@ -157,6 +159,8 @@ enum class Errno : i32 {
       return "faccessat";
     case Syscall::chdir:
       return "chdir";
+    case Syscall::fchmodat:
+      return "fchmodat";
     case Syscall::openat:
       return "openat";
     case Syscall::close:

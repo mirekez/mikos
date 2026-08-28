@@ -16,17 +16,21 @@ LOCAL_TEST_BINARIES := \
 	$(patsubst %.cpp,$(BUILD)/%,$(LOCAL_TEST_SOURCES))
 DRIVER_TEST_BINARIES := \
 	$(patsubst ../%.cpp,$(BUILD)/%,$(DRIVER_TEST_SOURCES))
+BRIDGE_TEST_BINARY := $(BUILD)/qemu/ethgig_tap_self_test
 TEST_BINARIES := $(LOCAL_TEST_BINARIES) $(DRIVER_TEST_BINARIES)
 TEST_DEPS := $(addsuffix .d,$(TEST_BINARIES))
 
-.PHONY: all test regression fs-driver-check x86-driver-check clean
+.PHONY: all test regression bridge-check fs-driver-check x86-driver-check clean
 
 all: test
 
-test: regression fs-driver-check x86-driver-check
+test: regression bridge-check fs-driver-check x86-driver-check
 
 regression: $(TEST_BINARIES)
 	@set -e; for test_binary in $(TEST_BINARIES); do "$$test_binary"; done
+
+bridge-check: $(BRIDGE_TEST_BINARY)
+	$< --self-test
 
 x86-driver-check: $(ROOT)/drivers/net/virtio_pci_legacy.cpp \
 		$(ROOT)/drivers/net/net.hpp \
@@ -63,6 +67,10 @@ $(BUILD)/net/stack_test: net/stack_test.cpp $(ROOT)/network/stack.cpp \
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d \
 		net/stack_test.cpp $(ROOT)/network/stack.cpp -o $@
+
+$(BRIDGE_TEST_BINARY): $(ROOT)/tests/qemu/ethgig_tap.cpp
+	@mkdir -p $(@D)
+	$(CXX) -std=c++2c -Wall -Wextra -Werror $< -o $@
 
 $(BUILD)/drivers/%: ../drivers/%.cpp support/test.hpp
 	@mkdir -p $(@D)

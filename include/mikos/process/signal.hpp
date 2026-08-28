@@ -5,6 +5,8 @@
 namespace mikos::process_model {
 
 inline constexpr u8 signal_max = 64;
+inline constexpr u8 signal_interrupt = 2;
+inline constexpr u8 signal_quit = 3;
 inline constexpr u8 signal_kill = 9;
 inline constexpr u8 signal_child = 17;
 inline constexpr u8 signal_continue = 18;
@@ -109,6 +111,9 @@ class SignalState {
 
   [[nodiscard]] constexpr u64 pending() const { return pending_; }
   [[nodiscard]] constexpr u64 blocked() const { return blocked_; }
+  [[nodiscard]] constexpr bool has_deliverable() const {
+    return (pending_ & ~blocked_) != 0;
+  }
 
   [[nodiscard]] static constexpr SignalDefault default_for(u8 signal) {
     if (signal == signal_child || signal == signal_urgent ||

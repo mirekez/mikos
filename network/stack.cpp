@@ -353,7 +353,7 @@ class BootstrapStack {
       return false;
     }
     pending->attempts = 1;
-    pending->retry_at = poll_epoch_ + retransmission_poll_interval;
+    pending->retry_at = poll_epoch_ + retransmission_delay(pending->attempts);
     return true;
   }
 
@@ -382,9 +382,10 @@ class BootstrapStack {
 
   void flush_retransmission() {
     ++poll_epoch_;
-    bool transmitted = false;
+    TransmitKey selected{};
+    TransmitSegment* selected_pending = nullptr;
     transmissions_.for_each([&](TransmitKey key, TransmitSegment& pending) {
-      if (transmitted || static_cast<i32>(poll_epoch_ - pending.retry_at) < 0) {
+      if (static_cast<i32>(poll_epoch_ - pending.retry_at) < 0) {
         return;
       }
       auto* socket = sockets_.slot(key.handle);
@@ -393,13 +394,38 @@ class BootstrapStack {
            socket->state != SocketState::close_wait)) {
         return;
       }
-      if (send_segment(*socket, pending.flags, pending.data, pending.size,
-                       key.sequence)) {
-        ++pending.attempts;
-        pending.retry_at = poll_epoch_ + retransmission_poll_interval;
-        transmitted = true;
+      // TCP recovery starts with the oldest unacknowledged data. In
+      // particular, do not cycle through every queued SSH record while a
+      // cumulative ACK is waiting in the Tribe RX path.
+      if (selected_pending == nullptr ||
+          static_cast<i32>(key.sequence - selected.sequence) < 0) {
+        selected = key;
+        selected_pending = &pending;
       }
     });
+    if (selected_pending == nullptr) {
+      return;
+    }
+    auto* socket = sockets_.slot(selected.handle);
+    if (socket != nullptr &&
+        send_segment(*socket, selected_pending->flags,
+                     selected_pending->data, selected_pending->size,
+                     selected.sequence)) {
+      if (selected_pending->attempts != 0xff) {
+        ++selected_pending->attempts;
+      }
+      selected_pending->retry_at =
+          poll_epoch_ + retransmission_delay(selected_pending->attempts);
+    }
+  }
+
+  [[nodiscard]] static constexpr u32 retransmission_delay(u8 attempts) {
+    constexpr u8 maximum_backoff_shift = 5;
+    const u8 completed_retries = attempts == 0 ? 0 : attempts - 1;
+    const u8 shift = completed_retries > maximum_backoff_shift
+                         ? maximum_backoff_shift
+                         : completed_retries;
+    return transmit_initial_retry_polls << shift;
   }
 
   void flush_acknowledgement(SocketSlot& socket) {
@@ -491,10 +517,10 @@ class BootstrapStack {
     if (view.payload_size != 0 || finish) {
       static_cast<void>(sockets_.receive(connection, sequence, view.payload,
                                          view.payload_size, finish));
-      // Send immediately, then retain one delayed retry. A failed immediate TX
-      // therefore gets retried by poll(), while a successful one gets one safe
-      // duplicate ACK during a long userspace compute interval.
-      value->acknowledgement_retries = 2;
+      // Send once immediately. If the TX descriptor is busy, the pending
+      // attempt remains for poll(); successful sends must not create a second
+      // ACK for every host retransmission and flood the cycle-level datapath.
+      value->acknowledgement_retries = 1;
       flush_acknowledgement(*value);
     }
   }
@@ -539,10 +565,6 @@ class BootstrapStack {
   u32 next_sequence_{0x4d494b4f};
   u16 next_identification_{1};
   u32 poll_epoch_{};
-  // Polling is the only clock available in the bootstrap stack. Keep the
-  // interval long enough to avoid racing a normal delayed ACK, but short
-  // enough to recover while a cycle-accurate userspace process is blocked.
-  static constexpr u32 retransmission_poll_interval = 256;
   bool initialized_{};
   bool arp_replied_{};
   bool echo_replied_{};

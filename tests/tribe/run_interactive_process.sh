@@ -4,7 +4,8 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 multicore=()
 tap_socket="${TRIBE_ETH_TAP_SOCKET:-/tmp/tribe-ethgig.sock}"
-wall_timeout="${TRIBE_INTERACTIVE_PROCESS_TIMEOUT:-1800}"
+wall_timeout="${TRIBE_INTERACTIVE_PROCESS_TIMEOUT:-7200}"
+nested_only="${TRIBE_INTERACTIVE_PROCESS_NESTED_ONLY:-0}"
 
 if [[ "${1:-}" == "--multicore" ]]; then
   multicore+=(--multicore)
@@ -12,6 +13,10 @@ if [[ "${1:-}" == "--multicore" ]]; then
 fi
 if [[ $# -ne 0 ]]; then
   echo "usage: $0 [--multicore]" >&2
+  exit 2
+fi
+if [[ "$nested_only" != 0 && "$nested_only" != 1 ]]; then
+  echo "TRIBE_INTERACTIVE_PROCESS_NESTED_ONLY must be 0 or 1" >&2
   exit 2
 fi
 if [[ ! -S "$tap_socket" ]]; then
@@ -24,6 +29,17 @@ input="$runtime/uart.in"
 log="$runtime/uart.log"
 rootfs="$runtime/rootfs.ext4"
 cp --reflink=auto "$root/build/tests/busybox/rootfs.ext4" "$rootfs"
+debugfs="${DEBUGFS:-/usr/sbin/debugfs}"
+process_rcs="$root/tests/busybox/rootfs/etc/init.d/rcS.process"
+if [[ ! -x "$debugfs" ]]; then
+  echo "missing debugfs: $debugfs" >&2
+  exit 1
+fi
+"$debugfs" -w -R 'rm /etc/init.d/rcS' "$rootfs" >/dev/null 2>&1
+"$debugfs" -w -R "write $process_rcs /etc/init.d/rcS" \
+  "$rootfs" >/dev/null 2>&1
+"$debugfs" -w -R 'set_inode_field /etc/init.d/rcS mode 0100755' \
+  "$rootfs" >/dev/null 2>&1
 mkfifo "$input"
 exec 3<>"$input"
 
@@ -62,14 +78,24 @@ wait_for_marker() {
 }
 
 wait_for_marker '/ # '
-printf '%s\n' \
-  'exec 10>&1; echo MIKOS_FD10_CHILD | cat >&10; echo MIKOS_FD10_PARENT >&10' \
-  "printf 'MIKOS_THREE_STAGE\\n' | cat | cat" \
-  "A=parent; export A; sh -c 'A=child; test \"\$A\" = child'; echo MIKOS_ADDR_\$A" \
-  "sh -c 'exit 7'; echo MIKOS_WAIT_\$?" >&3
+if [[ "$nested_only" == 1 ]]; then
+  commands=("sh -c 'ls /'; echo MIKOS_NESTED_LS_\$?")
+  markers=('MIKOS:NESTED_CLONE_STACK depth=1' MIKOS_NESTED_LS_0)
+else
+  commands=(
+    'exec 10>&1; echo MIKOS_FD10_CHILD | cat >&10; echo MIKOS_FD10_PARENT >&10'
+    "printf 'MIKOS_THREE_STAGE\\n' | cat | cat"
+    "A=parent; export A; sh -c 'A=child; test \"\$A\" = child'; echo MIKOS_ADDR_\$A"
+    "sh -c 'exit 7'; echo MIKOS_WAIT_\$?"
+    "sh -c 'ls /'; echo MIKOS_NESTED_LS_\$?"
+  )
+  markers=(MIKOS_FD10_CHILD MIKOS_FD10_PARENT MIKOS_THREE_STAGE
+           MIKOS_ADDR_parent MIKOS_WAIT_7
+           'MIKOS:NESTED_CLONE_STACK depth=1' MIKOS_NESTED_LS_0)
+fi
+printf '%s\n' "${commands[@]}" >&3
 
-for marker in MIKOS_FD10_CHILD MIKOS_FD10_PARENT MIKOS_THREE_STAGE \
-              MIKOS_ADDR_parent MIKOS_WAIT_7; do
+for marker in "${markers[@]}"; do
   wait_for_marker "(^|/ # )${marker}\\r?$"
 done
 
@@ -85,4 +111,8 @@ for marker in 'MIKOS:BUSYBOX_EXIT 0' 'MIKOS:EXIT 0'; do
   fi
 done
 
-echo 'PASS: BusyBox fork, inherited pipes/fd10, address restore, and wait status'
+if [[ "$nested_only" == 1 ]]; then
+  echo 'PASS: nested BusyBox shell fork and external ls'
+else
+  echo 'PASS: BusyBox fork, inherited pipes/fd10, address restore, wait status, and nested ls'
+fi

@@ -7,6 +7,47 @@ namespace mikos::process_model {
 
 inline constexpr u32 invalid_pid = 0;
 
+struct ProcessLineage {
+  u32 pid{};
+  u32 parent_pid{};
+
+  [[nodiscard]] constexpr bool operator==(
+      const ProcessLineage&) const = default;
+};
+
+[[nodiscard]] constexpr ProcessLineage fork_lineage(
+    ProcessLineage parent, u32 child_pid) {
+  return {child_pid, parent.pid};
+}
+
+// A live connection nested below a parked listener must remain resident.
+// Yielding it for UART input would resume the listener rather than the shell
+// and strand the connection in the single background slot.
+[[nodiscard]] constexpr bool connection_wait_can_yield_to_uart(
+    u32 nested_depth) {
+  return nested_depth == 0;
+}
+
+// The flat interactive adapter may temporarily run a PTY server while its
+// child is blocked on the slave. Only the immediate parent may resume that
+// child, and only when the slave read can complete. An already-active fork
+// parent means the child is running, not parked.
+[[nodiscard]] constexpr bool pty_child_can_park(bool child_already_parked,
+                                                 bool parent_active,
+                                                 bool slave_endpoint) {
+  return !child_already_parked && parent_active && slave_endpoint;
+}
+
+[[nodiscard]] constexpr bool pty_child_can_resume(bool child_parked,
+                                                   u32 current_pid,
+                                                   u32 child_parent_pid,
+                                                   bool parent_active,
+                                                   bool slave_readable,
+                                                   bool wait_interrupted) {
+  return child_parked && current_pid == child_parent_pid && !parent_active &&
+         (slave_readable || wait_interrupted);
+}
+
 enum class ProcessState : u8 {
   free,
   runnable,

@@ -1,0 +1,234 @@
+diff --git a/tribe/TribeDebug.h b/tribe/TribeDebug.h
+index 1763e6b..d8d9517 100644
+--- a/tribe/TribeDebug.h
++++ b/tribe/TribeDebug.h
+@@ -186,6 +186,38 @@ inline bool eth_tap_frame_has_priority(const std::vector<uint8_t>& frame)
+     return payload != 0 || (flags & 0x07u) != 0;
+ }
+ 
++inline uint64_t eth_tap_tcp_queue_key(const std::vector<uint8_t>& frame)
++{
++    if (frame.size() < 54 || frame[12] != 0x08u || frame[13] != 0x00u ||
++        frame[23] != 6) {
++        return 0;
++    }
++    const size_t ip_header = (frame[14] & 0x0fu) * 4u;
++    if (ip_header < 20 || frame.size() < 14 + ip_header + 20) {
++        return 0;
++    }
++    const size_t tcp = 14 + ip_header;
++    const size_t tcp_header = (frame[tcp + 12] >> 4) * 4u;
++    const uint16_t ip_length = (uint16_t(frame[16]) << 8) | frame[17];
++    if (tcp_header < 20 || ip_length < ip_header + tcp_header ||
++        frame.size() < 14 + ip_length) {
++        return 0;
++    }
++
++    // Ignore the IPv4 ID/checksums and TCP timestamps, which legitimately
++    // change on a retransmission. Hash the flow, sequence/ACK range, flags,
++    // window, and payload length so identical queued TCP work is coalesced.
++    uint64_t key = 1469598103934665603ull;
++    const auto mix = [&key](uint8_t byte) {
++        key = (key ^ byte) * 1099511628211ull;
++    };
++    for (size_t index = 26; index < 34; ++index) mix(frame[index]);
++    for (size_t index = tcp; index < tcp + 16; ++index) mix(frame[index]);
++    mix(frame[16]);
++    mix(frame[17]);
++    return key == 0 ? 1 : key;
++}
++
+ class EthGigTapSocket
+ {
+ #if defined(__linux__)
+@@ -459,12 +491,17 @@ public:
+                     // transmission. TCP retransmission recovers an evicted
+                     // frame; keeping stale duplicates instead can deadlock SSH.
+                     bool evicted = false;
++                    bool coalesced = false;
+                     std::vector<uint8_t> wire_frame = tap_frame_to_wire(tap_frame);
+                     if (rgmii.push_rx_packet_priority_limited(
+                             wire_frame, MAX_RX_BACKLOG_PACKETS,
+-                            eth_tap_frame_has_priority(tap_frame), evicted)) {
++                            eth_tap_frame_has_priority(tap_frame),
++                            eth_tap_tcp_queue_key(tap_frame), evicted,
++                            coalesced)) {
+                         rx_backlog_drop_count += evicted ? 1 : 0;
+-                        trace("tap->wire", tap_frame);
++                        trace(coalesced ? "coalesce-tap-retransmission"
++                                        : "tap->wire",
++                              tap_frame);
+                     }
+                     else {
+                         ++rx_backlog_drop_count;
+diff --git a/tribe/tests/EthGigCPU_test.cpp b/tribe/tests/EthGigCPU_test.cpp
+index 45b7a46..0bdfc9d 100644
+--- a/tribe/tests/EthGigCPU_test.cpp
++++ b/tribe/tests/EthGigCPU_test.cpp
+@@ -169,7 +169,7 @@ static bool check_rx_backlog_preserves_inflight_frame()
+ 
+     bool evicted = false;
+-    if (!verif.push_rx_packet_priority_limited({0x51}, 4, true, evicted) || !evicted) {
+-        std::print("EthGig RX backlog ERROR: full queue did not retain newest frame\n");
++    if (verif.push_rx_packet_priority_limited({0x51}, 4, true, evicted) || evicted) {
++        std::print("EthGig RX backlog ERROR: newer payload displaced earliest frame\n");
+         ok = false;
+     }
+     if (verif.pending_rx_packets() != 4) {
+@@ -193,6 +193,12 @@ static bool check_rx_backlog_preserves_inflight_frame()
+         std::print("EthGig RX backlog ERROR: evicted wrong pending frame\n");
+         ok = false;
+     }
++    verif.step(false, 0, false);
++    if (!verif.rgmii_rx_ctl || verif.rgmii_rxd != 0x2 ||
++        !verif.rgmii_rx_last) {
++        std::print("EthGig RX backlog ERROR: earliest pending payload was lost\n");
++        ok = false;
++    }
+     return ok;
+ }
+ 
+@@ -252,6 +258,11 @@ static bool check_rx_backlog_preserves_payload()
+         std::print("EthGig RX priority ERROR: ACK displaced payload\n");
+         ok = false;
+     }
++    if (verif.push_rx_packet_priority_limited({0xf1}, 4, true, evicted) ||
++        evicted) {
++        std::print("EthGig RX priority ERROR: later payload displaced earlier payload\n");
++        ok = false;
++    }
+     RGMIIVerif mixed;
+     if (!mixed.push_rx_packet_priority_limited({0xa1}, 4, false, evicted) ||
+         !mixed.push_rx_packet_priority_limited({0xb1}, 4, true, evicted) ||
+@@ -296,6 +307,32 @@ static bool check_tx_packet_requires_commit()
+     return true;
+ }
+ 
++static bool check_rx_retransmission_coalescing()
++{
++    RGMIIVerif verif;
++    bool evicted = false;
++    bool coalesced = false;
++    if (!verif.push_rx_packet_priority_limited(
++            {0xa1}, 4, true, 0x1234, evicted, coalesced) || evicted ||
++        coalesced || verif.pending_rx_packets() != 1) {
++        std::print("EthGig RX coalescing ERROR: initial packet failed\n");
++        return false;
++    }
++    if (!verif.push_rx_packet_priority_limited(
++            {0xb1}, 4, true, 0x1234, evicted, coalesced) || evicted ||
++        !coalesced || verif.pending_rx_packets() != 1) {
++        std::print("EthGig RX coalescing ERROR: retransmission was queued\n");
++        return false;
++    }
++    if (!verif.push_rx_packet_priority_limited(
++            {0xc1}, 4, true, 0x5678, evicted, coalesced) || evicted ||
++        coalesced || verif.pending_rx_packets() != 2) {
++        std::print("EthGig RX coalescing ERROR: distinct range was dropped\n");
++        return false;
++    }
++    return true;
++}
++
+ int main(int argc, char** argv)
+ {
+     bool noveril = false;
+@@ -317,6 +354,7 @@ int main(int argc, char** argv)
+     ok = check_rx_backlog_preserves_inflight_frame() && ok;
+     ok = check_rx_protocol_filter() && ok;
+     ok = check_rx_backlog_preserves_payload() && ok;
++    ok = check_rx_retransmission_coalescing() && ok;
+     ok = check_tx_packet_requires_commit() && ok;
+     if (policy_only) {
+         return ok ? 0 : 1;
+diff --git a/tribe/verif/RGMIIVerif.h b/tribe/verif/RGMIIVerif.h
+index 272e715..e233a5a 100644
+--- a/tribe/verif/RGMIIVerif.h
++++ b/tribe/verif/RGMIIVerif.h
+@@ -12,6 +12,7 @@ class RGMIIVerif
+ {
+     std::deque<std::vector<uint8_t>> rx_packets;
+     std::deque<bool> rx_packet_priority;
++    std::deque<uint64_t> rx_packet_keys;
+     std::vector<uint8_t> tx_packet;
+     std::vector<std::vector<uint8_t>> tx_packets;
+     bool rx_have_low = false;
+@@ -32,13 +33,32 @@ public:
+     {
+         rx_packets.push_back(packet);
+         rx_packet_priority.push_back(true);
++        rx_packet_keys.push_back(0);
+         ++rx_packet_count;
+     }
+ 
+     bool push_rx_packet_priority_limited(const std::vector<uint8_t>& packet,
+         size_t max_packets, bool priority, bool& evicted)
++    {
++        bool coalesced = false;
++        return push_rx_packet_priority_limited(packet, max_packets, priority,
++            0, evicted, coalesced);
++    }
++
++    bool push_rx_packet_priority_limited(const std::vector<uint8_t>& packet,
++        size_t max_packets, bool priority, uint64_t key, bool& evicted,
++        bool& coalesced)
+     {
+         evicted = false;
++        coalesced = false;
++        if (key != 0) {
++            for (uint64_t queued_key : rx_packet_keys) {
++                if (queued_key == key) {
++                    coalesced = true;
++                    return true;
++                }
++            }
++        }
+         if (max_packets != 0 && rx_packets.size() >= max_packets) {
+             size_t first_pending = rx_packet_started ? 1 : 0;
+             // Never remove the front packet after any of it has reached
+@@ -51,9 +70,5 @@ public:
+                     break;
+                 }
+             }
+-            if (victim == rx_packets.size() && priority &&
+-                first_pending < rx_packets.size()) {
+-                victim = first_pending;
+-            }
+             if (victim == rx_packets.size()) {
+                 return false;
+@@ -60,10 +80,12 @@ public:
+             }
+             rx_packets.erase(rx_packets.begin() + victim);
+             rx_packet_priority.erase(rx_packet_priority.begin() + victim);
++            rx_packet_keys.erase(rx_packet_keys.begin() + victim);
+             evicted = true;
+         }
+         rx_packets.push_back(packet);
+         rx_packet_priority.push_back(priority);
++        rx_packet_keys.push_back(key);
+         ++rx_packet_count;
+         return true;
+     }
+@@ -121,6 +143,7 @@ public:
+                     if (packet.empty()) {
+                         rx_packets.pop_front();
+                         rx_packet_priority.pop_front();
++                        rx_packet_keys.pop_front();
+                         rx_packet_started = false;
+                     }
+                 }
+@@ -174,6 +197,14 @@ public:
+             packet, max_packets, priority, evicted);
+     }
+ 
++    bool push_rx_packet_priority_limited(const std::vector<uint8_t>& packet,
++        size_t max_packets, bool priority, uint64_t key, bool& evicted,
++        bool& coalesced)
++    {
++        return verif.push_rx_packet_priority_limited(
++            packet, max_packets, priority, key, evicted, coalesced);
++    }
++
+     size_t pending_rx_packets() const
+     {
+         return verif.pending_rx_packets();

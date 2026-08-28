@@ -1,0 +1,77 @@
+diff --git a/tribe/TribeDebug.h b/tribe/TribeDebug.h
+--- a/tribe/TribeDebug.h
++++ b/tribe/TribeDebug.h
+@@ -216,6 +216,11 @@ inline uint64_t eth_tap_tcp_queue_key(const std::vector<uint8_t>& frame)
+     return key == 0 ? 1 : key;
+ }
+ 
++// Host TCP can emit ACK, payload, ACK plus retransmissions while only a few
++// cycles elapse in the model. Keep enough distinct work to feed the expanded
++// guest DMA ring; semantic retransmissions are coalesced separately.
++inline constexpr size_t eth_tap_rx_backlog_capacity = 16;
++
+ class EthGigTapSocket
+ {
+ #if defined(__linux__)
+@@ -237,11 +242,7 @@ class EthGigTapSocket
+     static constexpr uint8_t MSG_HELLO = 1;
+     static constexpr uint8_t MSG_FRAME = 2;
+     static constexpr size_t ETHERNET_MIN_FRAME_BYTES = 60;
+-    // Host TCP runs in wall time while the guest may spend minutes in one
+-    // cycle-level syscall. Keep a short recent burst rather than letting old
+-    // retransmissions either fill a large FIFO or cause the SSH record behind
+-    // their ACKs to be dropped.
+-    static constexpr size_t MAX_RX_BACKLOG_PACKETS = 4;
++    static constexpr size_t MAX_RX_BACKLOG_PACKETS = eth_tap_rx_backlog_capacity;
+     static constexpr size_t MAX_RX_DGRAMS_PER_PUMP = 16;
+     static constexpr uint64_t RX_BACKLOG_REPORT_PERIOD = 1000000;
+ 
+diff --git a/tribe/tests/EthGigCPU_test.cpp b/tribe/tests/EthGigCPU_test.cpp
+--- a/tribe/tests/EthGigCPU_test.cpp
++++ b/tribe/tests/EthGigCPU_test.cpp
+@@ -332,6 +332,37 @@ static bool check_rx_retransmission_coalescing()
+     return true;
+ }
+ 
++static bool check_rx_kex_burst_capacity()
++{
++    if (eth_tap_rx_backlog_capacity < 8) {
++        std::print("EthGig RX KEX burst ERROR: backlog capacity too small\n");
++        return false;
++    }
++    RGMIIVerif verif;
++    bool evicted = false;
++    bool coalesced = false;
++    for (size_t index = 0; index < eth_tap_rx_backlog_capacity; ++index) {
++        if (!verif.push_rx_packet_priority_limited(
++                {uint8_t(index + 1)}, eth_tap_rx_backlog_capacity, true,
++                index + 1, evicted, coalesced) || evicted || coalesced) {
++            std::print("EthGig RX KEX burst ERROR: distinct frame {} dropped\n",
++                index);
++            return false;
++        }
++    }
++    if (verif.pending_rx_packets() != eth_tap_rx_backlog_capacity) {
++        std::print("EthGig RX KEX burst ERROR: queue size mismatch\n");
++        return false;
++    }
++    if (verif.push_rx_packet_priority_limited(
++            {0xff}, eth_tap_rx_backlog_capacity, true, 0xffff,
++            evicted, coalesced) || evicted || coalesced) {
++        std::print("EthGig RX KEX burst ERROR: full payload queue reordered\n");
++        return false;
++    }
++    return true;
++}
++
+ int main(int argc, char** argv)
+ {
+     bool noveril = false;
+@@ -355,6 +386,7 @@ int main(int argc, char** argv)
+     ok = check_rx_protocol_filter() && ok;
+     ok = check_rx_backlog_preserves_payload() && ok;
+     ok = check_rx_retransmission_coalescing() && ok;
++    ok = check_rx_kex_burst_capacity() && ok;
+     ok = check_tx_packet_requires_commit() && ok;
+     if (policy_only) {
+         return ok ? 0 : 1;

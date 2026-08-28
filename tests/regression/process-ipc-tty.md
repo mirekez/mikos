@@ -15,14 +15,19 @@ Current executable gates:
   coalescing, unblock delivery, uncatchable signals, and default actions.
 - `tests/kernel/pty_test.cpp`: PTY allocation/locking, bidirectional rings,
   termios and winsize state, foreground groups, hangup, and slot reuse.
+- `tests/kernel/snapshot_arena_test.cpp`: exact-sized fork-snapshot allocation,
+  alignment, an allocation above the removed 512 KiB per-level limit,
+  exhaustion, out-of-order release, fragmentation, two-sided coalescing,
+  invalid release, and double-free rejection.
 - `make tribe-interactive-process-test`: ordinary glibc fork flags, pipe and
   fd-10 inheritance, three-stage BusyBox pipelines, restored parent data, and
   process-group-selected nonzero child reaping through RV32 glibc's `waitid`
-  emulation. The sequence reaches PID 8, detecting duplicate parent-side fork
-  results as well as stale or cross-parent zombies.
+  emulation, followed by a nested shell fork of external `ls`. The sequence
+  requires the kernel's nested-snapshot stack marker and detects duplicate
+  parent-side fork results as well as stale or cross-parent zombies.
 - `tests/tribe/run_interactive_ssh.sh --multicore`: native-C++ Tribe boot,
   background Dropbear listen/accept and none-mode test authentication, nested
-  command fork in a second concurrent address space, zombie publication,
+  external `ls` fork in an interactive address space, zombie publication,
   caught `SIGCHLD` delivery through an RV32 Linux-compatible signal frame,
   `rt_sigreturn`, `waitpid` reaping, remote output, exit status, and clean SSH
   channel close.
@@ -31,6 +36,5 @@ Current executable gates:
   adapters with freestanding warnings treated as errors.
 
 Still pending target gates include general concurrent/background runnable
-ordering, blocking pipe wake/replay, canonical line discipline, and a fully
-interactive PTY-attached SSH shell.
+ordering, blocking pipe wake/replay, and a complete canonical line discipline.
 They must not be inferred from host state-machine coverage or compile success.

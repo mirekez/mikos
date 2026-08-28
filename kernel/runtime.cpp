@@ -8,6 +8,23 @@ extern "C" void* memcpy(void* destination, const void* source,
   if (((reinterpret_cast<mikos::usize>(out) |
         reinterpret_cast<mikos::usize>(in)) &
        (sizeof(Word) - 1)) == 0) {
+    constexpr mikos::usize words_per_block = 8;
+    constexpr mikos::usize block_size = words_per_block * sizeof(Word);
+    while (size >= block_size) {
+      auto* word_out = reinterpret_cast<Word*>(out);
+      const auto* word_in = reinterpret_cast<const Word*>(in);
+      word_out[0] = word_in[0];
+      word_out[1] = word_in[1];
+      word_out[2] = word_in[2];
+      word_out[3] = word_in[3];
+      word_out[4] = word_in[4];
+      word_out[5] = word_in[5];
+      word_out[6] = word_in[6];
+      word_out[7] = word_in[7];
+      out += block_size;
+      in += block_size;
+      size -= block_size;
+    }
     while (size >= sizeof(Word)) {
       *reinterpret_cast<Word*>(out) = *reinterpret_cast<const Word*>(in);
       out += sizeof(Word);

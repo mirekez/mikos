@@ -29,6 +29,19 @@ void check(mikos::test::Suite& suite, const char* cwd, const char* input,
 
 int main() {
   mikos::test::Suite suite{"kernel/path"};
+  MIKOS_CHECK(suite, path::numbered_suffix("/dev/pts/0", "/dev/pts/", 4) == 0);
+  MIKOS_CHECK(suite, path::numbered_suffix("/dev/pts/3", "/dev/pts/", 4) == 3);
+  MIKOS_CHECK(suite, path::numbered_suffix("/dev/pts/4", "/dev/pts/", 4) ==
+                         path::invalid_number);
+  MIKOS_CHECK(suite,
+              path::numbered_suffix("/proc/self/fd/15", "/proc/self/fd/", 16) ==
+                  15);
+  MIKOS_CHECK(suite,
+              path::numbered_suffix("/proc/self/fd/16", "/proc/self/fd/", 16) ==
+                  path::invalid_number);
+  MIKOS_CHECK(suite,
+              path::numbered_suffix("/proc/self/fd/x", "/proc/self/fd/", 16) ==
+                  path::invalid_number);
   check(suite, "/", "/", "/");
   check(suite, "/", "bin", "/bin");
   check(suite, "/bin", "./stress-ng", "/bin/stress-ng");

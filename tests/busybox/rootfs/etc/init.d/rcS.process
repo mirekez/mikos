@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# Process regressions exercise the foreground BusyBox shell directly. Avoid
+# spending cycle-level simulation time starting the unrelated SSH service.
+echo MIKOS_PROCESS_BOOT

@@ -1,0 +1,140 @@
+diff --git a/tribe/tests/EthGigCPU_test.cpp b/tribe/tests/EthGigCPU_test.cpp
+--- a/tribe/tests/EthGigCPU_test.cpp
++++ b/tribe/tests/EthGigCPU_test.cpp
+@@ -330,6 +330,50 @@ static bool check_rx_retransmission_coalescing()
+     return true;
+ }
+ 
++static bool check_rx_completed_retransmission_coalescing()
++{
++    RGMIIVerif verif;
++    bool evicted = false;
++    bool coalesced = false;
++    constexpr uint64_t key = 0x1234;
++    if (!verif.push_rx_packet_priority_limited(
++            {0xa1}, 4, true, key, evicted, coalesced)) {
++        std::print("EthGig RX recent coalescing ERROR: initial packet failed\n");
++        return false;
++    }
++    verif.step(false, 0, false);
++    verif.step(false, 0, false);
++    if (verif.pending_rx_packets() != 0) {
++        std::print("EthGig RX recent coalescing ERROR: packet did not complete\n");
++        return false;
++    }
++    for (size_t retry = 0; retry < 3; ++retry) {
++        if (!verif.push_rx_packet_priority_limited(
++                {uint8_t(0xb1 + retry)}, 4, true, key, evicted, coalesced) ||
++            evicted || !coalesced || verif.pending_rx_packets() != 0) {
++            std::print("EthGig RX recent coalescing ERROR: retry {} was queued\n",
++                retry + 1);
++            return false;
++        }
++    }
++    // Periodically admit a retransmission so recovery remains possible if the
++    // completed RGMII frame was lost by the guest DMA ring.
++    if (!verif.push_rx_packet_priority_limited(
++            {0xc1}, 4, true, key, evicted, coalesced) || evicted ||
++        coalesced || verif.pending_rx_packets() != 1) {
++        std::print("EthGig RX recent coalescing ERROR: recovery retry dropped\n");
++        return false;
++    }
++    // Distinct TCP work is never suppressed by the recent-key cache.
++    if (!verif.push_rx_packet_priority_limited(
++            {0xd1}, 4, true, 0x5678, evicted, coalesced) || evicted ||
++        coalesced || verif.pending_rx_packets() != 2) {
++        std::print("EthGig RX recent coalescing ERROR: distinct range dropped\n");
++        return false;
++    }
++    return true;
++}
++
+ static bool check_rx_kex_burst_capacity()
+ {
+     if (eth_tap_rx_backlog_capacity < 8) {
+@@ -385,6 +429,7 @@ int main(int argc, char** argv)
+     ok = check_rx_protocol_filter() && ok;
+     ok = check_rx_backlog_preserves_payload() && ok;
+     ok = check_rx_retransmission_coalescing() && ok;
++    ok = check_rx_completed_retransmission_coalescing() && ok;
+     ok = check_rx_kex_burst_capacity() && ok;
+     ok = check_tx_packet_requires_commit() && ok;
+     if (policy_only) {
+diff --git a/tribe/verif/RGMIIVerif.h b/tribe/verif/RGMIIVerif.h
+--- a/tribe/verif/RGMIIVerif.h
++++ b/tribe/verif/RGMIIVerif.h
+@@ -10,9 +10,16 @@ using namespace cpphdl;
+ 
+ class RGMIIVerif
+ {
++    struct RecentRxKey
++    {
++        uint64_t key;
++        uint8_t suppressions_remaining;
++    };
++
+     std::deque<std::vector<uint8_t>> rx_packets;
+     std::deque<bool> rx_packet_priority;
+     std::deque<uint64_t> rx_packet_keys;
++    std::deque<RecentRxKey> recent_rx_keys;
+     std::vector<uint8_t> tx_packet;
+     std::vector<std::vector<uint8_t>> tx_packets;
+     bool rx_have_low = false;
+@@ -22,6 +29,26 @@ class RGMIIVerif
+     bool rx_packet_started = false;
+     uint8_t tx_byte = 0;
+ 
++    static constexpr size_t recent_rx_key_capacity = 16;
++    static constexpr uint8_t recent_rx_suppressions = 3;
++
++    void remember_completed_rx_key(uint64_t key)
++    {
++        if (key == 0) {
++            return;
++        }
++        for (auto it = recent_rx_keys.begin(); it != recent_rx_keys.end(); ++it) {
++            if (it->key == key) {
++                recent_rx_keys.erase(it);
++                break;
++            }
++        }
++        if (recent_rx_keys.size() >= recent_rx_key_capacity) {
++            recent_rx_keys.pop_front();
++        }
++        recent_rx_keys.push_back({key, recent_rx_suppressions});
++    }
++
+ public:
+     bool rgmii_rx_ctl = false;
+     uint8_t rgmii_rxd = 0;
+@@ -63,6 +90,20 @@ public:
+                     return true;
+                 }
+             }
++            if (priority) {
++                for (auto it = recent_rx_keys.begin(); it != recent_rx_keys.end(); ++it) {
++                    if (it->key != key) {
++                        continue;
++                    }
++                    if (it->suppressions_remaining != 0) {
++                        --it->suppressions_remaining;
++                        coalesced = true;
++                        return true;
++                    }
++                    recent_rx_keys.erase(it);
++                    break;
++                }
++            }
+         }
+         if (max_packets != 0 && rx_packets.size() >= max_packets) {
+             size_t first_pending = rx_packet_started ? 1 : 0;
+@@ -131,6 +172,9 @@ public:
+                     packet.erase(packet.begin());
+                     tx_high = false;
+                     if (packet.empty()) {
++                        if (rx_packet_priority.front()) {
++                            remember_completed_rx_key(rx_packet_keys.front());
++                        }
+                         rx_packets.pop_front();
+                         rx_packet_priority.pop_front();
+                         rx_packet_keys.pop_front();

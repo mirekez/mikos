@@ -90,5 +90,25 @@ int main() {
   MIKOS_CHECK(suite, another.status == PipeStatus::success);
   MIKOS_CHECK(suite, pipes.create().status == PipeStatus::no_space);
 
+  // Dropbear retains a signal pipe and a listener child-status pipe while it
+  // allocates stdin, stdout, and stderr pipes for a remote command. Guard the
+  // five simultaneously live pipe objects required before command fork.
+  PipeTable<5, 8, 4> ssh_pipes;
+  PipeHandle ssh_handles[5]{};
+  for (auto& ssh_handle : ssh_handles) {
+    const auto ssh_pipe = ssh_pipes.create();
+    MIKOS_CHECK(suite, ssh_pipe.status == PipeStatus::success);
+    ssh_handle = ssh_pipe.handle;
+  }
+  MIKOS_CHECK(suite, ssh_pipes.used() == 5);
+  MIKOS_CHECK(suite, ssh_pipes.create().status == PipeStatus::no_space);
+  for (const auto ssh_handle : ssh_handles) {
+    MIKOS_CHECK(suite, ssh_pipes.release(ssh_handle, PipeEnd::read) ==
+                           PipeStatus::success);
+    MIKOS_CHECK(suite, ssh_pipes.release(ssh_handle, PipeEnd::write) ==
+                           PipeStatus::success);
+  }
+  MIKOS_CHECK(suite, ssh_pipes.used() == 0);
+
   return suite.finish();
 }

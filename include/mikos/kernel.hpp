@@ -45,7 +45,9 @@ void restore_busybox_image();
 [[nodiscard]] bool replace_with_executable(TrapFrame& frame,
                                            const char* path,
                                            const char* const* arguments,
-                                           u32 argument_count);
+                                           u32 argument_count,
+                                           const char* const* environment = nullptr,
+                                           u32 environment_count = 0);
 
 }  // namespace mikos
 

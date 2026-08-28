@@ -189,7 +189,7 @@ int main() {
   // essential for SSH, which emits adjacent identification/KEX records and
   // cannot recover if either TCP segment is silently lost by the polling NIC.
   const u32 before_response_retry = transmit_count;
-  for (u32 i = 0; i < 255; ++i) {
+  for (u32 i = 0; i < transmit_initial_retry_polls - 1; ++i) {
     poll();
   }
   MIKOS_CHECK(suite, transmit_count == before_response_retry);
@@ -200,6 +200,11 @@ int main() {
   MIKOS_CHECK(suite, net32(response_retry.tcp->sequence) ==
                          server_sequence + 1);
   MIKOS_CHECK(suite, response_retry.payload_size == sizeof(response));
+  const u32 after_first_retry = transmit_count;
+  for (u32 i = 0; i < transmit_initial_retry_polls; ++i) {
+    poll();
+  }
+  MIKOS_CHECK(suite, transmit_count == after_first_retry);
 
   // Two writes occupy distinct sequence-keyed slots. A cumulative ACK of the
   // first must leave only the second eligible for retransmission.
@@ -230,15 +235,24 @@ int main() {
   MIKOS_CHECK(suite, transmitted_tcp(second_followup_view));
   MIKOS_CHECK(suite, net32(second_followup_view.tcp->sequence) ==
                          server_sequence + 8);
-  make_packet(tcp_ack, 1005, server_sequence + 8);
-  poll();
-  const u32 before_second_retry = transmit_count;
-  for (u32 i = 0; i < 254; ++i) {
+  const u32 before_ordered_retry = transmit_count;
+  for (u32 i = 0; i < transmit_initial_retry_polls - 1; ++i) {
     poll();
   }
-  MIKOS_CHECK(suite, transmit_count == before_second_retry);
+  MIKOS_CHECK(suite, transmit_count == before_ordered_retry);
   poll();
-  MIKOS_CHECK(suite, transmit_count == before_second_retry + 1);
+  MIKOS_CHECK(suite, transmit_count == before_ordered_retry + 1);
+  TcpView first_followup_retry{};
+  MIKOS_CHECK(suite, transmitted_tcp(first_followup_retry));
+  MIKOS_CHECK(suite, net32(first_followup_retry.tcp->sequence) ==
+                         server_sequence + 5);
+  MIKOS_CHECK(suite,
+              first_followup_retry.payload_size == sizeof(first_followup));
+
+  const u32 before_first_followup_ack = transmit_count;
+  make_packet(tcp_ack, 1005, server_sequence + 8);
+  poll();
+  MIKOS_CHECK(suite, transmit_count == before_first_followup_ack + 1);
   TcpView second_retry{};
   MIKOS_CHECK(suite, transmitted_tcp(second_retry));
   MIKOS_CHECK(suite, net32(second_retry.tcp->sequence) ==
@@ -249,8 +263,8 @@ int main() {
   poll();
 
   // If the polling NIC cannot send the immediate ACK, a later poll retries it.
-  // One further duplicate is retained for a silent compute interval, but no
-  // third duplicate is emitted (which could trigger fast retransmit).
+  // A successful retry clears the pending attempt; it must not emit a duplicate
+  // ACK into the single cycle-level TX/RX datapath.
   const u8 slow_request[]{'x'};
   transmit_failures = 1;
   make_packet(tcp_ack | tcp_psh, 1005, server_sequence + 10, slow_request,
@@ -265,9 +279,7 @@ int main() {
   MIKOS_CHECK(suite, retried_ack.tcp->flags == tcp_ack);
   MIKOS_CHECK(suite, net32(retried_ack.tcp->acknowledgement) == 1006);
   poll();
-  MIKOS_CHECK(suite, transmit_count == before_failed_ack + 2);
-  poll();
-  MIKOS_CHECK(suite, transmit_count == before_failed_ack + 2);
+  MIKOS_CHECK(suite, transmit_count == before_failed_ack + 1);
   MIKOS_CHECK(suite,
               socket_read(accepted.handle, input, sizeof(input)).size == 1);
 

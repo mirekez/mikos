@@ -2,6 +2,7 @@
 
 #include <mikos/base.hpp>
 #include <mikos/io/ring_buffer.hpp>
+#include <mikos/process/signal.hpp>
 
 namespace mikos::process_model {
 
@@ -29,6 +30,7 @@ enum class PtyStatus : u8 {
 struct PtyIoResult {
   PtyStatus status{PtyStatus::bad_handle};
   u32 size{};
+  u64 generated_signals{};
 };
 
 struct TermiosState {
@@ -108,6 +110,28 @@ class PtyTable {
             PtyHandle{pty.generation, static_cast<u8>(number)}};
   }
 
+  [[nodiscard]] constexpr OpenResult open_controlling_slave(u32 session) {
+    if (session == 0) {
+      return {PtyStatus::bad_handle, {}};
+    }
+    for (u32 i = 0; i < TableCapacity; ++i) {
+      auto& pty = ptys_[i];
+      if (!pty.used || pty.session != session) {
+        continue;
+      }
+      if (pty.locked) {
+        return {PtyStatus::locked, {}};
+      }
+      if (pty.slaves == 0xffff) {
+        return {};
+      }
+      ++pty.slaves;
+      return {PtyStatus::success,
+              PtyHandle{pty.generation, static_cast<u8>(i)}};
+    }
+    return {PtyStatus::bad_handle, {}};
+  }
+
   [[nodiscard]] constexpr PtyStatus retain(PtyHandle handle, PtyEnd end) {
     auto* pty = find(handle);
     if (pty == nullptr) {
@@ -175,9 +199,66 @@ class PtyTable {
     }
     auto& ring = end == PtyEnd::master ? pty->master_to_slave
                                        : pty->slave_to_master;
-    const u32 amount = ring.write(input, count);
-    return amount == 0 ? PtyIoResult{PtyStatus::would_block, 0}
-                       : PtyIoResult{PtyStatus::success, amount};
+    if (end == PtyEnd::slave) {
+      const u32 amount = ring.write(input, count);
+      return amount == 0 ? PtyIoResult{PtyStatus::would_block, 0}
+                         : PtyIoResult{PtyStatus::success, amount};
+    }
+
+    // Input written to a PTY master passes through the slave's line
+    // discipline. Honour the signal-generating characters even though the
+    // rest of MikOS's bounded line discipline is deliberately minimal.
+    constexpr u32 isig = 0x00000001;
+    constexpr u32 echo = 0x00000008;
+    constexpr u32 noflsh = 0x00000080;
+    constexpr u32 echoctl = 0x00000200;
+    constexpr u8 vintr = 0;
+    constexpr u8 vquit = 1;
+    constexpr u8 vsusp = 10;
+    constexpr u8 disabled = 0;
+    u32 consumed = 0;
+    u64 generated_signals = 0;
+    for (; consumed < count; ++consumed) {
+      const u8 character = input[consumed];
+      u8 signal = 0;
+      if ((pty->termios.local_flags & isig) != 0) {
+        if (pty->termios.control[vintr] != disabled &&
+            character == pty->termios.control[vintr]) {
+          signal = signal_interrupt;
+        } else if (pty->termios.control[vquit] != disabled &&
+                   character == pty->termios.control[vquit]) {
+          signal = signal_quit;
+        } else if (pty->termios.control[vsusp] != disabled &&
+                   character == pty->termios.control[vsusp]) {
+          signal = signal_tty_stop;
+        }
+      }
+      if (signal == 0) {
+        if (ring.full()) {
+          break;
+        }
+        static_cast<void>(ring.write(&character, 1));
+        continue;
+      }
+
+      generated_signals |= SignalState::bit(signal);
+      if ((pty->termios.local_flags & noflsh) == 0) {
+        pty->master_to_slave.clear();
+        pty->slave_to_master.clear();
+      }
+      if ((pty->termios.local_flags & echo) != 0) {
+        if ((pty->termios.local_flags & echoctl) != 0 && character < 32) {
+          const u8 visible[]{'^', static_cast<u8>(character + '@')};
+          static_cast<void>(pty->slave_to_master.write(visible, 2));
+        } else {
+          static_cast<void>(pty->slave_to_master.write(&character, 1));
+        }
+      }
+    }
+    return consumed == 0
+               ? PtyIoResult{PtyStatus::would_block, 0, generated_signals}
+               : PtyIoResult{PtyStatus::success, consumed,
+                             generated_signals};
   }
 
   [[nodiscard]] constexpr PtyStatus acquire_controlling_terminal(
@@ -305,6 +386,22 @@ class PtyTable {
     return count;
   }
 
+  [[nodiscard]] constexpr bool active(u8 number) const {
+    return number < TableCapacity && ptys_[number].used;
+  }
+
+  [[nodiscard]] constexpr u16 mode(u8 number) const {
+    return active(number) ? ptys_[number].mode : 0;
+  }
+
+  [[nodiscard]] constexpr PtyStatus set_mode(u8 number, u16 mode) {
+    if (!active(number)) {
+      return PtyStatus::bad_handle;
+    }
+    ptys_[number].mode = static_cast<u16>(mode & 07777u);
+    return PtyStatus::success;
+  }
+
  private:
   struct Pty {
     io::RingBuffer<BufferCapacity> master_to_slave{};
@@ -316,6 +413,7 @@ class PtyTable {
     u16 generation{};
     u16 masters{};
     u16 slaves{};
+    u16 mode{0666};
     bool used{};
     bool locked{};
   };

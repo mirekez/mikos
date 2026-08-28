@@ -6,6 +6,13 @@ int main() {
   using namespace mikos::process_model;
   mikos::test::Suite suite{"kernel/process_model"};
 
+  // Fork and snapshot restore preserve both halves of the lineage. In
+  // particular, restoring a nested child must not turn its PPID into init.
+  const ProcessLineage shell{4, 3};
+  const auto command = fork_lineage(shell, 5);
+  MIKOS_CHECK(suite, (command == ProcessLineage{5, 4}));
+  MIKOS_CHECK(suite, (shell == ProcessLineage{4, 3}));
+
   ProcessTable<4> table;
   MIKOS_CHECK(suite, table.initialize() == ProcessStatus::success);
   MIKOS_CHECK(suite, table.invariant());
@@ -13,6 +20,36 @@ int main() {
   MIKOS_CHECK(suite, table.address_spaces() == 1);
   MIKOS_CHECK(suite, table.find(1)->process_group == 1);
   MIKOS_CHECK(suite, table.find(1)->session == 1);
+
+  // UART may return a directly backgrounded service to its shell, but must
+  // never park a live connection child below a suspended listener.
+  MIKOS_CHECK(
+      suite, connection_wait_can_yield_to_uart(0));
+  MIKOS_CHECK(
+      suite, !connection_wait_can_yield_to_uart(1));
+  MIKOS_CHECK(
+      suite, !connection_wait_can_yield_to_uart(2));
+
+  // A serialized PTY child yields only from its slave read to its immediate
+  // suspended parent. The parent resumes it after input/EOF makes the slave
+  // readable or a deliverable signal interrupts the wait; unrelated processes
+  // and an active fork frame cannot.
+  MIKOS_CHECK(suite, pty_child_can_park(false, true, true));
+  MIKOS_CHECK(suite, !pty_child_can_park(true, true, true));
+  MIKOS_CHECK(suite, !pty_child_can_park(false, false, true));
+  MIKOS_CHECK(suite, !pty_child_can_park(false, true, false));
+  MIKOS_CHECK(suite,
+              pty_child_can_resume(true, 3, 3, false, true, false));
+  MIKOS_CHECK(suite,
+              pty_child_can_resume(true, 3, 3, false, false, true));
+  MIKOS_CHECK(suite,
+              !pty_child_can_resume(false, 3, 3, false, true, true));
+  MIKOS_CHECK(suite,
+              !pty_child_can_resume(true, 2, 3, false, true, true));
+  MIKOS_CHECK(suite,
+              !pty_child_can_resume(true, 3, 3, true, true, true));
+  MIKOS_CHECK(suite,
+              !pty_child_can_resume(true, 3, 3, false, false, false));
 
   auto first = table.fork(1);
   MIKOS_CHECK(suite, first.status == ProcessStatus::success);

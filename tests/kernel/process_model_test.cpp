@@ -31,9 +31,9 @@ int main() {
       suite, !connection_wait_can_yield_to_uart(2));
 
   // A serialized PTY child yields only from its slave read to its immediate
-  // suspended parent. The parent resumes it after input/EOF makes the slave
-  // readable or a deliverable signal interrupts the wait; unrelated processes
-  // and an active fork frame cannot.
+  // suspended parent or an explicitly recorded PTY-master relay. Input/EOF or
+  // a deliverable signal makes it resumable; unrelated processes and an
+  // active fork frame cannot.
   MIKOS_CHECK(suite, pty_child_can_park(false, true, true));
   MIKOS_CHECK(suite, !pty_child_can_park(true, true, true));
   MIKOS_CHECK(suite, !pty_child_can_park(false, false, true));
@@ -50,6 +50,15 @@ int main() {
               !pty_child_can_resume(true, 3, 3, true, true, true));
   MIKOS_CHECK(suite,
               !pty_child_can_resume(true, 3, 3, false, false, false));
+  // A foreground program such as top is parented by the waiting shell, while
+  // the Dropbear grandparent owns the PTY master. That explicitly recorded
+  // service process may resume it; unrelated ancestors still may not.
+  MIKOS_CHECK(suite,
+              pty_child_can_resume(true, 3, 4, false, true, false, 3));
+  MIKOS_CHECK(suite,
+              !pty_child_can_resume(true, 2, 4, false, true, false, 3));
+  MIKOS_CHECK(suite,
+              !pty_child_can_resume(true, 3, 4, true, true, false, 3));
 
   auto first = table.fork(1);
   MIKOS_CHECK(suite, first.status == ProcessStatus::success);

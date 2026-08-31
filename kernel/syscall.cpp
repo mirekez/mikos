@@ -187,6 +187,11 @@ struct ParkedInteractiveChild {
 };
 
 ParkedInteractiveChild interactive_child{};
+// When a foreground program below the shell blocks on the PTY, its immediate
+// parent is the waiting shell rather than Dropbear. Preserve that parent fork
+// frame while the nearest PTY-master owner services the connection.
+SuspendedParent interactive_parent{};
+u32 interactive_relay_service_pid{};
 
 [[maybe_unused, nodiscard]] bool user_string_is(u32 address,
                                                 const char* expected);
@@ -553,11 +558,48 @@ Descriptor nested_ancestor_descriptors[nested_ancestor_capacity][13]{};
 Descriptor nested_ancestor_standard_redirects[nested_ancestor_capacity][3]{};
 Descriptor interactive_child_descriptors[13]{};
 Descriptor interactive_child_standard_redirects[3]{};
+Descriptor interactive_parent_descriptors[13]{};
+Descriptor interactive_parent_standard_redirects[3]{};
 // A Dropbear command session holds its signal pipe and listener child-status
 // pipe while creating stdin, stdout, and stderr pipes for the remote command.
 // Keep spare bounded slots for cleanup/reaping paths and future PTY helpers.
 process_model::PipeTable<8> pipes{};
 process_model::PtyTable<4> ptys{};
+
+[[nodiscard]] bool owns_pty_master(
+    const Descriptor* saved, const Descriptor* saved_standard,
+    process_model::PtyHandle handle) {
+  for (u32 i = 0; i < 13; ++i) {
+    if (saved[i].node == Node::pty && saved[i].pty == handle &&
+        saved[i].pty_end == process_model::PtyEnd::master) {
+      return true;
+    }
+  }
+  for (u32 i = 0; i < 3; ++i) {
+    if (saved_standard[i].node == Node::pty &&
+        saved_standard[i].pty == handle &&
+        saved_standard[i].pty_end == process_model::PtyEnd::master) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] bool parent_owns_pty_master(
+    process_model::PtyHandle handle) {
+  return owns_pty_master(parent_descriptors,
+                         parent_standard_redirects, handle);
+}
+
+[[nodiscard]] bool nearest_ancestor_owns_pty_master(
+    process_model::PtyHandle handle) {
+  if (nested_ancestor_depth == 0) {
+    return false;
+  }
+  const u32 level = nested_ancestor_depth - 1;
+  return owns_pty_master(nested_ancestor_descriptors[level],
+                         nested_ancestor_standard_redirects[level], handle);
+}
 
 [[nodiscard]] u32 queue_process_group_signal(u32 process_group, u8 signal) {
   if (process_group == 0 || !process_model::SignalState::valid(signal)) {
@@ -792,6 +834,13 @@ void capture_interactive_child(TrapFrame& frame,
           wait_end == process_model::PtyEnd::slave)) {
     return false;
   }
+  const bool direct_parent_services_pty = parent_owns_pty_master(wait_pty);
+  const bool relay_through_ancestor =
+      !direct_parent_services_pty && !interactive_parent.active &&
+      nearest_ancestor_owns_pty_master(wait_pty);
+  if (!direct_parent_services_pty && !relay_through_ancestor) {
+    return false;
+  }
   capture_interactive_child(frame, wait_pty, wait_end);
   if (!save_interactive_child_memory()) {
 #ifdef MIKOS_TRIBE_INTERACTIVE
@@ -808,6 +857,44 @@ void capture_interactive_child(TrapFrame& frame,
   }
   move_active_descriptors(interactive_child_descriptors,
                           interactive_child_standard_redirects);
+  if (relay_through_ancestor) {
+    // Keep the waiting shell as the blocked program's immediate parent, but
+    // temporarily restore the Dropbear ancestor that owns the PTY master.
+    // On input, resume_interactive_child_if_ready() stacks Dropbear again,
+    // reinstates this fork frame, and only then restores the blocked program.
+    interactive_parent = parent;
+    for (u32 i = 0; i < 13; ++i) {
+      interactive_parent_descriptors[i] = parent_descriptors[i];
+      parent_descriptors[i] = {};
+    }
+    for (u32 i = 0; i < 3; ++i) {
+      interactive_parent_standard_redirects[i] =
+          parent_standard_redirects[i];
+      parent_standard_redirects[i] = {};
+    }
+    const u32 level = --nested_ancestor_depth;
+    parent = nested_ancestors[level];
+    nested_ancestors[level] = {};
+    for (u32 i = 0; i < 13; ++i) {
+      parent_descriptors[i] = nested_ancestor_descriptors[level][i];
+      nested_ancestor_descriptors[level][i] = {};
+    }
+    for (u32 i = 0; i < 3; ++i) {
+      parent_standard_redirects[i] =
+          nested_ancestor_standard_redirects[level][i];
+      nested_ancestor_standard_redirects[level][i] = {};
+    }
+    interactive_relay_service_pid = parent.lineage.pid;
+#ifdef MIKOS_TRIBE_INTERACTIVE
+    write_text("MIKOS:PTY_CHILD_RELAY child=");
+    write_u32(interactive_child.pid);
+    write_text(" parent=");
+    write_u32(interactive_parent.lineage.pid);
+    write_text(" service=");
+    write_u32(interactive_relay_service_pid);
+    write_text("\n");
+#endif
+  }
 #ifdef MIKOS_TRIBE_INTERACTIVE
   write_text("MIKOS:PTY_CHILD_PARK child=");
   write_u32(interactive_child.pid);
@@ -834,9 +921,13 @@ void capture_interactive_child(TrapFrame& frame,
   const bool wait_interrupted =
       interactive_child.used &&
       interactive_child.signals.has_deliverable();
+  const bool relayed = interactive_parent.active;
   if (!process_model::pty_child_can_resume(
           interactive_child.used, process.pid, interactive_child.parent_pid,
-          parent.active, slave_readable, wait_interrupted) ||
+          parent.active, slave_readable, wait_interrupted,
+          relayed ? interactive_relay_service_pid
+                  : process_model::invalid_pid) ||
+      (relayed && nested_ancestor_depth == nested_ancestor_capacity) ||
       !save_parent_descriptors()) {
     return false;
   }
@@ -847,7 +938,8 @@ void capture_interactive_child(TrapFrame& frame,
   parent.mmap_cursor = process.mmap_cursor;
   parent.mutable_begin = process.mutable_begin;
   parent.stack_begin = align_down(frame.x[2], static_cast<u32>(16));
-  parent.child_pid = interactive_child.pid;
+  parent.child_pid =
+      relayed ? interactive_parent.lineage.pid : interactive_child.pid;
   parent.lineage = {process.pid, process.parent_pid};
   parent.child_tid_address = child_tid_address;
   parent.process_group = process.process_group;
@@ -866,6 +958,28 @@ void capture_interactive_child(TrapFrame& frame,
     parent.active = false;
     discard_parent_descriptors();
     return false;
+  }
+
+  if (relayed) {
+    // The active PTY server belongs below the waiting shell in the suspended
+    // ancestry. Stack it, then restore the shell as the interactive program's
+    // immediate parent so normal exit/wait/SIGCHLD semantics remain intact.
+    if (!stack_suspended_ancestor()) {
+      write_text("MIKOS:PTY_CHILD_RELAY_STACK_FAIL\n");
+      shutdown(9);
+    }
+    parent = interactive_parent;
+    interactive_parent = {};
+    for (u32 i = 0; i < 13; ++i) {
+      parent_descriptors[i] = interactive_parent_descriptors[i];
+      interactive_parent_descriptors[i] = {};
+    }
+    for (u32 i = 0; i < 3; ++i) {
+      parent_standard_redirects[i] =
+          interactive_parent_standard_redirects[i];
+      interactive_parent_standard_redirects[i] = {};
+    }
+    interactive_relay_service_pid = 0;
   }
 
   const u32 child_pid = interactive_child.pid;

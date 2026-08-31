@@ -148,11 +148,16 @@ before the first KEX reply and leave UART input pending until
 SSH child stays resident instead of being incorrectly parked in favor of its
 listener.
 The second client is a true interactive login shell: it forces `-t`, waits for
-each remote prompt through a local PTY, verifies Ctrl+C recovery, prints
-`SSH_TTY`, and runs `ls /`. The harness deliberately withholds its next input
-until `ls` has exited and the shell has parked again. This catches lineage
-restore bugs where the shell's PPID becomes zero and later keystrokes can no
-longer wake it. A single Ctrl+D at that empty prompt performs clean logout
+the remote prompt through a local PTY, verifies Ctrl+C recovery, prints
+`SSH_TTY`, runs `ls /`, and then starts interactive `top`. The shell consumes
+those command lines from one batch so the host PTY cannot turn a short command
+into several multi-minute executable swaps. `top` still starts only after
+`ls` exits, blocks one fork level below the waiting shell, and must relay its
+PTY wait through that shell to Dropbear. The harness sends `1`, requires a
+rendered memory summary and a second relay, sends `q`, then requires the `top`
+zombie to be reaped and the shell to park at a fresh prompt. This catches both
+lineage bugs where PPID becomes zero and one-way PTY handoffs that cannot
+restore the shell. A single Ctrl+D at that empty prompt performs clean logout
 without dbclient splitting a longer `exit` line into expensive character-sized
 handoffs. The test also requires `/proc/self/fd/<n>` resolution and
 `/dev/pts/<n>` identity checks. `TRIBE_INTERACTIVE_SSH_PTY_ONLY=1` runs this

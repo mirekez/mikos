@@ -29,9 +29,10 @@ struct ProcessLineage {
 }
 
 // The flat interactive adapter may temporarily run a PTY server while its
-// child is blocked on the slave. Only the immediate parent may resume that
-// child, and only when the slave read can complete. An already-active fork
-// parent means the child is running, not parked.
+// child is blocked on the slave. Usually the immediate parent resumes it; a
+// foreground app below a waiting shell can instead record the PTY-master
+// service ancestor as an explicit relay. An already-active fork parent means
+// the child is running, not parked.
 [[nodiscard]] constexpr bool pty_child_can_park(bool child_already_parked,
                                                  bool parent_active,
                                                  bool slave_endpoint) {
@@ -43,8 +44,13 @@ struct ProcessLineage {
                                                    u32 child_parent_pid,
                                                    bool parent_active,
                                                    bool slave_readable,
-                                                   bool wait_interrupted) {
-  return child_parked && current_pid == child_parent_pid && !parent_active &&
+                                                   bool wait_interrupted,
+                                                   u32 relay_service_pid =
+                                                       invalid_pid) {
+  const bool correct_resumer =
+      current_pid == child_parent_pid ||
+      (relay_service_pid != invalid_pid && current_pid == relay_service_pid);
+  return child_parked && correct_resumer && !parent_active &&
          (slave_readable || wait_interrupted);
 }
 

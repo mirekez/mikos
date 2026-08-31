@@ -194,6 +194,28 @@ wait_for_log_count() {
   return 1
 }
 
+wait_for_ssh_log() {
+  local marker="$1"
+  local deadline=$((SECONDS + wall_timeout))
+  while ((SECONDS < deadline)); do
+    if rg -q "$marker" "$ssh_log" 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "$simulator_pid" 2>/dev/null ||
+       ! kill -0 "$ssh_pid" 2>/dev/null; then
+      sed -n '1,620p' "$log" >&2
+      sed -n '1,320p' "$ssh_log" >&2
+      echo "SSH session exited before client-output marker: $marker" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  sed -n '1,620p' "$log" >&2
+  sed -n '1,320p' "$ssh_log" >&2
+  echo "timed out waiting for SSH client-output marker: $marker" >&2
+  return 1
+}
+
 start_ssh_client() {
   local remote_marker="$1"
   local request_pty="${2:-0}"
@@ -318,6 +340,7 @@ exercise_interactive_shell() {
   local park_count
   local resume_count
   local child_exit_count
+  local relay_count
 
   # Wait until dbclient has switched its local pseudo-terminal to raw mode and
   # the remote shell is blocked at its first prompt. VINTR sent earlier is
@@ -336,22 +359,49 @@ exercise_interactive_shell() {
   wait_for_log_count 'MIKOS:PTY_CHILD_RESUME child=' "$((resume_count + 1))"
   wait_for_log_count 'MIKOS:PTY_CHILD_PARK child=' "$((park_count + 1))"
 
-  # Run ls, then withhold all further input until it has exited and the shell
-  # has printed a new prompt and parked again. This reproduces a human typing
-  # the next command only after seeing that prompt.
+  # Batch the foreground-app command behind ls. util-linux script can split a
+  # command typed after a fresh prompt into one-byte SSH channel packets; each
+  # byte would force a multi-minute Dropbear/BusyBox image swap in native C++.
+  # BusyBox consumes this batch one line at a time, so top still starts only
+  # after ls exits and exercises the identical nested PTY-blocking state.
+  relay_count="$(rg -c 'MIKOS:PTY_CHILD_RELAY child=' "$log" 2>/dev/null || true)"
   printf '%s\n' \
     'printf '\''%s\n'\'' "$SSH_TTY"' \
-    'ls /' >&"$ssh_input_fd"
+    'ls /' \
+    'top' >&"$ssh_input_fd"
   wait_for_log 'MIKOS:NESTED_CLONE_STACK depth=3'
   wait_for_log 'MIKOS:EXEC pid=[1-9][0-9]* path=/bin/(ls|sh).*argv0=ls'
   wait_for_log_count 'MIKOS:CHILD_EXIT pid=[1-9][0-9]* status=0' \
     "$((child_exit_count + 1))"
+  wait_for_log 'MIKOS:EXEC pid=[1-9][0-9]* path=/bin/(top|sh).*argv0=top'
+  wait_for_log_count 'MIKOS:PTY_CHILD_RELAY child=' "$((relay_count + 1))"
   wait_for_log_count 'MIKOS:PTY_CHILD_PARK child=' "$((park_count + 2))"
   if rg -q '^MIKOS:PTY_CHILD_PARK child=[1-9][0-9]* parent=0([[:space:]]|$)' \
       "$log"; then
     echo "FAIL: nested command restored the SSH shell with PPID 0" >&2
     return 1
   fi
+
+  # A full-screen foreground app blocks one process level below the shell.
+  # Its PTY wait must relay past that waiting shell to Dropbear, then rebuild
+  # the same ancestry when input arrives. Exercise two top wakeups, its clean
+  # exit, and the restored shell's next prompt so a one-way handoff cannot
+  # pass.
+  park_count="$(rg -c 'MIKOS:PTY_CHILD_PARK child=' "$log" 2>/dev/null || true)"
+  resume_count="$(rg -c 'MIKOS:PTY_CHILD_RESUME child=' "$log" 2>/dev/null || true)"
+  child_exit_count="$(rg -c 'MIKOS:CHILD_EXIT pid=[1-9][0-9]* status=0' \
+    "$log" 2>/dev/null || true)"
+  relay_count="$(rg -c 'MIKOS:PTY_CHILD_RELAY child=' "$log" 2>/dev/null || true)"
+  printf '1' >&"$ssh_input_fd"
+  wait_for_log_count 'MIKOS:PTY_CHILD_RESUME child=' "$((resume_count + 1))"
+  wait_for_log_count 'MIKOS:PTY_CHILD_RELAY child=' "$((relay_count + 1))"
+  wait_for_log_count 'MIKOS:PTY_CHILD_PARK child=' "$((park_count + 1))"
+  wait_for_ssh_log 'Mem:'
+  printf 'q' >&"$ssh_input_fd"
+  wait_for_log_count 'MIKOS:PTY_CHILD_RESUME child=' "$((resume_count + 2))"
+  wait_for_log_count 'MIKOS:CHILD_EXIT pid=[1-9][0-9]* status=0' \
+    "$((child_exit_count + 1))"
+  wait_for_log_count 'MIKOS:PTY_CHILD_PARK child=' "$((park_count + 2))"
 
   # EOF at an empty interactive prompt is a one-byte clean logout. A longer
   # `exit\n` transcript can be split by dbclient into character-sized SSH

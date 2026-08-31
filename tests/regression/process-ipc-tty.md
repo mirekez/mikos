@@ -29,8 +29,9 @@ Current executable gates:
   background Dropbear listen/accept and none-mode test authentication, nested
   external `ls` fork in an interactive address space, zombie publication,
   caught `SIGCHLD` delivery through an RV32 Linux-compatible signal frame,
-  `rt_sigreturn`, `waitpid` reaping, remote output, exit status, and clean SSH
-  channel close.
+  `rt_sigreturn`, `waitpid` reaping, foreground `top` blocking below its
+  waiting shell, two PTY-master relay/wake cycles, full-screen output, shell
+  restoration after `q`, exit status, and clean SSH channel close.
 - All four RV32 kernels compile the live `pipe2`, signal-mask/action,
   process-group/session, `/dev/ptmx`, `/dev/pts/N`, PTY I/O, and terminal-ioctl
   adapters with freestanding warnings treated as errors.

@@ -1,17 +1,19 @@
-# MikOS
+# mikOS
 
-Lightweight C++ replacement for Linux without MMU/TLB, exceptions and interrupts.
+Lightweight C++ replacement for Linux without MMU/TLB, exceptions and interrupts to fit in 512kB.
 
 Mikos is an experimental, test-driven operating system with a minimal
 mechanism-only kernel, flat-memory architecture profiles, polling instead of
 ordinary device interrupts, and generated Linux syscall ABI tables.
 
+![](doc/architecture.png)
+
 Start with:
 
 - [Requirements](REQUIREMENTS.md)
 - [Development plan](PLAN.md)
-- [RV32 BusyBox proof of concept](docs/poc-rv32.md)
-- [Polling network proof of concept](docs/network-poc.md)
+- [RV32 BusyBox proof of concept](doc/poc-rv32.md)
+- [Polling network proof of concept](doc/network-poc.md)
 - [Regression and acceptance tests](tests/README.md)
 
 The current proof of concept boots on the supplied RV32 QEMU, enters a
@@ -22,7 +24,7 @@ verified four-operation `cpu/loop` workload and reports its own metrics and
 success. A sole CLINT scheduling timer also demonstrably preempts an
 unmodified, non-cooperative U-mode loop before starting BusyBox; the PLIC and
 all device interrupts remain disabled. See
-[the stress-ng integration](docs/stress-ng.md) for the exact supported scope.
+[the stress-ng integration](doc/stress-ng.md) for the exact supported scope.
 
 The first networking slice discovers QEMU's modern virtio-net device over
 virtio-mmio, uses polling-only split queues, assigns the fixed POC address

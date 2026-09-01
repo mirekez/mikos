@@ -286,7 +286,7 @@ $(ETHGIG_TAP): tests/qemu/ethgig_tap.cpp
 	$(CXX) -std=c++2c -Wall -Wextra -Werror $< -o $@
 
 $(QEMU):
-	@echo "QEMU is not built. See docs/poc-rv32.md." >&2
+	@echo "QEMU is not built. See doc/poc-rv32.md." >&2
 	@false
 
 clean:

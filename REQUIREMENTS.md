@@ -1,4 +1,4 @@
-# Mikos Operating System Requirements
+# mikOS Operating System Requirements
 
 Status: initial architecture baseline  
 Language: C++26 and minimal architecture-specific assembly  
@@ -7,13 +7,15 @@ Primary toolchain: Clang/LLVM from the repository's Conda environment
 Primary Linux reference: Linux 6.19, commit
 `05f7e89ab9731565d8a62e3b5d1ec206485eeb0b`, available during initial
 development at `/home/me/cpphdl/tribe/linux/linux-build/linux`. Exact reference
-inputs are recorded in [docs/linux-reference.md](docs/linux-reference.md).
+inputs are recorded in [doc/linux-reference.md](doc/linux-reference.md).
 
 ## 1. Purpose and scope
 
 Mikos is a small, test-driven, Unix-like operating system that exposes Linux
 system-call ABIs while keeping policy, drivers, filesystems, networking, and
 other services outside the kernel.
+
+The whole OS must fit in sub 1MB RAM and should be possible to use it with less RAM like 512kb.
 
 The project has two distinct compatibility objectives:
 
@@ -82,7 +84,7 @@ These are hardware constraints, not implementation preferences:
   flag cannot regain control from an unmodified user task. Strict profiles
   therefore permit one architecture-local scheduling timer interrupt. It may
   preempt U-mode only; the kernel runs with its global interrupt-enable bit
-  clear. See [ADR-0001](docs/adr/0001-scheduling-interrupt.md).
+  clear. See [ADR-0001](doc/adr/0001-scheduling-interrupt.md).
 - **C-005 hosted C++ is not a freestanding kernel runtime.** `std::format` may
   allocate and its specified error path uses `std::format_error`. Kernel use is
   permitted only through a checked, no-failure wrapper with a proven compatible

@@ -41,4 +41,4 @@ Covered by `make tribe-interactive-tcp-test` when `tap-tribe` is configured:
   relying on the nc-1.10 relay's never-ending interactive UART stdin.
 
 The complete rationale and negative-case matrix is maintained in
-`docs/tcp-stream-plan.md`.
+`doc/tcp-stream-plan.md`.

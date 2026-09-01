@@ -1,7 +1,7 @@
 # Process, pipe, signal, and PTY regression inventory
 
 The authoritative exhaustive matrix is
-[docs/process-ipc-tty-plan.md](../../docs/process-ipc-tty-plan.md).  This file
+[doc/process-ipc-tty-plan.md](../../doc/process-ipc-tty-plan.md).  This file
 tracks executable coverage as the phases land.
 
 Current executable gates:

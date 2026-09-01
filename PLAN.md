@@ -24,8 +24,8 @@ brought up in successive gates.
 Current implementation status: the RV32 POC boots without address translation
 or enabled device interrupts, configures PMP, uses one M-mode scheduling timer
 to preempt an uncooperative U-mode loop, and passes
-`busybox echo MIKOS_BUSYBOX_OK`. See `docs/poc-rv32.md` and
-`docs/adr/0001-scheduling-interrupt.md`.
+`busybox echo MIKOS_BUSYBOX_OK`. See `doc/poc-rv32.md` and
+`doc/adr/0001-scheduling-interrupt.md`.
 
 The networking slice passes deterministic host/guest ARP and ICMP exchanges
 using a polling-only modern virtio-net MMIO driver and now includes a bounded
@@ -33,7 +33,7 @@ passive IPv4 TCP/socket path for `SOCK_STREAM`, bind, listen, accept, stream
 I/O, readiness, and `/proc/net/tcp`. Modern/legacy queues and the NIC data path
 are compile-time C++ types shared by the MMIO and PCI transports. The temporary
 kernel stack remains only until user tasks and IPC can host it as a service.
-See `docs/network-poc.md` and `docs/tcp-stream-plan.md`.
+See `doc/network-poc.md` and `doc/tcp-stream-plan.md`.
 
 ## Immediate network vertical slice
 
@@ -58,7 +58,7 @@ The shortest tested route to the requested QEMU login is:
 
 The dependency-ordered process/IPC/terminal work and its rational regression
 matrix are maintained in
-[docs/process-ipc-tty-plan.md](docs/process-ipc-tty-plan.md).  The allocator
+[doc/process-ipc-tty-plan.md](doc/process-ipc-tty-plan.md).  The allocator
 remains deferred: this slice starts with bounded static tables and explicit
 capacity failures.
 
@@ -81,7 +81,7 @@ Deliverables:
 - `ADR-0004`: define the kernel/user formatting policy and whether direct
   `std::format` can ever meet the no-exception kernel rule;
 - confirm the Linux 6.19 reference pin and checked-in input hashes documented in
-  `docs/linux-reference.md`, then select the first libc and executable format
+  `doc/linux-reference.md`, then select the first libc and executable format
   profile;
 - define the initial L1 application suite and quantitative success criteria;
 - write a short threat model and explicitly distinguish functional
@@ -110,7 +110,7 @@ Exit gate:
 Deliverables:
 
 - repository layout for `kernel`, `arch`, `platform`, `services`, `user`,
-  `tests`, `tools`, `generated`, and `docs/adr`;
+  `tests`, `tools`, `generated`, and `doc/adr`;
 - freestanding runtime: entry, linker script, zero/copy initialization, stack,
   panic, bounded trace records, and no global constructors;
 - typed architecture interface for CPU state, privilege transition, cycle

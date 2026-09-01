@@ -49,7 +49,67 @@ int main() {
               ptys.read(master.handle, PtyEnd::master, output, 2).size == 2);
   MIKOS_CHECK(suite, output[0] == 'O' && output[1] == 'K');
 
+  // The slave output discipline starts in cooked mode. OPOST | ONLCR maps
+  // each line feed to CR-LF so a real terminal returns to column zero. The
+  // reported write count remains the number of caller bytes consumed.
+  const mikos::u8 lines[] = {'a', '\n', 'b'};
+  MIKOS_CHECK(suite,
+              ptys.write(slave.handle, PtyEnd::slave, lines, sizeof(lines))
+                      .size == sizeof(lines));
+  MIKOS_CHECK(suite,
+              ptys.read(master.handle, PtyEnd::master, output,
+                        sizeof(output)).size == 4);
+  MIKOS_CHECK(suite, output[0] == 'a' && output[1] == '\r' &&
+                         output[2] == '\n' && output[3] == 'b');
+
+  // A CR-LF expansion is atomic at the ring boundary. With only one slot
+  // left, the newline remains unconsumed and a retry after draining emits
+  // exactly one CR-LF pair.
+  const mikos::u8 almost_full[] = {'0', '1', '2', '3', '4', '5', '6'};
+  MIKOS_CHECK(
+      suite,
+      ptys.write(slave.handle, PtyEnd::slave, almost_full,
+                 sizeof(almost_full)).size == sizeof(almost_full));
+  const mikos::u8 newline[] = {'\n'};
+  MIKOS_CHECK(suite,
+              ptys.write(slave.handle, PtyEnd::slave, newline,
+                         sizeof(newline)).status == PtyStatus::would_block);
+  MIKOS_CHECK(suite,
+              ptys.read(master.handle, PtyEnd::master, output,
+                        sizeof(output)).size == sizeof(almost_full));
+  MIKOS_CHECK(suite,
+              ptys.write(slave.handle, PtyEnd::slave, newline,
+                         sizeof(newline)).size == sizeof(newline));
+  MIKOS_CHECK(suite,
+              ptys.read(master.handle, PtyEnd::master, output,
+                        sizeof(output)).size == 2);
+  MIKOS_CHECK(suite, output[0] == '\r' && output[1] == '\n');
+
+  // Clearing either OPOST or ONLCR disables conversion.
+  TermiosState unprocessed = *ptys.termios(master.handle);
+  unprocessed.output_flags &= ~0x00000001u;
+  MIKOS_CHECK(suite, ptys.set_termios(slave.handle, unprocessed) ==
+                         PtyStatus::success);
+  MIKOS_CHECK(suite,
+              ptys.write(slave.handle, PtyEnd::slave, newline,
+                         sizeof(newline)).size == sizeof(newline));
+  MIKOS_CHECK(suite,
+              ptys.read(master.handle, PtyEnd::master, output,
+                        sizeof(output)).size == 1);
+  MIKOS_CHECK(suite, output[0] == '\n');
+  unprocessed.output_flags = 0x00000001;  // OPOST without ONLCR
+  MIKOS_CHECK(suite, ptys.set_termios(slave.handle, unprocessed) ==
+                         PtyStatus::success);
+  MIKOS_CHECK(suite,
+              ptys.write(slave.handle, PtyEnd::slave, newline,
+                         sizeof(newline)).size == sizeof(newline));
+  MIKOS_CHECK(suite,
+              ptys.read(master.handle, PtyEnd::master, output,
+                        sizeof(output)).size == 1);
+  MIKOS_CHECK(suite, output[0] == '\n');
+
   TermiosState raw = *ptys.termios(master.handle);
+  raw.output_flags = 0x00000005;
   raw.local_flags = 0;
   MIKOS_CHECK(suite, ptys.set_termios(slave.handle, raw) == PtyStatus::success);
   MIKOS_CHECK(suite, *ptys.termios(master.handle) == raw);

@@ -200,9 +200,36 @@ class PtyTable {
     auto& ring = end == PtyEnd::master ? pty->master_to_slave
                                        : pty->slave_to_master;
     if (end == PtyEnd::slave) {
-      const u32 amount = ring.write(input, count);
-      return amount == 0 ? PtyIoResult{PtyStatus::would_block, 0}
-                         : PtyIoResult{PtyStatus::success, amount};
+      // Output written through the slave passes through the terminal output
+      // discipline. Linux PTYs start with OPOST | ONLCR, which turns a line
+      // feed into CR-LF. Without that conversion a terminal moves down but
+      // stays in the current column, producing increasingly indented output.
+      constexpr u32 opost = 0x00000001;
+      constexpr u32 onlcr = 0x00000004;
+      const bool translate_newline =
+          (pty->termios.output_flags & (opost | onlcr)) == (opost | onlcr);
+      u32 consumed = 0;
+      while (consumed < count) {
+        const u8 character = input[consumed];
+        if (translate_newline && character == '\n') {
+          // Treat the expansion atomically. Returning a partial CR here
+          // would make a retry of the same input byte produce CR-CR-LF.
+          if (ring.free_space() < 2) {
+            break;
+          }
+          const u8 newline[]{'\r', '\n'};
+          static_cast<void>(ring.write(newline, sizeof(newline)));
+        } else {
+          if (ring.full()) {
+            break;
+          }
+          static_cast<void>(ring.write(&character, 1));
+        }
+        ++consumed;
+      }
+      return consumed == 0
+                 ? PtyIoResult{PtyStatus::would_block, 0}
+                 : PtyIoResult{PtyStatus::success, consumed};
     }
 
     // Input written to a PTY master passes through the slave's line

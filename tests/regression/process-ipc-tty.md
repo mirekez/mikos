@@ -14,7 +14,8 @@ Current executable gates:
 - `tests/kernel/signal_test.cpp`: disposition/mask validation, pending-signal
   coalescing, unblock delivery, uncatchable signals, and default actions.
 - `tests/kernel/pty_test.cpp`: PTY allocation/locking, bidirectional rings,
-  termios and winsize state, foreground groups, hangup, and slot reuse.
+  termios and winsize state, atomic `OPOST | ONLCR` output conversion at ring
+  boundaries, foreground groups, hangup, and slot reuse.
 - `tests/kernel/snapshot_arena_test.cpp`: exact-sized fork-snapshot allocation,
   alignment, an allocation above the removed 512 KiB per-level limit,
   exhaustion, out-of-order release, fragmentation, two-sided coalescing,

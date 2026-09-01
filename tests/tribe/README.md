@@ -164,6 +164,13 @@ handoffs. The test also requires `/proc/self/fd/<n>` resolution and
 interactive PTY exchange as the first and only session for a shorter focused
 regression.
 
+PTY slave output applies the negotiated terminal output modes. In the default
+`OPOST | ONLCR` mode, each line feed is atomically expanded to CR-LF before it
+reaches Dropbear. This is required because dbclient puts the host terminal in
+raw mode: forwarding bare line feeds would move the cursor down without
+returning it to column zero, making `top` and ordinary multiline output drift
+diagonally across the screen.
+
 Do not start a second Dropbear after `MIKOS:TCP_LISTEN 22` and
 `MIKOS:BACKGROUND_PARK 2`; those markers mean the original service is alive.
 The interactive kernel rejects a duplicate execution with `ETXTBSY` instead

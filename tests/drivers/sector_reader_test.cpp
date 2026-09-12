@@ -98,6 +98,13 @@ int main() {
     MIKOS_CHECK(suite, written[index] == replacement[index]);
   }
   MIKOS_CHECK(suite, reader.flush());
+  std::array<u8, 3> bounded{};
+  MIKOS_CHECK(suite, reader.read(14, std::span{bounded}));
+  MIKOS_CHECK(suite, bounded[0] == replacement[0]);
+  MIKOS_CHECK(suite, reader.write(14, std::span<const u8>{bounded}));
+  MIKOS_CHECK(suite, reader.read(reader.size(), std::span<u8>{}));
+  MIKOS_CHECK(suite, !reader.read(reader.size() + 1, std::span<u8>{}));
+  MIKOS_CHECK(suite, !reader.read(reader.size() - 1, std::span{bounded}));
   device.fail(true);
   reader.invalidate();
   MIKOS_CHECK(suite, !reader.read(0, output, 1));

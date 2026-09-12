@@ -1,6 +1,7 @@
 #pragma once
 
 #include <drivers/fs/filesystem.hpp>
+#include <array>
 
 namespace mikos::drivers::fs::ext4 {
 
@@ -108,19 +109,19 @@ class Volume {
   [[nodiscard]] static Result<Volume> mount(Device& device) {
     Volume volume;
     const Error error = volume.initialize(device);
-    return error == Error::none ? Result<Volume>::success(volume)
-                                : Result<Volume>::failure(error);
+    return error == Error::none ? Result<Volume>(volume)
+                                : std::unexpected(error);
   }
 
   [[nodiscard]] Error initialize(Device& device) {
     mounted_ = false;
     device_ = &device;
     const Error error =
-        read_exact(device, 1024, superblock_, sizeof(superblock_));
+        read_exact(device, 1024, superblock_.data(), superblock_.size());
     if (error != Error::none) {
       return error;
     }
-    const u8* superblock = superblock_;
+    const u8* superblock = superblock_.data();
     if (little_u16(superblock + 0x38) != detail::magic) {
       return Error::invalid_format;
     }
@@ -225,14 +226,14 @@ class Volume {
   [[nodiscard]] Result<Node> read_inode(u32 inode_number) {
     if (!mounted_ || inode_number == 0 ||
         inode_number > geometry_.inode_count) {
-      return Result<Node>::failure(Error::out_of_bounds);
+      return std::unexpected(Error::out_of_bounds);
     }
     const u32 group =
         (inode_number - 1) / geometry_.inodes_per_group;
     const u32 index =
         (inode_number - 1) % geometry_.inodes_per_group;
     if (group >= geometry_.group_count) {
-      return Result<Node>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
 
     const u64 descriptor_table_block =
@@ -248,7 +249,7 @@ class Volume {
     Error error = read_exact(*device_, descriptor_offset, descriptor,
                              descriptor_bytes);
     if (error != Error::none) {
-      return Result<Node>::failure(error);
+      return std::unexpected(error);
     }
     u64 inode_table = little_u32(descriptor + 0x08);
     if ((geometry_.incompatible_features &
@@ -257,7 +258,7 @@ class Volume {
           static_cast<u64>(little_u32(descriptor + 0x28)) << 32;
     }
     if (!valid_physical_block(inode_table)) {
-      return Result<Node>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
 
     const u64 inode_offset =
@@ -266,7 +267,7 @@ class Volume {
     u8 raw[128]{};
     error = read_exact(*device_, inode_offset, raw, sizeof(raw));
     if (error != Error::none) {
-      return Result<Node>::failure(error);
+      return std::unexpected(error);
     }
     Node node;
     node.inode = inode_number;
@@ -283,9 +284,9 @@ class Volume {
     node.inode_offset = inode_offset;
     node.type = detail::type_from_mode(node.mode);
     if (node.type == Type::other || node.mode == 0) {
-      return Result<Node>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
-    return Result<Node>::success(node);
+    return Result<Node>(node);
   }
 
   template <typename Visitor>
@@ -310,13 +311,13 @@ class Volume {
       const auto mapping =
           map_block(directory, static_cast<u32>(logical));
       if (!mapping) {
-        return mapping.error;
+        return mapping.error();
       }
-      if (mapping.value.zero) {
+      if (mapping->zero) {
         continue;
       }
       Error error =
-          read_physical_block(mapping.value.physical, directory_block_);
+          read_physical_block(mapping->physical, directory_block_.data());
       if (error != Error::none) {
         return error;
       }
@@ -331,7 +332,7 @@ class Volume {
         if (block_bytes - offset < 8) {
           return Error::corrupt;
         }
-        const u8* raw = directory_block_ + offset;
+        const u8* raw = directory_block_.data() + offset;
         const u32 inode_number = little_u32(raw);
         const u32 record_size = little_u16(raw + 4);
         const bool has_file_type =
@@ -358,11 +359,11 @@ class Volume {
           entry.directory_type = has_file_type ? raw[7] : 0;
           const auto inode = read_inode(inode_number);
           if (!inode) {
-            return inode.error;
+            return inode.error();
           }
-          entry.node = inode.value;
+          entry.node = (*inode);
           entry.node.directory_entry_offset =
-              mapping.value.physical * geometry_.block_size + offset;
+              mapping->physical * geometry_.block_size + offset;
           if (!visitor(entry)) {
             return Error::none;
           }
@@ -376,7 +377,7 @@ class Volume {
   [[nodiscard]] Result<Node> lookup(const Node& directory,
                                     const char* name) {
     if (name == nullptr || *name == '\0') {
-      return Result<Node>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     Node found{};
     bool matched = false;
@@ -389,21 +390,21 @@ class Volume {
       return true;
     });
     if (error != Error::none) {
-      return Result<Node>::failure(error);
+      return std::unexpected(error);
     }
-    return matched ? Result<Node>::success(found)
-                   : Result<Node>::failure(Error::not_found);
+    return matched ? Result<Node>(found)
+                   : std::unexpected(Error::not_found);
   }
 
   [[nodiscard]] Result<Node> lookup_path(const char* path) {
     if (!mounted_ || path == nullptr) {
-      return Result<Node>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     auto root_node = root();
     if (!root_node) {
       return root_node;
     }
-    Node current = root_node.value;
+    Node current = (*root_node);
     u32 cursor = 0;
     while (path[cursor] == '/') {
       ++cursor;
@@ -413,7 +414,7 @@ class Volume {
       u32 size = 0;
       while (path[cursor] != '\0' && path[cursor] != '/') {
         if (size == Name::capacity) {
-          return Result<Node>::failure(Error::invalid_argument);
+          return std::unexpected(Error::invalid_argument);
         }
         component[size++] = path[cursor++];
       }
@@ -425,33 +426,33 @@ class Volume {
         continue;
       }
       if (!current.directory()) {
-        return Result<Node>::failure(Error::not_directory);
+        return std::unexpected(Error::not_directory);
       }
       const auto child = lookup(current, component);
       if (!child) {
         return child;
       }
-      current = child.value;
+      current = (*child);
     }
-    return Result<Node>::success(current);
+    return Result<Node>(current);
   }
 
   [[nodiscard]] Result<u32> read(const Node& file, u64 offset,
                                  u8* output, u32 size) {
     if (!mounted_ || (output == nullptr && size != 0)) {
-      return Result<u32>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     if (file.directory()) {
-      return Result<u32>::failure(Error::is_directory);
+      return std::unexpected(Error::is_directory);
     }
     if (file.type != Type::regular) {
-      return Result<u32>::failure(Error::unsupported);
+      return std::unexpected(Error::unsupported);
     }
     if ((file.flags & detail::inode_inline_data) != 0) {
-      return Result<u32>::failure(Error::unsupported);
+      return std::unexpected(Error::unsupported);
     }
     if (offset >= file.size || size == 0) {
-      return Result<u32>::success(0);
+      return Result<u32>(0);
     }
     u64 available = file.size - offset;
     u32 remaining =
@@ -461,7 +462,7 @@ class Volume {
     while (remaining != 0) {
       const u64 logical64 = offset / geometry_.block_size;
       if (logical64 > 0xffffffffu) {
-        return Result<u32>::failure(Error::unsupported);
+        return std::unexpected(Error::unsupported);
       }
       const u32 within =
           static_cast<u32>(offset % geometry_.block_size);
@@ -471,9 +472,9 @@ class Volume {
       const auto mapping =
           map_block(file, static_cast<u32>(logical64));
       if (!mapping) {
-        return Result<u32>::failure(mapping.error);
+        return std::unexpected(mapping.error());
       }
-      if (mapping.value.zero) {
+      if (mapping->zero) {
         zero_bytes(output, count);
       } else {
         if (within == 0 && count == geometry_.block_size) {
@@ -482,9 +483,9 @@ class Volume {
                  logical64 + following <= 0xffffffffu) {
             const auto next = map_block(
                 file, static_cast<u32>(logical64 + following));
-            if (!next || next.value.zero ||
-                next.value.physical !=
-                    mapping.value.physical + following) {
+            if (!next || next->zero ||
+                next->physical !=
+                    mapping->physical + following) {
               break;
             }
             count += geometry_.block_size;
@@ -492,18 +493,18 @@ class Volume {
           }
         }
         const u64 byte_offset =
-            mapping.value.physical * geometry_.block_size + within;
+            mapping->physical * geometry_.block_size + within;
         const Error error =
             read_exact(*device_, byte_offset, output, count);
         if (error != Error::none) {
-          return Result<u32>::failure(error);
+          return std::unexpected(error);
         }
       }
       output += count;
       offset += count;
       remaining -= count;
     }
-    return Result<u32>::success(requested);
+    return Result<u32>(requested);
   }
 
   [[nodiscard]] constexpr bool writable_format() const {
@@ -516,20 +517,20 @@ class Volume {
     requires WritableDevice<D>
   [[nodiscard]] Result<u64> allocate_block() {
     if (!writable_format()) {
-      return Result<u64>::failure(Error::unsupported);
+      return std::unexpected(Error::unsupported);
     }
     for (u32 group = 0; group < geometry_.group_count; ++group) {
       GroupDescriptor descriptor{};
       Error error = read_group_descriptor(group, descriptor);
       if (error != Error::none) {
-        return Result<u64>::failure(error);
+        return std::unexpected(error);
       }
       if (descriptor.free_blocks == 0) {
         continue;
       }
-      error = read_physical_block(descriptor.block_bitmap, block_);
+      error = read_physical_block(descriptor.block_bitmap, block_.data());
       if (error != Error::none) {
-        return Result<u64>::failure(error);
+        return std::unexpected(error);
       }
       const u64 first = geometry_.first_data_block +
                         static_cast<u64>(group) *
@@ -545,9 +546,9 @@ class Volume {
         block_[bit / 8] |= static_cast<u8>(1u << (bit % 8));
         error = write_exact(*device_,
                             descriptor.block_bitmap * geometry_.block_size,
-                            block_, geometry_.block_size);
+                            block_.data(), geometry_.block_size);
         if (error != Error::none) {
-          return Result<u64>::failure(error);
+          return std::unexpected(error);
         }
         --descriptor.free_blocks;
         --geometry_.free_blocks;
@@ -559,41 +560,41 @@ class Volume {
           error = Error::io;
         }
         if (error != Error::none) {
-          return Result<u64>::failure(error);
+          return std::unexpected(error);
         }
-        zero_bytes(block_, geometry_.block_size);
+        zero_bytes(block_.data(), geometry_.block_size);
         const u64 allocated = first + bit;
         error = write_exact(*device_, allocated * geometry_.block_size,
-                            block_, geometry_.block_size);
+                            block_.data(), geometry_.block_size);
         if (error != Error::none || !device_->flush()) {
-          return Result<u64>::failure(error == Error::none ? Error::io
+          return std::unexpected(error == Error::none ? Error::io
                                                            : error);
         }
-        return Result<u64>::success(allocated);
+        return Result<u64>(allocated);
       }
-      return Result<u64>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
-    return Result<u64>::failure(Error::no_space);
+    return std::unexpected(Error::no_space);
   }
 
   template <typename D = Device>
     requires WritableDevice<D>
   [[nodiscard]] Result<u32> allocate_inode() {
     if (!writable_format()) {
-      return Result<u32>::failure(Error::unsupported);
+      return std::unexpected(Error::unsupported);
     }
     for (u32 group = 0; group < geometry_.group_count; ++group) {
       GroupDescriptor descriptor{};
       Error error = read_group_descriptor(group, descriptor);
       if (error != Error::none) {
-        return Result<u32>::failure(error);
+        return std::unexpected(error);
       }
       if (descriptor.free_inodes == 0) {
         continue;
       }
-      error = read_physical_block(descriptor.inode_bitmap, block_);
+      error = read_physical_block(descriptor.inode_bitmap, block_.data());
       if (error != Error::none) {
-        return Result<u32>::failure(error);
+        return std::unexpected(error);
       }
       const u32 first = group * geometry_.inodes_per_group + 1;
       u32 count = geometry_.inodes_per_group;
@@ -609,9 +610,9 @@ class Volume {
         block_[bit / 8] |= static_cast<u8>(1u << (bit % 8));
         error = write_exact(*device_,
                             descriptor.inode_bitmap * geometry_.block_size,
-                            block_, geometry_.block_size);
+                            block_.data(), geometry_.block_size);
         if (error != Error::none) {
-          return Result<u32>::failure(error);
+          return std::unexpected(error);
         }
         --descriptor.free_inodes;
         --geometry_.free_inodes;
@@ -623,23 +624,23 @@ class Volume {
           error = Error::io;
         }
         if (error != Error::none) {
-          return Result<u32>::failure(error);
+          return std::unexpected(error);
         }
-        zero_bytes(block_, geometry_.inode_size);
+        zero_bytes(block_.data(), geometry_.inode_size);
         const u64 inode_offset =
             descriptor.inode_table * geometry_.block_size +
             static_cast<u64>(bit) * geometry_.inode_size;
-        error = write_exact(*device_, inode_offset, block_,
+        error = write_exact(*device_, inode_offset, block_.data(),
                             geometry_.inode_size);
         if (error != Error::none || !device_->flush()) {
-          return Result<u32>::failure(error == Error::none ? Error::io
+          return std::unexpected(error == Error::none ? Error::io
                                                            : error);
         }
-        return Result<u32>::success(inode);
+        return Result<u32>(inode);
       }
-      return Result<u32>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
-    return Result<u32>::failure(Error::no_space);
+    return std::unexpected(Error::no_space);
   }
 
   template <typename D = Device>
@@ -669,7 +670,7 @@ class Volume {
          block < descriptor.inode_table + inode_table_blocks)) {
       return Error::invalid_argument;
     }
-    error = read_physical_block(descriptor.block_bitmap, block_);
+    error = read_physical_block(descriptor.block_bitmap, block_.data());
     if (error != Error::none) {
       return error;
     }
@@ -677,16 +678,16 @@ class Volume {
     if ((block_[bit / 8] & mask) == 0) {
       return Error::corrupt;
     }
-    zero_bytes(directory_block_, geometry_.block_size);
+    zero_bytes(directory_block_.data(), geometry_.block_size);
     error = write_exact(*device_, block * geometry_.block_size,
-                        directory_block_, geometry_.block_size);
+                        directory_block_.data(), geometry_.block_size);
     if (error != Error::none || !device_->flush()) {
       return error == Error::none ? Error::io : error;
     }
     block_[bit / 8] &= static_cast<u8>(~mask);
     error = write_exact(*device_,
                         descriptor.block_bitmap * geometry_.block_size,
-                        block_, geometry_.block_size);
+                        block_.data(), geometry_.block_size);
     if (error != Error::none) {
       return error;
     }
@@ -716,7 +717,7 @@ class Volume {
     if (error != Error::none) {
       return error;
     }
-    error = read_physical_block(descriptor.inode_bitmap, block_);
+    error = read_physical_block(descriptor.inode_bitmap, block_.data());
     if (error != Error::none) {
       return error;
     }
@@ -724,11 +725,11 @@ class Volume {
     if ((block_[bit / 8] & mask) == 0) {
       return Error::corrupt;
     }
-    zero_bytes(directory_block_, geometry_.inode_size);
+    zero_bytes(directory_block_.data(), geometry_.inode_size);
     const u64 inode_offset =
         descriptor.inode_table * geometry_.block_size +
         static_cast<u64>(bit) * geometry_.inode_size;
-    error = write_exact(*device_, inode_offset, directory_block_,
+    error = write_exact(*device_, inode_offset, directory_block_.data(),
                         geometry_.inode_size);
     if (error != Error::none || !device_->flush()) {
       return error == Error::none ? Error::io : error;
@@ -736,7 +737,7 @@ class Volume {
     block_[bit / 8] &= static_cast<u8>(~mask);
     error = write_exact(*device_,
                         descriptor.inode_bitmap * geometry_.block_size,
-                        block_, geometry_.block_size);
+                        block_.data(), geometry_.block_size);
     if (error != Error::none) {
       return error;
     }
@@ -759,15 +760,15 @@ class Volume {
     if (!writable_format() || (input == nullptr && size != 0) ||
         file.type != Type::regular || offset > 0xffffffffu ||
         size > 0xffffffffu - offset) {
-      return Result<u32>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     if (size == 0) {
-      return Result<u32>::success(0);
+      return Result<u32>(0);
     }
     const u64 end = offset + size;
     Error error = ensure_file_blocks(file, end);
     if (error != Error::none) {
-      return Result<u32>::failure(error);
+      return std::unexpected(error);
     }
     u32 remaining = size;
     while (remaining != 0) {
@@ -777,33 +778,33 @@ class Volume {
                             ? remaining
                             : geometry_.block_size - within;
       const auto mapping = map_block(file, logical);
-      if (!mapping || mapping.value.zero) {
-        return Result<u32>::failure(!mapping ? mapping.error
+      if (!mapping || mapping->zero) {
+        return std::unexpected(!mapping ? mapping.error()
                                              : Error::corrupt);
       }
       error = write_exact(*device_,
-                          mapping.value.physical * geometry_.block_size +
+                          mapping->physical * geometry_.block_size +
                               within,
                           input, count);
       if (error != Error::none) {
-        return Result<u32>::failure(error);
+        return std::unexpected(error);
       }
       input += count;
       offset += count;
       remaining -= count;
     }
     if (!device_->flush()) {
-      return Result<u32>::failure(Error::io);
+      return std::unexpected(Error::io);
     }
     if (end > file.size) {
       file.size = end;
       error = persist_inode(file);
       if (error != Error::none || !device_->flush()) {
-        return Result<u32>::failure(error == Error::none ? Error::io
+        return std::unexpected(error == Error::none ? Error::io
                                                          : error);
       }
     }
-    return Result<u32>::success(size);
+    return Result<u32>(size);
   }
 
   template <typename D = Device>
@@ -866,19 +867,19 @@ class Volume {
     if (duplicate) {
       return Error::already_exists;
     }
-    if (duplicate.error != Error::not_found) {
-      return duplicate.error;
+    if (duplicate.error() != Error::not_found) {
+      return duplicate.error();
     }
     const auto allocated = allocate_inode();
     if (!allocated) {
-      return allocated.error;
+      return allocated.error();
     }
     Node file{};
-    initialize_extent_inode(file, allocated.value, 0x81a4, Type::regular);
+    initialize_extent_inode(file, (*allocated), 0x81a4, Type::regular);
     error = persist_inode(file);
     if (error == Error::none && size != 0) {
       const auto stored = write(file, 0, input, size);
-      error = stored ? Error::none : stored.error;
+      error = stored ? Error::none : stored.error();
     }
     if (error == Error::none) {
       error = insert_directory_entry(parent, name, file);
@@ -916,17 +917,17 @@ class Volume {
     if (duplicate) {
       return Error::already_exists;
     }
-    if (duplicate.error != Error::not_found) {
-      return duplicate.error;
+    if (duplicate.error() != Error::not_found) {
+      return duplicate.error();
     }
 
     const auto allocated_inode = allocate_inode();
     if (!allocated_inode) {
-      return allocated_inode.error;
+      return allocated_inode.error();
     }
     Node directory{};
     initialize_extent_inode(
-        directory, allocated_inode.value,
+        directory, (*allocated_inode),
         static_cast<u16>(detail::mode_directory | (mode & 07777)),
         Type::directory);
     directory.links = 2;
@@ -934,14 +935,14 @@ class Volume {
     const auto allocated_block = allocate_block();
     if (!allocated_block) {
       (void)release_inode(directory.inode);
-      return allocated_block.error;
+      return allocated_block.error();
     }
-    error = append_extent(directory, 0, allocated_block.value);
+    error = append_extent(directory, 0, (*allocated_block));
     if (error == Error::none) {
       directory.size = geometry_.block_size;
       directory.allocated_sectors = geometry_.block_size / 512;
       error = initialize_directory_block(directory, parent,
-                                         allocated_block.value);
+                                         (*allocated_block));
     }
     if (error == Error::none) {
       error = persist_inode(directory);
@@ -950,7 +951,7 @@ class Volume {
       error = insert_directory_entry(parent, name, directory);
     }
     if (error != Error::none) {
-      (void)release_block(allocated_block.value);
+      (void)release_block((*allocated_block));
       (void)release_inode(directory.inode);
       return error;
     }
@@ -969,18 +970,18 @@ class Volume {
   [[nodiscard]] Result<u32> read(const char* path, u64 offset,
                                  u8* output, u32 size) {
     const auto file = lookup_path(path);
-    return file ? read(file.value, offset, output, size)
-                : Result<u32>::failure(file.error);
+    return file ? read((*file), offset, output, size)
+                : std::unexpected(file.error());
   }
 
   [[nodiscard]] Result<u32> file_size(const char* path) {
     const auto file = lookup_path(path);
     if (!file) {
-      return Result<u32>::failure(file.error);
+      return std::unexpected(file.error());
     }
-    return file.value.type == Type::regular
-               ? Result<u32>::success(static_cast<u32>(file.value.size))
-               : Result<u32>::failure(Error::is_directory);
+    return file->type == Type::regular
+               ? Result<u32>(static_cast<u32>(file->size))
+               : std::unexpected(Error::is_directory);
   }
 
   template <typename D = Device>
@@ -994,16 +995,16 @@ class Volume {
     }
     const auto file = lookup(parent, name);
     if (!file) {
-      return file.error;
+      return file.error();
     }
-    if (file.value.directory()) {
+    if (file->directory()) {
       return Error::is_directory;
     }
-    error = erase_directory_entry(parent, file.value.directory_entry_offset);
+    error = erase_directory_entry(parent, file->directory_entry_offset);
     if (error != Error::none || !device_->flush()) {
       return error == Error::none ? Error::io : error;
     }
-    Node released = file.value;
+    Node released = (*file);
     error = release_file_blocks(released);
     return error == Error::none ? release_inode(released.inode) : error;
   }
@@ -1025,20 +1026,20 @@ class Volume {
     }
     const auto file = lookup(source_parent, source_name);
     if (!file) {
-      return file.error;
+      return file.error();
     }
     const auto duplicate = lookup(destination_parent, destination_name);
     if (duplicate) {
       return Error::already_exists;
     }
-    if (duplicate.error != Error::not_found) {
-      return duplicate.error;
+    if (duplicate.error() != Error::not_found) {
+      return duplicate.error();
     }
     error = insert_directory_entry(destination_parent, destination_name,
-                                   file.value);
+                                   (*file));
     if (error == Error::none) {
       error = erase_directory_entry(source_parent,
-                                    file.value.directory_entry_offset);
+                                    file->directory_entry_offset);
     }
     if (error == Error::none && !device_->flush()) {
       error = Error::io;
@@ -1053,30 +1054,30 @@ class Volume {
     auto target = lookup_path(destination);
     const auto origin = lookup_path(source);
     if (!target) {
-      return target.error;
+      return target.error();
     }
     if (!origin) {
-      return origin.error;
+      return origin.error();
     }
-    if (target.value.size > 0xffffffffu || origin.value.size > 0xffffffffu ||
-        origin.value.size > 0xffffffffu - target.value.size) {
+    if (target->size > 0xffffffffu || origin->size > 0xffffffffu ||
+        origin->size > 0xffffffffu - target->size) {
       return Error::no_space;
     }
-    const u32 target_size = static_cast<u32>(target.value.size);
-    const u32 source_size = static_cast<u32>(origin.value.size);
+    const u32 target_size = static_cast<u32>(target->size);
+    const u32 source_size = static_cast<u32>(origin->size);
     u32 copied = 0;
     while (copied < source_size) {
       const u32 count = source_size - copied < geometry_.block_size
                             ? source_size - copied
                             : geometry_.block_size;
-      const auto loaded = read(origin.value, copied, directory_block_, count);
-      if (!loaded || loaded.value != count) {
-        return !loaded ? loaded.error : Error::io;
+      const auto loaded = read((*origin), copied, directory_block_.data(), count);
+      if (!loaded || (*loaded) != count) {
+        return !loaded ? loaded.error() : Error::io;
       }
-      const auto stored = write(target.value, target_size + copied,
-                                directory_block_, count);
-      if (!stored || stored.value != count) {
-        return !stored ? stored.error : Error::io;
+      const auto stored = write((*target), target_size + copied,
+                                directory_block_.data(), count);
+      if (!stored || (*stored) != count) {
+        return !stored ? stored.error() : Error::io;
       }
       copied += count;
     }
@@ -1086,7 +1087,7 @@ class Volume {
   [[nodiscard]] bool consistent() {
     const auto root_node = root();
     return root_node &&
-           for_each(root_node.value, [](const Entry&) { return true; }) ==
+           for_each((*root_node), [](const Entry&) { return true; }) ==
                Error::none;
   }
 
@@ -1140,9 +1141,9 @@ class Volume {
     if (start <= 1) {
       const auto root_node = root();
       if (!root_node) {
-        return root_node.error;
+        return root_node.error();
       }
-      parent = root_node.value;
+      parent = (*root_node);
       return Error::none;
     }
     char parent_path[Name::capacity + 1]{};
@@ -1155,12 +1156,12 @@ class Volume {
     }
     const auto found = lookup_path(parent_path);
     if (!found) {
-      return found.error;
+      return found.error();
     }
-    if (!found.value.directory()) {
+    if (!found->directory()) {
       return Error::not_directory;
     }
-    parent = found.value;
+    parent = (*found);
     return Error::none;
   }
 
@@ -1186,10 +1187,10 @@ class Volume {
   template <typename D = Device>
     requires WritableDevice<D>
   [[nodiscard]] Error persist_inode(const Node& node) {
-    if (node.inode_offset == 0 || geometry_.inode_size > sizeof(block_)) {
+    if (node.inode_offset == 0 || geometry_.inode_size > block_.size()) {
       return Error::corrupt;
     }
-    Error error = read_exact(*device_, node.inode_offset, block_,
+    Error error = read_exact(*device_, node.inode_offset, block_.data(),
                              geometry_.inode_size);
     if (error != Error::none) {
       return error;
@@ -1214,7 +1215,7 @@ class Volume {
     }
     put32(0x64, node.generation);
     put32(0x6c, static_cast<u32>(node.size >> 32));
-    return write_exact(*device_, node.inode_offset, block_,
+    return write_exact(*device_, node.inode_offset, block_.data(),
                        geometry_.inode_size);
   }
 
@@ -1270,11 +1271,11 @@ class Volume {
     for (u32 logical = current; logical < required; ++logical) {
       const auto block = allocate_block();
       if (!block) {
-        return block.error;
+        return block.error();
       }
-      const Error error = append_extent(node, logical, block.value);
+      const Error error = append_extent(node, logical, (*block));
       if (error != Error::none) {
-        (void)release_block(block.value);
+        (void)release_block((*block));
         return error;
       }
       node.allocated_sectors += geometry_.block_size / 512;
@@ -1324,16 +1325,16 @@ class Volume {
         (directory.size + geometry_.block_size - 1) / geometry_.block_size);
     for (u32 logical = 0; logical < blocks; ++logical) {
       const auto mapping = map_block(directory, logical);
-      if (!mapping || mapping.value.zero) {
-        return !mapping ? mapping.error : Error::corrupt;
+      if (!mapping || mapping->zero) {
+        return !mapping ? mapping.error() : Error::corrupt;
       }
-      Error error = read_physical_block(mapping.value.physical,
-                                        directory_block_);
+      Error error = read_physical_block(mapping->physical,
+                                        directory_block_.data());
       if (error != Error::none) {
         return error;
       }
       for (u32 offset = 0; offset < geometry_.block_size;) {
-        u8* raw = directory_block_ + offset;
+        u8* raw = directory_block_.data() + offset;
         const u32 inode = little_u32(raw);
         const u32 record = little_u16(raw + 4);
         if (record < 8 || (record & 3) != 0 ||
@@ -1356,7 +1357,7 @@ class Volume {
           offset += record;
           continue;
         }
-        u8* entry = directory_block_ + slot;
+        u8* entry = directory_block_.data() + slot;
         for (u32 index = 0; index < available; ++index) {
           entry[index] = 0;
         }
@@ -1377,8 +1378,8 @@ class Volume {
           entry[8 + index] = static_cast<u8>(name[index]);
         }
         error = write_exact(*device_,
-                            mapping.value.physical * geometry_.block_size,
-                            directory_block_, geometry_.block_size);
+                            mapping->physical * geometry_.block_size,
+                            directory_block_.data(), geometry_.block_size);
         if (error != Error::none || !device_->flush()) {
           return error == Error::none ? Error::io : error;
         }
@@ -1393,12 +1394,12 @@ class Volume {
   [[nodiscard]] Error initialize_directory_block(const Node& directory,
                                                  const Node& parent,
                                                  u64 block) {
-    zero_bytes(directory_block_, geometry_.block_size);
+    zero_bytes(directory_block_.data(), geometry_.block_size);
     const bool file_types =
         (geometry_.incompatible_features & detail::incompat_file_type) != 0;
     auto write_entry = [&](u32 offset, u32 inode, u16 record_size,
                            const char* name, u8 name_size) {
-      u8* entry = directory_block_ + offset;
+      u8* entry = directory_block_.data() + offset;
       entry[0] = static_cast<u8>(inode);
       entry[1] = static_cast<u8>(inode >> 8);
       entry[2] = static_cast<u8>(inode >> 16);
@@ -1415,7 +1416,7 @@ class Volume {
     write_entry(12, parent.inode,
                 static_cast<u16>(geometry_.block_size - 12), "..", 2);
     return write_exact(*device_, block * geometry_.block_size,
-                       directory_block_, geometry_.block_size);
+                       directory_block_.data(), geometry_.block_size);
   }
 
   template <typename D = Device>
@@ -1443,20 +1444,20 @@ class Volume {
     }
     const u64 block_offset =
         entry_offset - entry_offset % geometry_.block_size;
-    Error error = read_exact(*device_, block_offset, directory_block_,
+    Error error = read_exact(*device_, block_offset, directory_block_.data(),
                              geometry_.block_size);
     if (error != Error::none) {
       return error;
     }
     const u32 within = static_cast<u32>(entry_offset - block_offset);
     if (within > geometry_.block_size - 8 ||
-        little_u32(directory_block_ + within) == 0) {
+        little_u32(directory_block_.data() + within) == 0) {
       return Error::corrupt;
     }
     for (u32 index = 0; index < 4; ++index) {
       directory_block_[within + index] = 0;
     }
-    return write_exact(*device_, block_offset, directory_block_,
+    return write_exact(*device_, block_offset, directory_block_.data(),
                        geometry_.block_size);
   }
 
@@ -1555,7 +1556,7 @@ class Volume {
       superblock_[0x15a] = static_cast<u8>(high >> 16);
       superblock_[0x15b] = static_cast<u8>(high >> 24);
     }
-    return write_exact(*device_, 1024, superblock_, sizeof(superblock_));
+    return write_exact(*device_, 1024, superblock_.data(), superblock_.size());
   }
 
   [[nodiscard]] Error read_physical_block(u64 block, u8* output) {
@@ -1568,21 +1569,21 @@ class Volume {
 
   [[nodiscard]] Result<u32> indirect_pointer(u32 block, u32 index) {
     if (block == 0) {
-      return Result<u32>::success(0);
+      return Result<u32>(0);
     }
-    Error error = read_physical_block(block, block_);
+    Error error = read_physical_block(block, block_.data());
     if (error != Error::none) {
-      return Result<u32>::failure(error);
+      return std::unexpected(error);
     }
     const u32 pointers = geometry_.block_size / 4;
     if (index >= pointers) {
-      return Result<u32>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
-    const u32 value = little_u32(block_ + index * 4);
+    const u32 value = little_u32(block_.data() + index * 4);
     if (value != 0 && !valid_physical_block(value)) {
-      return Result<u32>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
-    return Result<u32>::success(value);
+    return Result<u32>(value);
   }
 
   [[nodiscard]] Result<BlockMapping> map_legacy(const Node& node,
@@ -1591,9 +1592,9 @@ class Volume {
     if (logical < 12) {
       const u32 block = little_u32(node.block_data + logical * 4);
       if (block != 0 && !valid_physical_block(block)) {
-        return Result<BlockMapping>::failure(Error::corrupt);
+        return std::unexpected(Error::corrupt);
       }
-      return Result<BlockMapping>::success(
+      return Result<BlockMapping>(
           BlockMapping{block, block == 0});
     }
     u64 remaining = logical - 12;
@@ -1602,10 +1603,10 @@ class Volume {
           indirect_pointer(little_u32(node.block_data + 48),
                            static_cast<u32>(remaining));
       if (!block) {
-        return Result<BlockMapping>::failure(block.error);
+        return std::unexpected(block.error());
       }
-      return Result<BlockMapping>::success(
-          BlockMapping{block.value, block.value == 0});
+      return Result<BlockMapping>(
+          BlockMapping{(*block), (*block) == 0});
     }
     remaining -= pointers;
     const u64 double_capacity =
@@ -1615,43 +1616,43 @@ class Volume {
           indirect_pointer(little_u32(node.block_data + 52),
                            static_cast<u32>(remaining / pointers));
       if (!indirect) {
-        return Result<BlockMapping>::failure(indirect.error);
+        return std::unexpected(indirect.error());
       }
       const auto block =
-          indirect_pointer(indirect.value,
+          indirect_pointer((*indirect),
                            static_cast<u32>(remaining % pointers));
       if (!block) {
-        return Result<BlockMapping>::failure(block.error);
+        return std::unexpected(block.error());
       }
-      return Result<BlockMapping>::success(
-          BlockMapping{block.value, block.value == 0});
+      return Result<BlockMapping>(
+          BlockMapping{(*block), (*block) == 0});
     }
     remaining -= double_capacity;
     const u64 triple_capacity = double_capacity * pointers;
     if (remaining >= triple_capacity) {
-      return Result<BlockMapping>::failure(Error::out_of_bounds);
+      return std::unexpected(Error::out_of_bounds);
     }
     const auto double_block =
         indirect_pointer(little_u32(node.block_data + 56),
                          static_cast<u32>(remaining / double_capacity));
     if (!double_block) {
-      return Result<BlockMapping>::failure(double_block.error);
+      return std::unexpected(double_block.error());
     }
     const u64 within_double = remaining % double_capacity;
     const auto indirect =
-        indirect_pointer(double_block.value,
+        indirect_pointer((*double_block),
                          static_cast<u32>(within_double / pointers));
     if (!indirect) {
-      return Result<BlockMapping>::failure(indirect.error);
+      return std::unexpected(indirect.error());
     }
     const auto block =
-        indirect_pointer(indirect.value,
+        indirect_pointer((*indirect),
                          static_cast<u32>(within_double % pointers));
     if (!block) {
-      return Result<BlockMapping>::failure(block.error);
+      return std::unexpected(block.error());
     }
-    return Result<BlockMapping>::success(
-        BlockMapping{block.value, block.value == 0});
+    return Result<BlockMapping>(
+        BlockMapping{(*block), (*block) == 0});
   }
 
   [[nodiscard]] Result<BlockMapping> map_extents(const Node& node,
@@ -1660,13 +1661,13 @@ class Volume {
     u32 capacity = sizeof(node.block_data);
     u16 expected_depth = little_u16(extent_node + 6);
     if (expected_depth > 5) {
-      return Result<BlockMapping>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
 
     for (;;) {
       if (capacity < 12 ||
           little_u16(extent_node) != detail::extent_magic) {
-        return Result<BlockMapping>::failure(Error::corrupt);
+        return std::unexpected(Error::corrupt);
       }
       const u32 entries = little_u16(extent_node + 2);
       const u32 maximum = little_u16(extent_node + 4);
@@ -1674,7 +1675,7 @@ class Volume {
       const u32 capacity_entries = (capacity - 12) / 12;
       if (depth != expected_depth || entries > maximum ||
           maximum > capacity_entries) {
-        return Result<BlockMapping>::failure(Error::corrupt);
+        return std::unexpected(Error::corrupt);
       }
 
       if (depth == 0) {
@@ -1685,7 +1686,7 @@ class Volume {
           const u32 first = little_u32(extent);
           const u32 raw_length = little_u16(extent + 4);
           if (raw_length == 0) {
-            return Result<BlockMapping>::failure(Error::corrupt);
+            return std::unexpected(Error::corrupt);
           }
           const bool uninitialized = raw_length > 32768;
           const u32 length =
@@ -1693,7 +1694,7 @@ class Volume {
           const u64 end = static_cast<u64>(first) + length;
           if ((have_previous && first < previous_end) ||
               end > u64{0x100000000}) {
-            return Result<BlockMapping>::failure(Error::corrupt);
+            return std::unexpected(Error::corrupt);
           }
           have_previous = true;
           previous_end = end;
@@ -1701,19 +1702,19 @@ class Volume {
             continue;
           }
           if (uninitialized) {
-            return Result<BlockMapping>::success(BlockMapping{});
+            return Result<BlockMapping>(BlockMapping{});
           }
           const u64 physical =
               (static_cast<u64>(little_u16(extent + 6)) << 32) |
               little_u32(extent + 8);
           const u64 mapped = physical + (logical - first);
           if (!valid_physical_block(mapped)) {
-            return Result<BlockMapping>::failure(Error::corrupt);
+            return std::unexpected(Error::corrupt);
           }
-          return Result<BlockMapping>::success(
+          return Result<BlockMapping>(
               BlockMapping{mapped, false});
         }
-        return Result<BlockMapping>::success(BlockMapping{});
+        return Result<BlockMapping>(BlockMapping{});
       }
 
       const u8* selected = nullptr;
@@ -1723,7 +1724,7 @@ class Volume {
             extent_node + 12 + index * 12;
         const u32 first = little_u32(extent_index);
         if (index != 0 && first <= previous) {
-          return Result<BlockMapping>::failure(Error::corrupt);
+          return std::unexpected(Error::corrupt);
         }
         previous = first;
         if (first <= logical) {
@@ -1733,16 +1734,16 @@ class Volume {
         }
       }
       if (selected == nullptr) {
-        return Result<BlockMapping>::success(BlockMapping{});
+        return Result<BlockMapping>(BlockMapping{});
       }
       const u64 child =
           (static_cast<u64>(little_u16(selected + 8)) << 32) |
           little_u32(selected + 4);
-      const Error error = read_physical_block(child, block_);
+      const Error error = read_physical_block(child, block_.data());
       if (error != Error::none) {
-        return Result<BlockMapping>::failure(error);
+        return std::unexpected(error);
       }
-      extent_node = block_;
+      extent_node = block_.data();
       capacity = geometry_.block_size;
       --expected_depth;
     }
@@ -1751,7 +1752,7 @@ class Volume {
   [[nodiscard]] Result<BlockMapping> map_block(const Node& node,
                                                u32 logical) {
     if ((node.flags & detail::inode_inline_data) != 0) {
-      return Result<BlockMapping>::failure(Error::unsupported);
+      return std::unexpected(Error::unsupported);
     }
     return (node.flags & detail::inode_extents) != 0
                ? map_extents(node, logical)
@@ -1761,9 +1762,9 @@ class Volume {
   Device* device_{};
   Geometry geometry_{};
   bool mounted_{};
-  u8 superblock_[1024]{};
-  u8 block_[4096]{};
-  u8 directory_block_[4096]{};
+  std::array<u8, 1024> superblock_{};
+  std::array<u8, 4096> block_{};
+  std::array<u8, 4096> directory_block_{};
 };
 
 }  // namespace mikos::drivers::fs::ext4

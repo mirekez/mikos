@@ -11,6 +11,8 @@
 #include <mikos/process/signal.hpp>
 #include <mikos/process/snapshot_arena.hpp>
 #include <mikos/process/pty.hpp>
+#include <mikos/memory/boot_array.hpp>
+#include <mikos/io/scatter_write.hpp>
 
 extern "C" void* memset(void*, int, mikos::usize);
 extern "C" void* memcpy(void*, const void*, mikos::usize);
@@ -25,10 +27,7 @@ using abi::riscv32::Syscall;
 using abi::riscv32::error;
 using PseudoFilesystem = pseudo_fs::Filesystem;
 
-struct [[gnu::packed]] Iovec32 {
-  u32 base;
-  u32 size;
-};
+using abi::Iovec32;
 
 struct [[gnu::packed]] Rlimit64 {
   u64 current;
@@ -554,8 +553,8 @@ Descriptor parent_descriptors[13]{};
 Descriptor parent_standard_redirects[3]{};
 Descriptor background_descriptors[13]{};
 Descriptor background_standard_redirects[3]{};
-Descriptor nested_ancestor_descriptors[nested_ancestor_capacity][13]{};
-Descriptor nested_ancestor_standard_redirects[nested_ancestor_capacity][3]{};
+memory::BootArray<Descriptor[13], nested_ancestor_capacity> nested_ancestor_descriptors;
+memory::BootArray<Descriptor[3], nested_ancestor_capacity> nested_ancestor_standard_redirects;
 Descriptor interactive_child_descriptors[13]{};
 Descriptor interactive_child_standard_redirects[3]{};
 Descriptor interactive_parent_descriptors[13]{};
@@ -1359,7 +1358,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
     return Node{pseudo_node};
   }
   const auto result = drivers::fs::root::lookup(path);
-  return result ? Node{result.value} : Node{Node::none};
+  return result ? Node{(*result)} : Node{Node::none};
 }
 
 [[nodiscard]] Node path_node(u32 address, char* canonical = nullptr) {
@@ -1532,7 +1531,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
     }
     const auto created = drivers::fs::root::lookup(canonical);
     if (created) {
-      node = Node{created.value};
+      node = Node{(*created)};
     }
   } else if (node != Node::none && (flags & create) != 0 &&
              (flags & exclusive) != 0) {
@@ -2345,7 +2344,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
     if (!result) {
       return error(Errno::io);
     }
-    count = result.value;
+    count = (*result);
   } else {
     const char* contents = node_contents(slot.node);
     if (contents == nullptr) {
@@ -2921,7 +2920,7 @@ static_assert(sizeof(Statx) == 256);
     }
     canonical[index] = '\0';
     const auto executable = drivers::fs::root::lookup(canonical);
-    node = executable ? Node{executable.value} : Node{Node::none};
+    node = executable ? Node{(*executable)} : Node{Node::none};
   }
   if (!user_memory.aligned(argv, alignof(u32)) ||
       (envp != 0 && !user_memory.aligned(envp, alignof(u32)))) {
@@ -3698,8 +3697,8 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
   if (!result) {
     return error(Errno::io);
   }
-  slot.offset += result.value;
-  return static_cast<i32>(result.value);
+  slot.offset += (*result);
+  return static_cast<i32>((*result));
 }
 
 [[nodiscard]] i32 writev(u32 descriptor, u32 address, u32 count) {
@@ -3708,19 +3707,13 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
       !user_memory.aligned(address, alignof(Iovec32))) {
     return error(Errno::bad_address);
   }
-  const auto* vectors = reinterpret_cast<const Iovec32*>(address);
-  u32 total = 0;
-  for (u32 i = 0; i < count; ++i) {
-    const i32 result = write(descriptor, vectors[i].base, vectors[i].size);
-    if (result < 0) {
-      return result;
-    }
-    if (vectors[i].size > 0x7fffffffu - total) {
-      return error(Errno::invalid_argument);
-    }
-    total += vectors[i].size;
-  }
-  return static_cast<i32>(total);
+  // Snapshot plain ABI records before I/O can yield or modify shared memory.
+  std::array<Iovec32, 1024> snapshot;
+  memcpy(snapshot.data(), reinterpret_cast<const void*>(address),
+         count * sizeof(Iovec32));
+  return io::scatter_write(std::span<const Iovec32>{snapshot.data(), count},
+      [descriptor](u32 base, u32 size) { return write(descriptor, base, size); },
+      error(Errno::invalid_argument));
 }
 
 [[nodiscard]] i32 read(TrapFrame& frame, u32 descriptor, u32 address,
@@ -4146,6 +4139,11 @@ static_assert(sizeof(Winsize) == sizeof(process_model::WindowSize));
 }
 
 }  // namespace
+
+void initialize_kernel_tables() {
+  nested_ancestor_descriptors.initialize();
+  nested_ancestor_standard_redirects.initialize();
+}
 
 void deliver_pending_signal(TrapFrame& frame) {
   deliver_pending_signal_impl(frame);

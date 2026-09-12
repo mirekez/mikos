@@ -283,7 +283,22 @@ int main() {
   MIKOS_CHECK(suite,
               socket_read(accepted.handle, input, sizeof(input)).size == 1);
 
-  make_packet(tcp_ack | tcp_fin, 1006, server_sequence + 10);
+  // Every pending transmit slot is usable; failed capacity checks must not
+  // advance SEQ. A cumulative ACK frees all slots for the next burst.
+  u32 acknowledged_output = server_sequence + 10;
+  const u8 marker = 0xa5;
+  for (u32 round = 0; round < 2; ++round) {
+    for (u32 i = 0; i < transmit_capacity; ++i)
+      MIKOS_CHECK(suite, socket_write(accepted.handle, &marker, 1).size == 1);
+    MIKOS_CHECK(suite, socket_write(accepted.handle, &marker, 1).result == SocketResult::no_space);
+    TcpView last{};
+    MIKOS_CHECK(suite, transmitted_tcp(last));
+    MIKOS_CHECK(suite, net32(last.tcp->sequence) == acknowledged_output + transmit_capacity - 1);
+    acknowledged_output += transmit_capacity;
+    make_packet(tcp_ack, 1006, acknowledged_output);
+    poll();
+  }
+  make_packet(tcp_ack | tcp_fin, 1006, acknowledged_output);
   poll();
   MIKOS_CHECK(suite,
               socket_read(accepted.handle, input, sizeof(input)).result ==

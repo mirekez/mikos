@@ -9,19 +9,26 @@ RISCV_PREFIX ?= /home/me/riscv/bin/riscv32-unknown-linux-gnu-
 LD := $(RISCV_PREFIX)ld
 OBJCOPY := $(RISCV_PREFIX)objcopy
 
+.DEFAULT_GOAL := all
+include support/kernel-cxx/flags.mk
+
 RV_FLAGS := --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 \
 	-mcmodel=medany -msmall-data-limit=0 -std=c++2c -ffreestanding \
 	-fno-exceptions -fno-rtti -fno-unwind-tables \
 	-fno-asynchronous-unwind-tables -fno-threadsafe-statics \
 	-fno-use-cxa-atexit -fno-stack-protector -fdata-sections \
 	-ffunction-sections -Wall -Wextra -Werror -O2 -g \
-	-I$(ROOT) -I$(ROOT)/include -MMD -MP
+	-I$(ROOT) -I$(ROOT)/include -MMD -MP $(KERNEL_CXX_TARGET_HEADERS)
 
 KERNEL_ELF := $(BUILD)/mikos-rv32.elf
 KERNEL_MAP := $(BUILD)/mikos-rv32.map
 KERNEL_SOURCES := \
 	kernel/main.cpp \
 	kernel/runtime.cpp \
+	kernel/cxx_arena.cpp \
+	kernel/cxx_runtime.cpp \
+	kernel/cxx_math.cpp \
+	kernel/cxx_smoke.cpp \
 	kernel/syscall.cpp \
 	kernel/pseudo_filesystem.cpp \
 	drivers/uart/ns16550a.cpp \
@@ -44,6 +51,10 @@ TRIBE_KERNEL_MAP := $(BUILD)/mikos-tribe-rv32.map
 TRIBE_KERNEL_SOURCES := \
 	kernel/main.cpp \
 	kernel/runtime.cpp \
+	kernel/cxx_arena.cpp \
+	kernel/cxx_runtime.cpp \
+	kernel/cxx_math.cpp \
+	kernel/cxx_smoke.cpp \
 	kernel/syscall.cpp \
 	kernel/pseudo_filesystem.cpp \
 	drivers/uart/ns16550a.cpp \
@@ -77,6 +88,41 @@ TRIBE_INTERACTIVE_MULTICORE_OBJECTS := \
 	$(patsubst %.S,$(BUILD)/tribe-interactive-multicore/%.o,$(filter %.S,$(TRIBE_KERNEL_SOURCES)))
 TRIBE_INTERACTIVE_MULTICORE_DEPS := \
 	$(TRIBE_INTERACTIVE_MULTICORE_OBJECTS:.o=.d)
+
+KERNEL_OBJECTS += $(BUILD)/kernel/cxx_hash.o
+TRIBE_KERNEL_OBJECTS += $(BUILD)/tribe/kernel/cxx_hash.o
+TRIBE_INTERACTIVE_OBJECTS += $(BUILD)/tribe-interactive/kernel/cxx_hash.o
+TRIBE_INTERACTIVE_MULTICORE_OBJECTS += $(BUILD)/tribe-interactive-multicore/kernel/cxx_hash.o
+
+# std::unordered_set uses float load-factor arithmetic. Compile only the five
+# integer-only compiler-rt leaf implementations it needs; no FPU/libm/unwinder.
+KERNEL_SOFTFLOAT_NAMES := comparesf2 divsf3 mulsf3 fixunssfsi floatunsisf
+KERNEL_SOFTFLOAT_OBJECTS := $(addprefix $(BUILD)/kernel/softfloat/,$(addsuffix .o,$(KERNEL_SOFTFLOAT_NAMES)))
+KERNEL_OBJECTS += $(KERNEL_SOFTFLOAT_OBJECTS)
+TRIBE_KERNEL_OBJECTS += $(KERNEL_SOFTFLOAT_OBJECTS)
+TRIBE_INTERACTIVE_OBJECTS += $(KERNEL_SOFTFLOAT_OBJECTS)
+TRIBE_INTERACTIVE_MULTICORE_OBJECTS += $(KERNEL_SOFTFLOAT_OBJECTS)
+
+$(BUILD)/kernel/softfloat/%.o: $(KERNEL_CXX_READY)
+	@mkdir -p $(@D)
+	$(CXX) $(filter-out -std=c++2c,$(TRIBE_RV_FLAGS)) -x c -std=c11 \
+	  -c $(KERNEL_CXX_BUILTINS)/$*.c -o $@
+
+$(KERNEL_OBJECTS) $(TRIBE_KERNEL_OBJECTS) $(TRIBE_INTERACTIVE_OBJECTS) \
+  $(TRIBE_INTERACTIVE_MULTICORE_OBJECTS): Makefile support/kernel-cxx/flags.mk $(KERNEL_CXX_READY)
+
+$(BUILD)/kernel/cxx_hash.o: $(KERNEL_CXX_READY)
+	@mkdir -p $(@D)
+	$(CXX) $(RV_FLAGS) -c $(KERNEL_CXX_HASH) -o $@
+$(BUILD)/tribe/kernel/cxx_hash.o: $(KERNEL_CXX_READY)
+	@mkdir -p $(@D)
+	$(CXX) $(TRIBE_RV_FLAGS) -c $(KERNEL_CXX_HASH) -o $@
+$(BUILD)/tribe-interactive/kernel/cxx_hash.o: $(KERNEL_CXX_READY)
+	@mkdir -p $(@D)
+	$(CXX) $(TRIBE_INTERACTIVE_RV_FLAGS) -c $(KERNEL_CXX_HASH) -o $@
+$(BUILD)/tribe-interactive-multicore/kernel/cxx_hash.o: $(KERNEL_CXX_READY)
+	@mkdir -p $(@D)
+	$(CXX) $(TRIBE_INTERACTIVE_MULTICORE_RV_FLAGS) -c $(KERNEL_CXX_HASH) -o $@
 
 # BusyBox and stress-ng live in one ext4 root image shared by QEMU and Tribe.
 BUSYBOX_TEST_BUILD := $(BUILD)/tests/busybox
@@ -116,6 +162,13 @@ tribe-interactive-multicore-kernel: $(ROOTFS_IMAGE) \
 
 inspect: $(KERNEL_ELF)
 	tests/kernel/inspect_kernel.sh
+
+.PHONY: kernel-cxx-test
+kernel-cxx-test: $(KERNEL_ELF) $(TRIBE_KERNEL_ELF) \
+    $(TRIBE_INTERACTIVE_ELF) $(TRIBE_INTERACTIVE_MULTICORE_ELF)
+	$(MAKE) -C tests kernel-cxx-check
+	@for elf in $^; do tests/kernel/inspect_kernel.sh "$$elf"; done
+	bash tests/qemu/run_kernel_cxx.sh
 
 busybox:
 	$(MAKE) -C tests/busybox all

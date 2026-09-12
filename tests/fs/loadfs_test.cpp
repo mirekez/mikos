@@ -30,7 +30,7 @@ void verify_file(mikos::test::Suite& suite, Filesystem& filesystem,
   if (!size) {
     return;
   }
-  MIKOS_CHECK(suite, size.value == expected_size);
+  MIKOS_CHECK(suite, (*size) == expected_size);
   u8 window[257]{};
   for (u32 offset = 0; offset < expected_size; offset += sizeof(window)) {
     const u32 remaining = expected_size - offset;
@@ -41,7 +41,7 @@ void verify_file(mikos::test::Suite& suite, Filesystem& filesystem,
     if (!read) {
       return;
     }
-    MIKOS_CHECK(suite, read.value == count);
+    MIKOS_CHECK(suite, (*read) == count);
     for (u32 index = 0; index < count; ++index) {
       MIKOS_CHECK(suite, window[index] == expected[offset + index]);
     }
@@ -79,7 +79,7 @@ void run_load(mikos::test::Suite& suite, Filesystem& filesystem) {
               filesystem.move("/alpha.prbs", "/moved.prbs") ==
                   Error::none);
   MIKOS_CHECK(suite,
-              filesystem.file_size("/alpha.prbs").error ==
+              filesystem.file_size("/alpha.prbs").error() ==
                   Error::not_found);
   verify_file(suite, filesystem, "/moved.prbs", first, sizeof(first));
 
@@ -93,7 +93,7 @@ void run_load(mikos::test::Suite& suite, Filesystem& filesystem) {
   MIKOS_CHECK(suite,
               filesystem.remove("/beta.prbs") == Error::none);
   MIKOS_CHECK(suite,
-              filesystem.file_size("/beta.prbs").error ==
+              filesystem.file_size("/beta.prbs").error() ==
                   Error::not_found);
   MIKOS_CHECK(suite,
               filesystem.remove("/beta.prbs") == Error::not_found);
@@ -116,31 +116,31 @@ int main() {
   ext4::test::Image ext4_image;
   auto ext4_mount = Ext4Contract::mount(ext4_image.device);
   MIKOS_CHECK(suite, ext4_mount);
-  run_load(suite, ext4_mount.value);
+  run_load(suite, (*ext4_mount));
   MIKOS_CHECK(suite,
-              ext4_mount.value.create("/Case", nullptr, 0) == Error::none);
+              ext4_mount->create("/Case", nullptr, 0) == Error::none);
   MIKOS_CHECK(suite,
-              ext4_mount.value.create("/case", nullptr, 0) == Error::none);
+              ext4_mount->create("/case", nullptr, 0) == Error::none);
   auto ext4_remount = Ext4Contract::mount(ext4_image.device);
   MIKOS_CHECK(suite, ext4_remount);
   MIKOS_CHECK(suite,
-              ext4_remount.value.file_size("/moved.prbs").value == 20480);
-  MIKOS_CHECK(suite, ext4_remount.value.consistent());
+              ext4_remount->file_size("/moved.prbs").value() == 20480);
+  MIKOS_CHECK(suite, ext4_remount->consistent());
 
   fat32::test::Image fat32_image;
   fat32_image.end_directory(2, 0);
   auto fat32_mount = Fat32Contract::mount(fat32_image.device);
   MIKOS_CHECK(suite, fat32_mount);
-  run_load(suite, fat32_mount.value);
+  run_load(suite, (*fat32_mount));
   MIKOS_CHECK(suite,
-              fat32_mount.value.create("/Case", nullptr, 0) == Error::none);
+              fat32_mount->create("/Case", nullptr, 0) == Error::none);
   MIKOS_CHECK(suite,
-              fat32_mount.value.create("/case", nullptr, 0) ==
+              fat32_mount->create("/case", nullptr, 0) ==
                   Error::already_exists);
   auto fat32_remount = Fat32Contract::mount(fat32_image.device);
   MIKOS_CHECK(suite, fat32_remount);
   MIKOS_CHECK(suite,
-              fat32_remount.value.file_size("/moved.prbs").value == 20480);
-  MIKOS_CHECK(suite, fat32_remount.value.consistent());
+              fat32_remount->file_size("/moved.prbs").value() == 20480);
+  MIKOS_CHECK(suite, fat32_remount->consistent());
   return suite.finish();
 }

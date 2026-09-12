@@ -25,9 +25,9 @@ void check_fragmented_read(mikos::test::Suite& suite) {
   MIKOS_CHECK(suite, mounted);
   Node file{5, 900, Type::file, 0x20};
   u8 output[80]{};
-  const auto read = mounted.value.read(file, 480, output, sizeof(output));
+  const auto read = mounted->read(file, 480, output, sizeof(output));
   MIKOS_CHECK(suite, read);
-  MIKOS_CHECK(suite, read.value == sizeof(output));
+  MIKOS_CHECK(suite, (*read) == sizeof(output));
   for (u32 index = 0; index < 32; ++index) {
     MIKOS_CHECK(suite, output[index] == first[480 + index]);
   }
@@ -44,19 +44,19 @@ void check_corrupt_chains(mikos::test::Suite& suite) {
   Node file{5, 700, Type::file, 0x20};
   u8 output[700]{};
   image.set_fat(5, 0x0ffffff7);
-  auto read = mounted.value.read(file, 0, output, sizeof(output));
+  auto read = mounted->read(file, 0, output, sizeof(output));
   MIKOS_CHECK(suite, !read);
-  MIKOS_CHECK(suite, read.error == Error::corrupt);
+  MIKOS_CHECK(suite, read.error() == Error::corrupt);
 
   image.set_fat(5, 6);
   image.set_fat(6, 5);
   file.size = (fat32::test::Image::cluster_count + 2) * 512u;
-  read = mounted.value.read(
+  read = mounted->read(
       file,
       static_cast<u64>(fat32::test::Image::cluster_count + 1) * 512,
       output, 1);
   MIKOS_CHECK(suite, !read);
-  MIKOS_CHECK(suite, read.error == Error::loop);
+  MIKOS_CHECK(suite, read.error() == Error::loop);
 }
 
 }  // namespace

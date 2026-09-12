@@ -19,6 +19,9 @@ SECTIONS
     *(.data .data.*)
     *(.sdata .sdata.*)
   }
+  __kernel_image_end = .;
+  ASSERT(__kernel_image_end - __kernel_begin <= 500000,
+         "kernel text/rodata/data exceed 500 kB")
 
   .bss (NOLOAD) : ALIGN(16) {
     __bss_begin = .;

@@ -29,25 +29,25 @@ void check_lookup_and_read(mikos::test::Suite& suite) {
 
   auto mounted = Volume<fat32::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, mounted);
-  const auto file = mounted.value.lookup_path("/payload.bin");
+  const auto file = mounted->lookup_path("/payload.bin");
   MIKOS_CHECK(suite, file);
   u8 output[256]{};
-  const auto read = mounted.value.read(file.value, 500, output,
+  const auto read = mounted->read((*file), 500, output,
                                        sizeof(output));
   MIKOS_CHECK(suite, read);
-  MIKOS_CHECK(suite, read.value == 200);
+  MIKOS_CHECK(suite, (*read) == 200);
   for (u32 index = 0; index < 12; ++index) {
     MIKOS_CHECK(suite, output[index] == first[500 + index]);
   }
   for (u32 index = 12; index < 200; ++index) {
     MIKOS_CHECK(suite, output[index] == second[index - 12]);
   }
-  const auto eof = mounted.value.read(file.value, 700, output, 1);
+  const auto eof = mounted->read((*file), 700, output, 1);
   MIKOS_CHECK(suite, eof);
-  MIKOS_CHECK(suite, eof.value == 0);
+  MIKOS_CHECK(suite, (*eof) == 0);
 
   const auto directory_read =
-      mounted.value.read(mounted.value.root(), 0, output, 1);
+      mounted->read(mounted->root(), 0, output, 1);
   MIKOS_CHECK(suite, !directory_read);
 }
 

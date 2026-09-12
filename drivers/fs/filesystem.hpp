@@ -1,6 +1,10 @@
 #pragma once
 
 #include <mikos/base.hpp>
+#include <algorithm>
+#include <expected>
+#include <span>
+#include <string_view>
 
 namespace mikos::drivers::fs {
 
@@ -21,22 +25,7 @@ enum class Error : u8 {
 };
 
 template <typename T>
-struct [[nodiscard]] Result {
-  T value{};
-  Error error{Error::none};
-
-  [[nodiscard]] constexpr operator bool() const {
-    return error == Error::none;
-  }
-
-  [[nodiscard]] static constexpr Result success(T value) {
-    return Result{value, Error::none};
-  }
-
-  [[nodiscard]] static constexpr Result failure(Error error) {
-    return Result{{}, error};
-  }
-};
+using Result = std::expected<T, Error>;
 
 template <typename Device>
 concept ReadableDevice = requires(Device& device, u64 offset, u8* output,
@@ -73,29 +62,21 @@ struct Name {
 
   [[nodiscard]] constexpr bool empty() const { return size == 0; }
 
+  [[nodiscard]] constexpr std::string_view view() const { return {data, size}; }
+
   [[nodiscard]] constexpr bool equals(const char* other,
                                       bool ascii_fold = false) const {
     if (other == nullptr) {
       return false;
     }
-    u32 index = 0;
-    while (index < size && other[index] != '\0') {
-      char left = data[index];
-      char right = other[index];
-      if (ascii_fold) {
-        if (left >= 'a' && left <= 'z') {
-          left = static_cast<char>(left - ('a' - 'A'));
-        }
-        if (right >= 'a' && right <= 'z') {
-          right = static_cast<char>(right - ('a' - 'A'));
-        }
-      }
-      if (left != right) {
-        return false;
-      }
-      ++index;
-    }
-    return index == size && other[index] == '\0';
+    // Bound the C-string scan by our own length, as the old comparison did.
+    usize length = 0;
+    while (length < size && other[length] != '\0') ++length;
+    if (length != size || other[length] != '\0') return false;
+    const auto fold = [ascii_fold](char c) {
+      return ascii_fold && c >= 'a' && c <= 'z' ? char(c - ('a' - 'A')) : c;
+    };
+    return std::ranges::equal(view(), std::string_view{other, length}, {}, fold, fold);
   }
 };
 
@@ -155,9 +136,7 @@ template <WritableDevice Device>
 }
 
 inline void zero_bytes(u8* output, u32 size) {
-  for (u32 index = 0; index < size; ++index) {
-    output[index] = 0;
-  }
+  std::ranges::fill(std::span{output, size}, u8{});
 }
 
 }  // namespace mikos::drivers::fs

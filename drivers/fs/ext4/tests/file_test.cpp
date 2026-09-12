@@ -21,12 +21,12 @@ void check_sparse_partial_read(mikos::test::Suite& suite) {
   image.write_block(12, third, sizeof(third));
 
   auto mounted = Volume<ext4::test::Device>::mount(image.device);
-  const auto inode = mounted.value.read_inode(3);
+  const auto inode = mounted->read_inode(3);
   u8 output[1200]{};
   const auto read =
-      mounted.value.read(inode.value, 900, output, sizeof(output));
+      mounted->read((*inode), 900, output, sizeof(output));
   MIKOS_CHECK(suite, read);
-  MIKOS_CHECK(suite, read.value == sizeof(output));
+  MIKOS_CHECK(suite, (*read) == sizeof(output));
   for (u32 index = 0; index < 124; ++index) {
     MIKOS_CHECK(suite, output[index] == 0x11);
   }
@@ -38,9 +38,9 @@ void check_sparse_partial_read(mikos::test::Suite& suite) {
   }
 
   const auto eof =
-      mounted.value.read(inode.value, 3 * 1024, output, 1);
+      mounted->read((*inode), 3 * 1024, output, 1);
   MIKOS_CHECK(suite, eof);
-  MIKOS_CHECK(suite, eof.value == 0);
+  MIKOS_CHECK(suite, (*eof) == 0);
 }
 
 }  // namespace

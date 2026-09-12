@@ -15,7 +15,7 @@ void check_valid(mikos::test::Suite& suite) {
   if (!mounted) {
     return;
   }
-  const auto& geometry = mounted.value.geometry();
+  const auto& geometry = mounted->geometry();
   MIKOS_CHECK(suite, geometry.bytes_per_sector == 512);
   MIKOS_CHECK(suite, geometry.bytes_per_cluster == 512);
   MIKOS_CHECK(suite, geometry.first_data_sector == 544);
@@ -44,7 +44,7 @@ void check_sector_sizes(mikos::test::Suite& suite) {
     MIKOS_CHECK(suite, mounted);
     if (mounted) {
       MIKOS_CHECK(suite,
-                  mounted.value.geometry().bytes_per_sector ==
+                  mounted->geometry().bytes_per_sector ==
                       bytes_per_sector);
     }
   }
@@ -55,13 +55,13 @@ void check_invalid(mikos::test::Suite& suite) {
   image.device.write8(510, 0);
   auto mounted = Volume<fat32::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::invalid_format);
+  MIKOS_CHECK(suite, mounted.error() == Error::invalid_format);
 
   image.device.write8(510, 0x55);
   image.device.write16(11, 513);
   mounted = Volume<fat32::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::invalid_format);
+  MIKOS_CHECK(suite, mounted.error() == Error::invalid_format);
 
   image.device.write16(11, 512);
   image.device.write8(13, 3);
@@ -77,7 +77,7 @@ void check_invalid(mikos::test::Suite& suite) {
   image.device.resize(4096);
   mounted = Volume<fat32::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::out_of_bounds);
+  MIKOS_CHECK(suite, mounted.error() == Error::out_of_bounds);
 }
 
 void check_io_error(mikos::test::Suite& suite) {
@@ -85,7 +85,7 @@ void check_io_error(mikos::test::Suite& suite) {
   image.device.fail_reads(true);
   const auto mounted = Volume<fat32::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::io);
+  MIKOS_CHECK(suite, mounted.error() == Error::io);
 }
 
 }  // namespace

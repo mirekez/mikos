@@ -1,8 +1,10 @@
 #pragma once
 
 #include <mikos/abi/socket.hpp>
-#include <mikos/container/fixed_unordered_map.hpp>
 #include <mikos/net/ethernet.hpp>
+#include <algorithm>
+#include <array>
+#include <optional>
 
 namespace mikos::network {
 
@@ -97,12 +99,6 @@ struct ReassemblyKey {
       default;
 };
 
-struct ReassemblyHash {
-  [[nodiscard]] constexpr u32 operator()(ReassemblyKey key) const {
-    return key.sequence * 2654435761u + key.handle * 97u;
-  }
-};
-
 struct ReassemblySegment {
   u16 size{};
   bool finish{};
@@ -114,12 +110,6 @@ struct TransmitKey {
   u32 sequence{};
 
   [[nodiscard]] constexpr bool operator==(const TransmitKey&) const = default;
-};
-
-struct TransmitHash {
-  [[nodiscard]] constexpr u32 operator()(TransmitKey key) const {
-    return key.sequence * 2654435761u + key.handle * 97u;
-  }
 };
 
 struct TransmitSegment {
@@ -525,51 +515,49 @@ class SocketTable {
     if (size > reassembly_segment_capacity) {
       return SocketResult::no_space;
     }
-    bool inserted = false;
-    auto* available =
-        reassembly_.find_or_emplace({handle, sequence}, inserted);
-    if (available == nullptr) {
-      return SocketResult::no_space;
-    }
-    if (!inserted) {
+    const ReassemblyKey key{handle, sequence};
+    if (std::ranges::any_of(reassembly_, [&](const auto& slot) {
+          return slot && slot->first == key;
+        })) {
       return SocketResult::success;
     }
-    available->size = static_cast<u16>(size);
-    available->finish = finish;
-    for (u32 i = 0; i < size; ++i) {
-      available->data[i] = data[i];
-    }
+    const auto free = std::ranges::find_if(reassembly_,
+        [](const auto& slot) { return !slot; });
+    if (free == reassembly_.end()) return SocketResult::no_space;
+    auto& available = free->emplace().second;
+    (*free)->first = key;
+    available.size = static_cast<u16>(size);
+    available.finish = finish;
+    std::copy_n(data, size, available.data);
     return SocketResult::success;
   }
 
   [[nodiscard]] ReadResult drain_reassembly(u8 handle, SocketSlot& value) {
     u32 total = 0;
     for (;;) {
-      ReassemblyKey selected{};
-      bool found = false;
-      reassembly_.for_each([&](ReassemblyKey key, ReassemblySegment&) {
+      auto selected = reassembly_.end();
+      for (auto it = reassembly_.begin(); it != reassembly_.end(); ++it) {
+        if (!*it) continue;
+        const auto key = (*it)->first;
         if (key.handle != handle ||
             static_cast<i32>(key.sequence - value.receive_next) > 0) {
-          return;
+          continue;
         }
         // Prefer the closest segment at or before receive_next. Older fully
         // covered entries are removed on subsequent iterations.
-        if (!found || static_cast<i32>(key.sequence - selected.sequence) > 0) {
-          selected = key;
-          found = true;
+        if (selected == reassembly_.end() ||
+            static_cast<i32>(key.sequence - (*selected)->first.sequence) > 0) {
+          selected = it;
         }
-      });
-      if (!found) {
+      }
+      if (selected == reassembly_.end()) {
         break;
       }
-      auto* queued = reassembly_.find(selected);
-      if (queued == nullptr) {
-        break;
-      }
-      const u32 acknowledged = value.receive_next - selected.sequence;
+      auto* queued = &(*selected)->second;
+      const u32 acknowledged = value.receive_next - (*selected)->first.sequence;
       if (acknowledged > queued->size ||
           (acknowledged == queued->size && !queued->finish)) {
-        static_cast<void>(reassembly_.erase(selected));
+        selected->reset();
         continue;
       }
       const u32 remaining = queued->size - acknowledged;
@@ -579,7 +567,7 @@ class SocketTable {
       const auto appended = append_received(
           value, queued->data + acknowledged, remaining, queued->finish);
       total += appended.size;
-      static_cast<void>(reassembly_.erase(selected));
+      selected->reset();
       if (appended.result != SocketResult::success ||
           appended.size != remaining) {
         return {appended.result, total};
@@ -589,14 +577,15 @@ class SocketTable {
   }
 
   void clear_reassembly(u8 handle) {
-    reassembly_.erase_if(
-        [handle](ReassemblyKey key) { return key.handle == handle; });
+    for (auto& slot : reassembly_)
+      if (slot && slot->first.handle == handle) slot.reset();
   }
 
   SocketSlot slots_[socket_capacity]{};
-  container::FixedUnorderedMap<ReassemblyKey, ReassemblySegment,
-                               reassembly_capacity, ReassemblyHash>
-      reassembly_{};
+  // Fixed slots preserve packet addresses and avoid allocation or moving
+  // payloads when ACKs/close remove another entry. Capacity is only sixteen.
+  std::array<std::optional<std::pair<ReassemblyKey, ReassemblySegment>>,
+             reassembly_capacity> reassembly_{};
 };
 
 }  // namespace mikos::network

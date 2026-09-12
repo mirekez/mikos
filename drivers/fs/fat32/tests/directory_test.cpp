@@ -38,21 +38,21 @@ void check_names_and_paths(mikos::test::Suite& suite) {
 
   auto mounted = Volume<fat32::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, mounted);
-  auto file = mounted.value.lookup_path("/readme.txt");
+  auto file = mounted->lookup_path("/readme.txt");
   MIKOS_CHECK(suite, file);
-  MIKOS_CHECK(suite, file.value.first_cluster == 4);
+  MIKOS_CHECK(suite, file->first_cluster == 4);
 
-  file = mounted.value.lookup_path("/Long readable name.txt");
+  file = mounted->lookup_path("/Long readable name.txt");
   MIKOS_CHECK(suite, file);
-  MIKOS_CHECK(suite, file.value.first_cluster == 5);
+  MIKOS_CHECK(suite, file->first_cluster == 5);
 
-  file = mounted.value.lookup_path("SUBDIR/INNER.BIN");
+  file = mounted->lookup_path("SUBDIR/INNER.BIN");
   MIKOS_CHECK(suite, file);
-  MIKOS_CHECK(suite, file.value.first_cluster == 7);
+  MIKOS_CHECK(suite, file->first_cluster == 7);
 
-  const auto missing = mounted.value.lookup_path("/missing");
+  const auto missing = mounted->lookup_path("/missing");
   MIKOS_CHECK(suite, !missing);
-  MIKOS_CHECK(suite, missing.error == Error::not_found);
+  MIKOS_CHECK(suite, missing.error() == Error::not_found);
 }
 
 void check_orphan_long_name_falls_back(mikos::test::Suite& suite) {
@@ -67,10 +67,10 @@ void check_orphan_long_name_falls_back(mikos::test::Suite& suite) {
 
   auto mounted = Volume<fat32::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, mounted);
-  const auto alias_result = mounted.value.lookup_path("/alias.txt");
+  const auto alias_result = mounted->lookup_path("/alias.txt");
   MIKOS_CHECK(suite, alias_result);
   const auto long_result =
-      mounted.value.lookup_path("/Broken long name");
+      mounted->lookup_path("/Broken long name");
   MIKOS_CHECK(suite, !long_result);
 }
 

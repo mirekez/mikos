@@ -24,10 +24,10 @@ void check_inline_root_extent(mikos::test::Suite& suite) {
 
   auto mounted = Volume<ext4::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, mounted);
-  const auto inode = mounted.value.read_inode(3);
+  const auto inode = mounted->read_inode(3);
   MIKOS_CHECK(suite, inode);
   u8 output[80]{};
-  const auto read = mounted.value.read(inode.value, 1000, output,
+  const auto read = mounted->read((*inode), 1000, output,
                                        sizeof(output));
   MIKOS_CHECK(suite, read);
   for (u32 index = 0; index < 24; ++index) {
@@ -51,15 +51,15 @@ void check_external_and_legacy(mikos::test::Suite& suite) {
 
   auto mounted = Volume<ext4::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, mounted);
-  auto inode = mounted.value.read_inode(3);
+  auto inode = mounted->read_inode(3);
   u8 output[32]{};
-  auto read = mounted.value.read(inode.value, 0, output, 15);
+  auto read = mounted->read((*inode), 0, output, 15);
   MIKOS_CHECK(suite, read);
   MIKOS_CHECK(suite, output[0] == 'e');
   MIKOS_CHECK(suite, output[14] == 't');
 
-  inode = mounted.value.read_inode(4);
-  read = mounted.value.read(inode.value, 12 * 1024, output, 8);
+  inode = mounted->read_inode(4);
+  read = mounted->read((*inode), 12 * 1024, output, 8);
   MIKOS_CHECK(suite, read);
   MIKOS_CHECK(suite, output[0] == 'i');
   MIKOS_CHECK(suite, output[7] == 't');
@@ -69,13 +69,13 @@ void check_uninitialized_extent(mikos::test::Suite& suite) {
   ext4::test::Image image;
   image.extent_inode(3, 0x81a4, 32, 11, 1, 0, true);
   auto mounted = Volume<ext4::test::Device>::mount(image.device);
-  const auto inode = mounted.value.read_inode(3);
+  const auto inode = mounted->read_inode(3);
   u8 output[32];
   for (auto& byte : output) {
     byte = 0xff;
   }
   const auto read =
-      mounted.value.read(inode.value, 0, output, sizeof(output));
+      mounted->read((*inode), 0, output, sizeof(output));
   MIKOS_CHECK(suite, read);
   for (auto byte : output) {
     MIKOS_CHECK(suite, byte == 0);

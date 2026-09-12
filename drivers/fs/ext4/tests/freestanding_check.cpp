@@ -16,9 +16,9 @@ struct Device {
   if (!mounted) {
     return;
   }
-  static_cast<void>(mounted.value.lookup_path("/file"));
-  static_cast<void>(mounted.value.read(node, 0, output, 1));
-  static_cast<void>(mounted.value.for_each(
+  static_cast<void>(mounted->lookup_path("/file"));
+  static_cast<void>(mounted->read(node, 0, output, 1));
+  static_cast<void>(mounted->for_each(
       node, [](const Entry&) { return true; }));
 }
 

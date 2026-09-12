@@ -19,6 +19,41 @@ int main() {
   using mikos::network::SocketState;
   mikos::network::SocketTable sockets;
 
+  // Fill every reassembly slot across SEQ wraparound, preserve duplicates
+  // even when full, drain in order, then reuse slots after reset/close.
+  {
+    using namespace mikos;
+    network::SocketTable table;
+    const auto listen = table.open(Type::stream);
+    MIKOS_CHECK(suite, table.bind(listen.handle, {any, 22}) == SocketResult::success);
+    MIKOS_CHECK(suite, table.listen(listen.handle, 2) == SocketResult::success);
+    const auto child = table.begin_connection(listen.handle, {local_ip, 22},
+        {peer_ip, 49000}, peer_mac, 0xfffffff0u, 100);
+    MIKOS_CHECK(suite, table.establish(child.handle, 101) == SocketResult::success);
+    const u32 start = table.slot(child.handle)->receive_next;
+    for (u32 i = 1; i <= network::reassembly_capacity; ++i) {
+      const u8 byte = static_cast<u8>(i);
+      MIKOS_CHECK(suite, table.receive(child.handle, start + i, &byte, 1, false).result == SocketResult::success);
+    }
+    const u8 different = 99;
+    MIKOS_CHECK(suite, table.receive(child.handle, start + 1, &different, 1, false).result == SocketResult::success);
+    MIKOS_CHECK(suite, table.receive(child.handle, start + 17, &different, 1, false).result == SocketResult::no_space);
+    const u8 first = 0;
+    MIKOS_CHECK(suite, table.receive(child.handle, start, &first, 1, false).size == 17);
+    u8 output[17]{};
+    MIKOS_CHECK(suite, table.read(child.handle, output, 17).size == 17);
+    for (u32 i = 0; i < 17; ++i) MIKOS_CHECK(suite, output[i] == i);
+    for (u32 i = 1; i <= network::reassembly_capacity; ++i)
+      MIKOS_CHECK(suite, table.receive(child.handle, start + 17 + i, &different, 1, false).result == SocketResult::success);
+    table.reset(child.handle);
+    const auto second = table.begin_connection(listen.handle, {local_ip, 22},
+        {peer_ip, 49001}, peer_mac, 500, 200);
+    MIKOS_CHECK(suite, table.establish(second.handle, 201) == SocketResult::success);
+    for (u32 i = 1; i <= network::reassembly_capacity; ++i)
+      MIKOS_CHECK(suite, table.receive(second.handle, 501 + i, &different, 1, false).result == SocketResult::success);
+    MIKOS_CHECK(suite, table.release(second.handle) == SocketResult::success);
+  }
+
   const auto control = sockets.open(Type::datagram);
   MIKOS_CHECK(suite, control.result == SocketResult::success);
   MIKOS_CHECK(suite, sockets.slot(control.handle)->state ==

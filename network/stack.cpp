@@ -337,11 +337,16 @@ class BootstrapStack {
   [[nodiscard]] bool queue_transmission(u8 handle, const SocketSlot& socket,
                                         u8 flags, const u8* payload,
                                         u32 payload_size, u32 sequence) {
-    bool inserted = false;
-    auto* pending = transmissions_.find_or_emplace({handle, sequence}, inserted);
-    if (pending == nullptr || !inserted || payload_size > sizeof(pending->data)) {
-      return false;
-    }
+    const TransmitKey key{handle, sequence};
+    if (payload_size > transmit_segment_capacity ||
+        std::ranges::any_of(transmissions_, [&](const auto& slot) {
+          return slot && slot->first == key;
+        })) return false;
+    const auto free = std::ranges::find_if(transmissions_,
+        [](const auto& slot) { return !slot; });
+    if (free == transmissions_.end()) return false;
+    auto* pending = &free->emplace().second;
+    (*free)->first = key;
     pending->size = static_cast<u16>(payload_size);
     pending->flags = flags;
     pending->attempts = 0;
@@ -349,7 +354,7 @@ class BootstrapStack {
       pending->data[i] = payload[i];
     }
     if (!send_segment(socket, flags, pending->data, payload_size, sequence)) {
-      static_cast<void>(transmissions_.erase({handle, sequence}));
+      free->reset();
       return false;
     }
     pending->attempts = 1;
@@ -362,37 +367,33 @@ class BootstrapStack {
     if (static_cast<i32>(acknowledgement - send_next) > 0) {
       return;
     }
-    transmissions_.erase_if([&](TransmitKey key) {
-      if (key.handle != handle) {
-        return false;
-      }
-      const auto* segment = transmissions_.find(key);
-      if (segment == nullptr) {
-        return false;
-      }
-      const u32 end = key.sequence + segment->size;
-      return static_cast<i32>(acknowledgement - end) >= 0;
-    });
+    for (auto& slot : transmissions_) {
+      if (!slot || slot->first.handle != handle) continue;
+      const u32 end = slot->first.sequence + slot->second.size;
+      if (static_cast<i32>(acknowledgement - end) >= 0) slot.reset();
+    }
   }
 
   void clear_transmissions(u8 handle) {
-    transmissions_.erase_if(
-        [handle](TransmitKey key) { return key.handle == handle; });
+    for (auto& slot : transmissions_)
+      if (slot && slot->first.handle == handle) slot.reset();
   }
 
   void flush_retransmission() {
     ++poll_epoch_;
     TransmitKey selected{};
     TransmitSegment* selected_pending = nullptr;
-    transmissions_.for_each([&](TransmitKey key, TransmitSegment& pending) {
+    for (auto& slot : transmissions_) {
+      if (!slot) continue;
+      auto& [key, pending] = *slot;
       if (static_cast<i32>(poll_epoch_ - pending.retry_at) < 0) {
-        return;
+        continue;
       }
       auto* socket = sockets_.slot(key.handle);
       if (socket == nullptr ||
           (socket->state != SocketState::established &&
            socket->state != SocketState::close_wait)) {
-        return;
+        continue;
       }
       // TCP recovery starts with the oldest unacknowledged data. In
       // particular, do not cycle through every queued SSH record while a
@@ -402,7 +403,7 @@ class BootstrapStack {
         selected = key;
         selected_pending = &pending;
       }
-    });
+    }
     if (selected_pending == nullptr) {
       return;
     }
@@ -557,9 +558,8 @@ class BootstrapStack {
 
   InterfaceState state_{};
   SocketTable sockets_{};
-  container::FixedUnorderedMap<TransmitKey, TransmitSegment,
-                               transmit_capacity, TransmitHash>
-      transmissions_{};
+  std::array<std::optional<std::pair<TransmitKey, TransmitSegment>>,
+             transmit_capacity> transmissions_{};
   alignas(4) u8 transmit_buffer_[1536]{};
   char tcp_table_buffer_[2048]{};
   u32 next_sequence_{0x4d494b4f};

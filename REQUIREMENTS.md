@@ -315,6 +315,11 @@ An exclusion MAY later be removed only with behavioral tests.
 - Floating point, SIMD state, dynamic initialization, heap use, and thread-local
   storage are forbidden in the kernel until individually enabled by an
   architecture decision record and tests.
+  The bounded caller-owned container arenas and software-only binary32
+  load-factor arithmetic are enabled for RV32-flat by
+  [ADR-0002](doc/adr/0002-kernel-standard-containers.md). Exceptions, hardware
+  floating point, global heap allocation and implicit initialization remain
+  disabled.
 
 ## 12. Build and repository requirements
 

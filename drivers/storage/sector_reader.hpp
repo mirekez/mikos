@@ -1,6 +1,9 @@
 #pragma once
 
 #include <mikos/base.hpp>
+#include <algorithm>
+#include <array>
+#include <span>
 
 namespace mikos::drivers::storage {
 
@@ -24,6 +27,17 @@ template <SectorDevice Device>
 class SectorReader {
  public:
   explicit constexpr SectorReader(Device& device) : device_{&device} {}
+
+  [[nodiscard]] bool read(u64 offset, std::span<u8> output) {
+    return output.size() <= ~u32{0} &&
+           read(offset, output.data(), static_cast<u32>(output.size()));
+  }
+
+  [[nodiscard]] bool write(u64 offset, std::span<const u8> input)
+      requires WritableSectorDevice<Device> {
+    return input.size() <= ~u32{0} &&
+           write(offset, input.data(), static_cast<u32>(input.size()));
+  }
 
   [[nodiscard]] u64 size() const {
     const u64 sectors = device_->sector_count();
@@ -59,16 +73,14 @@ class SectorReader {
         chunk = count;
       }
       if (!cache_valid_ || cached_sector_ != sector) {
-        if (!device_->read_sector(sector, cache_)) {
+        if (!device_->read_sector(sector, cache_.data())) {
           cache_valid_ = false;
           return false;
         }
         cached_sector_ = sector;
         cache_valid_ = true;
       }
-      for (u32 index = 0; index < chunk; ++index) {
-        output[index] = cache_[within + index];
-      }
+      std::copy_n(cache_.data() + within, chunk, output);
       output += chunk;
       offset += chunk;
       count -= chunk;
@@ -103,17 +115,15 @@ class SectorReader {
         chunk = count;
       }
       if (!cache_valid_ || cached_sector_ != sector) {
-        if (!device_->read_sector(sector, cache_)) {
+        if (!device_->read_sector(sector, cache_.data())) {
           cache_valid_ = false;
           return false;
         }
         cached_sector_ = sector;
         cache_valid_ = true;
       }
-      for (u32 index = 0; index < chunk; ++index) {
-        cache_[within + index] = input[index];
-      }
-      if (!device_->write_sector(sector, cache_)) {
+      std::copy_n(input, chunk, cache_.data() + within);
+      if (!device_->write_sector(sector, cache_.data())) {
         cache_valid_ = false;
         return false;
       }
@@ -132,7 +142,7 @@ class SectorReader {
 
  private:
   Device* device_{};
-  alignas(8) u8 cache_[Device::sector_size]{};
+  alignas(8) std::array<u8, Device::sector_size> cache_{};
   u64 cached_sector_{};
   bool cache_valid_{};
 };

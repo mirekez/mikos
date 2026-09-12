@@ -15,7 +15,7 @@ void check_valid(mikos::test::Suite& suite) {
   if (!mounted) {
     return;
   }
-  const auto& geometry = mounted.value.geometry();
+  const auto& geometry = mounted->geometry();
   MIKOS_CHECK(suite, geometry.block_size == 1024);
   MIKOS_CHECK(suite, geometry.block_count == 64);
   MIKOS_CHECK(suite, geometry.group_count == 1);
@@ -38,7 +38,7 @@ void check_block_and_descriptor_sizes(mikos::test::Suite& suite) {
     MIKOS_CHECK(suite, mounted);
     if (mounted) {
       MIKOS_CHECK(suite,
-                  mounted.value.geometry().block_size == block_size);
+                  mounted->geometry().block_size == block_size);
     }
   }
 
@@ -48,7 +48,7 @@ void check_block_and_descriptor_sizes(mikos::test::Suite& suite) {
   auto mounted = Volume<ext4::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, mounted);
   if (mounted) {
-    MIKOS_CHECK(suite, mounted.value.geometry().descriptor_size == 64);
+    MIKOS_CHECK(suite, mounted->geometry().descriptor_size == 64);
   }
 
   image.device.write32(1024 + 0x64, 0x400);
@@ -56,9 +56,9 @@ void check_block_and_descriptor_sizes(mikos::test::Suite& suite) {
   MIKOS_CHECK(suite, mounted);
   if (mounted) {
     MIKOS_CHECK(suite,
-                mounted.value.geometry().metadata_checksums);
+                mounted->geometry().metadata_checksums);
     MIKOS_CHECK(suite,
-                !mounted.value.geometry().integrity_verified);
+                !mounted->geometry().integrity_verified);
   }
 }
 
@@ -67,13 +67,13 @@ void check_feature_rejection(mikos::test::Suite& suite) {
   image.device.write32(1024 + 0x60, 0x42 | 0x10);
   auto mounted = Volume<ext4::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::unsupported);
+  MIKOS_CHECK(suite, mounted.error() == Error::unsupported);
 
   image.device.write32(1024 + 0x60, 0x42);
   image.device.write32(1024 + 0x64, 0x200);
   mounted = Volume<ext4::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::unsupported);
+  MIKOS_CHECK(suite, mounted.error() == Error::unsupported);
 }
 
 void check_bounds_and_io(mikos::test::Suite& suite) {
@@ -81,13 +81,13 @@ void check_bounds_and_io(mikos::test::Suite& suite) {
   image.device.resize(4096);
   auto mounted = Volume<ext4::test::Device>::mount(image.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::out_of_bounds);
+  MIKOS_CHECK(suite, mounted.error() == Error::out_of_bounds);
 
   ext4::test::Image failed;
   failed.device.fail_reads(true);
   mounted = Volume<ext4::test::Device>::mount(failed.device);
   MIKOS_CHECK(suite, !mounted);
-  MIKOS_CHECK(suite, mounted.error == Error::io);
+  MIKOS_CHECK(suite, mounted.error() == Error::io);
 }
 
 }  // namespace

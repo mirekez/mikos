@@ -25,7 +25,8 @@ if [[ $status -ne 0 ]]; then
   exit 1
 fi
 
-if ! rg -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
+if ! rg -q '^MIKOS:KERNEL_CXX_OK$' "$log" ||
+   ! rg -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
    ! rg -q '^MIKOS_BUSYBOX_OK$' "$log" ||
    [[ $(rg -c '^MIKOS_WRITE_OK$' "$log") -ne 2 ]]; then
   sed -n '1,240p' "$log"

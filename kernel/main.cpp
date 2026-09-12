@@ -84,7 +84,7 @@ struct Aux {
                              void* output, u32 size) {
   const auto result = drivers::fs::root::read(
       file, offset, reinterpret_cast<u8*>(output), size);
-  return result && result.value == size;
+  return result && (*result) == size;
 }
 
 template <typename Reader>
@@ -255,10 +255,10 @@ void copy_path(char* output, const char* input) {
   Image image{};
   if (!node ||
 #ifdef MIKOS_TRIBE_INTERACTIVE
-      (preloaded_busybox ? !load_preloaded_busybox(node.value, image)
-                         : !load_image(node.value, image, writable_only))) {
+      (preloaded_busybox ? !load_preloaded_busybox((*node), image)
+                         : !load_image((*node), image, writable_only))) {
 #else
-      preloaded_busybox || !load_image(node.value, image, writable_only)) {
+      preloaded_busybox || !load_image((*node), image, writable_only)) {
 #endif
     write_text("MIKOS:BAD_ELF\n");
     shutdown(1);
@@ -397,31 +397,31 @@ bool replace_with_executable(TrapFrame& frame, const char* path,
     return false;
   }
   const auto node = drivers::fs::root::lookup(path);
-  if (!node || node.value.type != drivers::fs::root::Type::regular ||
-      (node.value.mode & 0111) == 0) {
+  if (!node || node->type != drivers::fs::root::Type::regular ||
+      (node->mode & 0111) == 0) {
     return false;
   }
   const auto busybox_node = drivers::fs::root::lookup("/bin/busybox");
   const bool busybox = busybox_node &&
-                       busybox_node.value.inode == node.value.inode;
+                       busybox_node->inode == node->inode;
   Image image{};
 #ifdef MIKOS_TRIBE_INTERACTIVE
   const auto dropbear_node =
       drivers::fs::root::lookup("/usr/sbin/dropbear");
   const bool dropbear = dropbear_node &&
-                        dropbear_node.value.inode == node.value.inode;
+                        dropbear_node->inode == node->inode;
   if (dropbear) {
     write_text("MIKOS:DROPBEAR_PRELOAD_START\n");
   }
-  const bool loaded = dropbear ? load_preloaded_dropbear(node.value, image)
-                               : load_image(node.value, image, busybox);
+  const bool loaded = dropbear ? load_preloaded_dropbear((*node), image)
+                               : load_image((*node), image, busybox);
   if (dropbear) {
     write_text(loaded ? "MIKOS:DROPBEAR_PRELOAD_OK\n"
                       : "MIKOS:DROPBEAR_PRELOAD_FAIL\n");
   }
   if (!loaded) {
 #else
-  if (!load_image(node.value, image, busybox)) {
+  if (!load_image((*node), image, busybox)) {
 #endif
     return false;
   }
@@ -461,11 +461,11 @@ bool restore_executable_image(const char* path) {
 #ifdef MIKOS_TRIBE_INTERACTIVE
   const auto dropbear_node =
       drivers::fs::root::lookup("/usr/sbin/dropbear");
-  if (node && dropbear_node && node.value.inode == dropbear_node.value.inode) {
-    return load_preloaded_dropbear(node.value, image);
+  if (node && dropbear_node && node->inode == dropbear_node->inode) {
+    return load_preloaded_dropbear((*node), image);
   }
 #endif
-  return node && load_image(node.value, image);
+  return node && load_image((*node), image);
 }
 
 void start_stress_ng(TrapFrame& frame) {
@@ -531,6 +531,11 @@ void write_u32(u32 value) {
 
 }  // namespace mikos
 
+namespace mikos {
+void initialize_kernel_tables();
+bool kernel_cxx_smoke();
+}
+
 extern "C" void kernel_main() {
   using namespace mikos;
   asm volatile("csrw mie, zero");
@@ -540,6 +545,12 @@ extern "C" void kernel_main() {
 
   static_cast<void>(drivers::uart::initialize());
   write_text("MIKOS:BOOT\n");
+  initialize_kernel_tables();
+  if (!kernel_cxx_smoke()) {
+    write_text("MIKOS:KERNEL_CXX_FAIL\n");
+    shutdown(32);
+  }
+  write_text("MIKOS:KERNEL_CXX_OK\n");
   if (!flat_and_device_irq_off()) {
     write_text("MIKOS:PLATFORM_STATE_BAD\n");
     shutdown(3);

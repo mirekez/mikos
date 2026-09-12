@@ -30,4 +30,5 @@ class Suite {
 
 }  // namespace mikos::test
 
-#define MIKOS_CHECK(suite, expression) (suite).check((expression), #expression)
+#define MIKOS_CHECK(suite, expression) \
+  (suite).check(static_cast<bool>(expression), #expression)

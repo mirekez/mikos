@@ -1,6 +1,8 @@
 #pragma once
 
 #include <drivers/fs/filesystem.hpp>
+#include <mikos/container/inplace_vector.hpp>
+#include <array>
 
 namespace mikos::drivers::fs::fat32 {
 
@@ -54,16 +56,14 @@ inline constexpr u32 end_of_chain = 0x0ffffff8;
 inline constexpr u32 reserved_cluster = 0x0ffffff0;
 
 struct LongNameState {
-  u16 characters[260]{};
+  std::array<u16, 260> characters{};
   u8 checksum{};
   u8 expected{};
   u8 parts{};
   bool active{};
 
   void reset() {
-    for (auto& character : characters) {
-      character = 0xffff;
-    }
+    characters.fill(0xffff);
     checksum = 0;
     expected = 0;
     parts = 0;
@@ -221,12 +221,12 @@ class Volume {
     const Error read_error =
         read_exact(device, 0, volume.sector_, sizeof(volume.sector_));
     if (read_error != Error::none) {
-      return Result<Volume>::failure(read_error);
+      return std::unexpected(read_error);
     }
 
     const u8* boot = volume.sector_;
     if (boot[510] != 0x55 || boot[511] != 0xaa) {
-      return Result<Volume>::failure(Error::invalid_format);
+      return std::unexpected(Error::invalid_format);
     }
     auto& geometry = volume.geometry_;
     geometry.bytes_per_sector = little_u16(boot + 11);
@@ -253,26 +253,26 @@ class Volume {
         root_entry_count != 0 || total_sectors_16 != 0 ||
         fat_sectors_16 != 0 || geometry.total_sectors == 0 ||
         geometry.fat_sectors == 0 || version != 0) {
-      return Result<Volume>::failure(Error::invalid_format);
+      return std::unexpected(Error::invalid_format);
     }
     geometry.bytes_per_cluster =
         geometry.bytes_per_sector * geometry.sectors_per_cluster;
     if (geometry.bytes_per_cluster > 32 * 1024) {
-      return Result<Volume>::failure(Error::unsupported);
+      return std::unexpected(Error::unsupported);
     }
 
     geometry.active_fat =
         (extended_flags & 0x80) != 0 ? extended_flags & 0x0f : 0;
     geometry.mirror_fats = (extended_flags & 0x80) == 0;
     if (geometry.active_fat >= geometry.fat_count) {
-      return Result<Volume>::failure(Error::invalid_format);
+      return std::unexpected(Error::invalid_format);
     }
 
     const u64 fat_region =
         static_cast<u64>(geometry.fat_count) * geometry.fat_sectors;
     const u64 metadata_sectors = geometry.reserved_sectors + fat_region;
     if (metadata_sectors >= geometry.total_sectors) {
-      return Result<Volume>::failure(Error::invalid_format);
+      return std::unexpected(Error::invalid_format);
     }
     geometry.first_data_sector = static_cast<u32>(metadata_sectors);
     const u32 data_sectors =
@@ -281,12 +281,12 @@ class Volume {
         data_sectors / geometry.sectors_per_cluster;
     if (geometry.cluster_count < 65525 ||
         geometry.cluster_count > detail::reserved_cluster - 2) {
-      return Result<Volume>::failure(Error::invalid_format);
+      return std::unexpected(Error::invalid_format);
     }
     const u32 maximum_cluster = geometry.cluster_count + 1;
     if (geometry.root_cluster < 2 ||
         geometry.root_cluster > maximum_cluster) {
-      return Result<Volume>::failure(Error::invalid_format);
+      return std::unexpected(Error::invalid_format);
     }
 
     const u64 fat_bytes =
@@ -299,7 +299,7 @@ class Volume {
         geometry.bytes_per_sector;
     if (fat_bytes < required_fat_bytes ||
         volume_bytes > static_cast<u64>(device.size())) {
-      return Result<Volume>::failure(Error::out_of_bounds);
+      return std::unexpected(Error::out_of_bounds);
     }
 
     if (geometry.fs_info_sector != 0xffff &&
@@ -326,7 +326,7 @@ class Volume {
     }
 
     volume.mounted_ = true;
-    return Result<Volume>::success(volume);
+    return Result<Volume>(volume);
   }
 
   [[nodiscard]] constexpr const Geometry& geometry() const {
@@ -423,12 +423,12 @@ class Volume {
 
       const auto next = next_cluster(cluster);
       if (!next) {
-        return next.error;
+        return next.error();
       }
-      if (next.value.end) {
+      if (next->end) {
         return Error::none;
       }
-      cluster = next.value.cluster;
+      cluster = next->cluster;
     }
     return Error::loop;
   }
@@ -436,7 +436,7 @@ class Volume {
   [[nodiscard]] Result<Node> lookup(const Node& directory,
                                     const char* name) {
     if (name == nullptr || *name == '\0') {
-      return Result<Node>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     Node found{};
     bool matched = false;
@@ -450,15 +450,15 @@ class Volume {
       return true;
     });
     if (error != Error::none) {
-      return Result<Node>::failure(error);
+      return std::unexpected(error);
     }
-    return matched ? Result<Node>::success(found)
-                   : Result<Node>::failure(Error::not_found);
+    return matched ? Result<Node>(found)
+                   : std::unexpected(Error::not_found);
   }
 
   [[nodiscard]] Result<Node> lookup_path(const char* path) {
     if (!mounted_ || path == nullptr) {
-      return Result<Node>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     Node current = root();
     u32 cursor = 0;
@@ -470,7 +470,7 @@ class Volume {
       u32 size = 0;
       while (path[cursor] != '\0' && path[cursor] != '/') {
         if (size == Name::capacity) {
-          return Result<Node>::failure(Error::invalid_argument);
+          return std::unexpected(Error::invalid_argument);
         }
         component[size++] = path[cursor++];
       }
@@ -482,30 +482,30 @@ class Volume {
         continue;
       }
       if (size == 2 && component[0] == '.' && component[1] == '.') {
-        return Result<Node>::failure(Error::unsupported);
+        return std::unexpected(Error::unsupported);
       }
       if (!current.directory()) {
-        return Result<Node>::failure(Error::not_directory);
+        return std::unexpected(Error::not_directory);
       }
       const auto child = lookup(current, component);
       if (!child) {
         return child;
       }
-      current = child.value;
+      current = (*child);
     }
-    return Result<Node>::success(current);
+    return Result<Node>(current);
   }
 
   [[nodiscard]] Result<u32> read(const Node& file, u64 offset,
                                  u8* output, u32 size) {
     if (!mounted_ || (output == nullptr && size != 0)) {
-      return Result<u32>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     if (file.directory()) {
-      return Result<u32>::failure(Error::is_directory);
+      return std::unexpected(Error::is_directory);
     }
     if (offset >= file.size || size == 0) {
-      return Result<u32>::success(0);
+      return Result<u32>(0);
     }
     u32 remaining = size;
     const u64 available = static_cast<u64>(file.size) - offset;
@@ -513,7 +513,7 @@ class Volume {
       remaining = static_cast<u32>(available);
     }
     if (remaining != 0 && !valid_cluster(file.first_cluster)) {
-      return Result<u32>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
 
     u32 cluster = file.first_cluster;
@@ -521,16 +521,16 @@ class Volume {
     u32 traversed = 0;
     while (clusters_to_skip-- != 0) {
       if (++traversed > geometry_.cluster_count) {
-        return Result<u32>::failure(Error::loop);
+        return std::unexpected(Error::loop);
       }
       const auto next = next_cluster(cluster);
       if (!next) {
-        return Result<u32>::failure(next.error);
+        return std::unexpected(next.error());
       }
-      if (next.value.end) {
-        return Result<u32>::failure(Error::corrupt);
+      if (next->end) {
+        return std::unexpected(Error::corrupt);
       }
-      cluster = next.value.cluster;
+      cluster = next->cluster;
     }
 
     u32 within = static_cast<u32>(offset % geometry_.bytes_per_cluster);
@@ -545,7 +545,7 @@ class Volume {
           read_exact(*device_, cluster_byte_offset(cluster) + within,
                      output, count);
       if (error != Error::none) {
-        return Result<u32>::failure(error);
+        return std::unexpected(error);
       }
       output += count;
       remaining -= count;
@@ -554,18 +554,18 @@ class Volume {
         break;
       }
       if (++traversed > geometry_.cluster_count) {
-        return Result<u32>::failure(Error::loop);
+        return std::unexpected(Error::loop);
       }
       const auto next = next_cluster(cluster);
       if (!next) {
-        return Result<u32>::failure(next.error);
+        return std::unexpected(next.error());
       }
-      if (next.value.end) {
-        return Result<u32>::failure(Error::corrupt);
+      if (next->end) {
+        return std::unexpected(Error::corrupt);
       }
-      cluster = next.value.cluster;
+      cluster = next->cluster;
     }
-    return Result<u32>::success(requested);
+    return Result<u32>(requested);
   }
 
   template <typename D = Device>
@@ -650,10 +650,10 @@ class Volume {
          (old_clusters < new_clusters ? old_clusters : new_clusters);
          ++index) {
       const auto next = next_cluster(last_kept);
-      if (!next || next.value.end) {
-        return !next ? next.error : Error::corrupt;
+      if (!next || next->end) {
+        return !next ? next.error() : Error::corrupt;
       }
-      last_kept = next.value.cluster;
+      last_kept = next->cluster;
     }
 
     if (new_clusters > old_clusters) {
@@ -688,8 +688,8 @@ class Volume {
       }
     } else {
       const auto tail = next_cluster(last_kept);
-      if (!tail || tail.value.end) {
-        return !tail ? tail.error : Error::corrupt;
+      if (!tail || tail->end) {
+        return !tail ? tail.error() : Error::corrupt;
       }
       Error error = write_fat_entry(last_kept, detail::end_of_chain);
       if (error == Error::none) {
@@ -701,7 +701,7 @@ class Volume {
       if (error != Error::none) {
         return error;
       }
-      error = free_chain(tail.value.cluster);
+      error = free_chain(tail->cluster);
       if (error != Error::none) {
         return error;
       }
@@ -717,19 +717,19 @@ class Volume {
                                   const u8* input, u32 size) {
     if (!mounted_ || (input == nullptr && size != 0) ||
         offset > 0xffffffffu || size > 0xffffffffu - offset) {
-      return Result<u32>::failure(Error::invalid_argument);
+      return std::unexpected(Error::invalid_argument);
     }
     if (file.directory()) {
-      return Result<u32>::failure(Error::is_directory);
+      return std::unexpected(Error::is_directory);
     }
     if (size == 0) {
-      return Result<u32>::success(0);
+      return Result<u32>(0);
     }
     const u32 end = static_cast<u32>(offset) + size;
     if (end > file.size) {
       const Error error = truncate(file, end);
       if (error != Error::none) {
-        return Result<u32>::failure(error);
+        return std::unexpected(error);
       }
     }
 
@@ -737,10 +737,10 @@ class Volume {
     u32 skip = static_cast<u32>(offset) / geometry_.bytes_per_cluster;
     for (u32 traversed = 0; traversed < skip; ++traversed) {
       const auto next = next_cluster(cluster);
-      if (!next || next.value.end) {
-        return Result<u32>::failure(!next ? next.error : Error::corrupt);
+      if (!next || next->end) {
+        return std::unexpected(!next ? next.error() : Error::corrupt);
       }
-      cluster = next.value.cluster;
+      cluster = next->cluster;
     }
     u32 within = static_cast<u32>(offset) % geometry_.bytes_per_cluster;
     u32 remaining = size;
@@ -753,22 +753,22 @@ class Volume {
                                       cluster_byte_offset(cluster) + within,
                                       input, count);
       if (error != Error::none) {
-        return Result<u32>::failure(error);
+        return std::unexpected(error);
       }
       input += count;
       remaining -= count;
       within = 0;
       if (remaining != 0) {
         const auto next = next_cluster(cluster);
-        if (!next || next.value.end) {
-          return Result<u32>::failure(!next ? next.error : Error::corrupt);
+        if (!next || next->end) {
+          return std::unexpected(!next ? next.error() : Error::corrupt);
         }
-        cluster = next.value.cluster;
+        cluster = next->cluster;
       }
     }
     const Error error = flush();
-    return error == Error::none ? Result<u32>::success(size)
-                                : Result<u32>::failure(error);
+    return error == Error::none ? Result<u32>(size)
+                                : std::unexpected(error);
   }
 
   template <typename D = Device>
@@ -787,8 +787,8 @@ class Volume {
     if (existing) {
       return Error::already_exists;
     }
-    if (existing.error != Error::not_found) {
-      return existing.error;
+    if (existing.error() != Error::not_found) {
+      return existing.error();
     }
     Node file{};
     file.attributes = 0x20;
@@ -803,7 +803,7 @@ class Volume {
         if (file.first_cluster != 0) {
           (void)free_chain(file.first_cluster);
         }
-        return written.error;
+        return written.error();
       }
     }
     return Error::none;
@@ -812,18 +812,18 @@ class Volume {
   [[nodiscard]] Result<u32> read(const char* path, u64 offset,
                                  u8* output, u32 size) {
     const auto file = lookup_path(path);
-    return file ? read(file.value, offset, output, size)
-                : Result<u32>::failure(file.error);
+    return file ? read((*file), offset, output, size)
+                : std::unexpected(file.error());
   }
 
   [[nodiscard]] Result<u32> file_size(const char* path) {
     const auto file = lookup_path(path);
     if (!file) {
-      return Result<u32>::failure(file.error);
+      return std::unexpected(file.error());
     }
-    return file.value.directory()
-               ? Result<u32>::failure(Error::is_directory)
-               : Result<u32>::success(file.value.size);
+    return file->directory()
+               ? std::unexpected(Error::is_directory)
+               : Result<u32>(file->size);
   }
 
   template <typename D = Device>
@@ -837,11 +837,11 @@ class Volume {
     }
     const auto found = lookup(parent, leaf);
     if (!found) {
-      return found.error;
+      return found.error();
     }
-    if (found.value.directory()) {
+    if (found->directory()) {
       bool nonempty = false;
-      error = for_each(found.value, [&](const Entry& entry) {
+      error = for_each((*found), [&](const Entry& entry) {
         if (!entry.name.equals(".") && !entry.name.equals("..")) {
           nonempty = true;
           return false;
@@ -855,11 +855,11 @@ class Volume {
         return Error::unsupported;
       }
     }
-    error = erase_directory_record(parent, found.value.entry_offset);
+    error = erase_directory_record(parent, found->entry_offset);
     if (error != Error::none || (error = flush()) != Error::none) {
       return error;
     }
-    error = free_chain(found.value.first_cluster);
+    error = free_chain(found->first_cluster);
     return error == Error::none ? commit_fs_info() : error;
   }
 
@@ -881,17 +881,17 @@ class Volume {
     }
     const auto source_node = lookup(source_parent, source_leaf);
     if (!source_node) {
-      return source_node.error;
+      return source_node.error();
     }
     const auto destination_node =
         lookup(destination_parent, destination_leaf);
     if (destination_node) {
       return Error::already_exists;
     }
-    if (destination_node.error != Error::not_found) {
-      return destination_node.error;
+    if (destination_node.error() != Error::not_found) {
+      return destination_node.error();
     }
-    Node replacement = source_node.value;
+    Node replacement = (*source_node);
     replacement.entry_offset = 0;
     error = insert_directory_record(destination_parent, destination_leaf,
                                     replacement);
@@ -899,7 +899,7 @@ class Volume {
       return error;
     }
     error = erase_directory_record(source_parent,
-                                   source_node.value.entry_offset);
+                                   source_node->entry_offset);
     return error == Error::none ? flush() : error;
   }
 
@@ -910,24 +910,24 @@ class Volume {
     auto destination_node = lookup_path(destination);
     const auto source_node = lookup_path(source);
     if (!destination_node) {
-      return destination_node.error;
+      return destination_node.error();
     }
     if (!source_node) {
-      return source_node.error;
+      return source_node.error();
     }
-    if (destination_node.value.directory() ||
-        source_node.value.directory()) {
+    if (destination_node->directory() ||
+        source_node->directory()) {
       return Error::is_directory;
     }
-    if (destination_node.value.size > 0xffffffffu ||
-        source_node.value.size >
-            0xffffffffu - destination_node.value.size) {
+    if (destination_node->size > 0xffffffffu ||
+        source_node->size >
+            0xffffffffu - destination_node->size) {
       return Error::no_space;
     }
     const u32 destination_size =
-        static_cast<u32>(destination_node.value.size);
-    const u32 source_size = static_cast<u32>(source_node.value.size);
-    Error error = truncate(destination_node.value,
+        static_cast<u32>(destination_node->size);
+    const u32 source_size = static_cast<u32>(source_node->size);
+    Error error = truncate((*destination_node),
                            destination_size + source_size);
     if (error != Error::none) {
       return error;
@@ -937,14 +937,14 @@ class Volume {
       const u32 count = source_size - copied < geometry_.bytes_per_sector
                             ? source_size - copied
                             : geometry_.bytes_per_sector;
-      const auto loaded = read(source_node.value, copied, sector_, count);
-      if (!loaded || loaded.value != count) {
-        return !loaded ? loaded.error : Error::io;
+      const auto loaded = read((*source_node), copied, sector_, count);
+      if (!loaded || (*loaded) != count) {
+        return !loaded ? loaded.error() : Error::io;
       }
-      const auto stored = write(destination_node.value,
+      const auto stored = write((*destination_node),
                                 destination_size + copied, sector_, count);
-      if (!stored || stored.value != count) {
-        return !stored ? stored.error : Error::io;
+      if (!stored || (*stored) != count) {
+        return !stored ? stored.error() : Error::io;
       }
       copied += count;
     }
@@ -956,8 +956,8 @@ class Volume {
       return false;
     }
     const auto root_link = fat_entry(geometry_.root_cluster);
-    if (!root_link || root_link.value == 0 ||
-        root_link.value == detail::bad_cluster) {
+    if (!root_link || (*root_link) == 0 ||
+        (*root_link) == detail::bad_cluster) {
       return false;
     }
     return for_each(root(), [](const Entry&) { return true; }) ==
@@ -993,7 +993,9 @@ class Volume {
       --leaf_start;
     }
     const u32 leaf_size = length - leaf_start;
-    if (leaf_size == 0 || leaf_size > 255 ||
+    // The LFN limit is checked in UTF-16 units by decode_utf8_name, not
+    // UTF-8 bytes here. The enclosing path scan already bounds this buffer.
+    if (leaf_size == 0 ||
         (leaf_size == 1 && path[leaf_start] == '.') ||
         (leaf_size == 2 && path[leaf_start] == '.' &&
          path[leaf_start + 1] == '.')) {
@@ -1019,12 +1021,12 @@ class Volume {
     parent_path[parent_size] = '\0';
     const auto found = lookup_path(parent_path);
     if (!found) {
-      return found.error;
+      return found.error();
     }
-    if (!found.value.directory()) {
+    if (!found->directory()) {
       return Error::not_directory;
     }
-    parent = found.value;
+    parent = (*found);
     return Error::none;
   }
 
@@ -1034,9 +1036,11 @@ class Volume {
            value == '\\' || value == '|';
   }
 
-  [[nodiscard]] static bool decode_utf8_name(const char* name, u16* output,
-                                             u32& output_size) {
-    output_size = 0;
+  using Utf16Name = mikos::inplace_vector<u16, 255>;
+  using DirectorySlots = mikos::inplace_vector<u64, 21>;
+
+  [[nodiscard]] static bool decode_utf8_name(const char* name, Utf16Name& output) {
+    output.clear();
     if (name == nullptr || *name == '\0') {
       return false;
     }
@@ -1076,23 +1080,17 @@ class Volume {
         return false;
       }
       if (codepoint <= 0xffff) {
-        if (output_size == 255) {
-          return false;
-        }
-        output[output_size++] = static_cast<u16>(codepoint);
+        if (!output.try_push_back(static_cast<u16>(codepoint))) return false;
       } else {
-        if (output_size > 253) {
+        if (output.size() > 253) {
           return false;
         }
         codepoint -= 0x10000;
-        output[output_size++] =
-            static_cast<u16>(0xd800 + (codepoint >> 10));
-        output[output_size++] =
-            static_cast<u16>(0xdc00 + (codepoint & 0x3ff));
+        output.push_back(static_cast<u16>(0xd800 + (codepoint >> 10)));
+        output.push_back(static_cast<u16>(0xdc00 + (codepoint & 0x3ff)));
       }
     }
-    return output_size != 0 && output[output_size - 1] != ' ' &&
-           output[output_size - 1] != '.';
+    return !output.empty() && output.back() != ' ' && output.back() != '.';
   }
 
   [[nodiscard]] Error make_short_alias(const Node& directory,
@@ -1205,11 +1203,11 @@ class Volume {
     requires WritableDevice<D>
   [[nodiscard]] Error find_free_directory_slots(const Node& directory,
                                                 u32 needed,
-                                                u64* offsets) {
+                                                DirectorySlots& offsets) {
+    offsets.clear();
     if (!directory.directory() || needed == 0 || needed > 21) {
       return Error::invalid_argument;
     }
-    u32 found = 0;
     u32 cluster = directory.first_cluster;
     for (u32 traversed = 0; traversed < geometry_.cluster_count;
          ++traversed) {
@@ -1222,39 +1220,39 @@ class Volume {
           return error;
         }
         if (marker == 0 || marker == 0xe5) {
-          offsets[found++] = offset;
-          if (found == needed) {
+          if (!offsets.try_push_back(offset)) return Error::no_space;
+          if (offsets.size() == needed) {
             return Error::none;
           }
         } else {
-          found = 0;
+          offsets.clear();
         }
       }
       const auto next = next_cluster(cluster);
       if (!next) {
-        return next.error;
+        return next.error();
       }
-      if (!next.value.end) {
-        cluster = next.value.cluster;
+      if (!next->end) {
+        cluster = next->cluster;
         continue;
       }
 
       const auto added = allocate_cluster();
       if (!added) {
-        return added.error;
+        return added.error();
       }
       Error error = flush();
       if (error == Error::none) {
-        error = write_fat_entry(cluster, added.value);
+        error = write_fat_entry(cluster, (*added));
       }
       if (error == Error::none) {
         error = flush();
       }
       if (error != Error::none) {
-        (void)write_fat_entry(added.value, 0);
+        (void)write_fat_entry((*added), 0);
         return error;
       }
-      cluster = added.value;
+      cluster = (*added);
     }
     return Error::loop;
   }
@@ -1263,9 +1261,8 @@ class Volume {
     requires WritableDevice<D>
   [[nodiscard]] Error insert_directory_record(const Node& directory,
                                               const char* name, Node& node) {
-    u16 utf16[255]{};
-    u32 utf16_size = 0;
-    if (!decode_utf8_name(name, utf16, utf16_size)) {
+    Utf16Name utf16;
+    if (!decode_utf8_name(name, utf16)) {
       return Error::invalid_argument;
     }
     u8 alias[11]{};
@@ -1273,8 +1270,8 @@ class Volume {
     if (error != Error::none) {
       return error;
     }
-    const u32 parts = (utf16_size + 12) / 13;
-    u64 offsets[21]{};
+    const u32 parts = (utf16.size() + 12) / 13;
+    DirectorySlots offsets;
     error = find_free_directory_slots(directory, parts + 1, offsets);
     if (error != Error::none) {
       return error;
@@ -1300,9 +1297,9 @@ class Volume {
       const u32 base = (ordinal - 1) * 13;
       for (u32 index = 0; index < 13; ++index) {
         u16 value = 0xffff;
-        if (base + index < utf16_size) {
+        if (base + index < utf16.size()) {
           value = utf16[base + index];
-        } else if (base + index == utf16_size) {
+        } else if (base + index == utf16.size()) {
           value = 0;
         }
         raw[character_offsets[index]] = static_cast<u8>(value);
@@ -1346,8 +1343,7 @@ class Volume {
     if (!directory.directory() || entry_offset == 0) {
       return Error::invalid_argument;
     }
-    u64 long_offsets[20]{};
-    u32 long_count = 0;
+    mikos::inplace_vector<u64, 20> long_offsets;
     u32 cluster = directory.first_cluster;
     for (u32 traversed = 0; traversed < geometry_.cluster_count;
          ++traversed) {
@@ -1363,37 +1359,33 @@ class Volume {
           return Error::not_found;
         }
         if (header[0] == 0xe5) {
-          long_count = 0;
+          long_offsets.clear();
           continue;
         }
         if (header[11] == detail::attribute_long_name) {
-          if (long_count < 20) {
-            long_offsets[long_count++] = offset;
-          } else {
-            long_count = 0;
-          }
+          if (!long_offsets.try_push_back(offset)) long_offsets.clear();
           continue;
         }
         if (offset == entry_offset) {
           u8 deleted = 0xe5;
-          for (u32 index = 0; index < long_count; ++index) {
-            error = write_exact(*device_, long_offsets[index], &deleted, 1);
+          for (const u64 long_offset : long_offsets) {
+            error = write_exact(*device_, long_offset, &deleted, 1);
             if (error != Error::none) {
               return error;
             }
           }
           return write_exact(*device_, offset, &deleted, 1);
         }
-        long_count = 0;
+        long_offsets.clear();
       }
       const auto next = next_cluster(cluster);
       if (!next) {
-        return next.error;
+        return next.error();
       }
-      if (next.value.end) {
+      if (next->end) {
         return Error::not_found;
       }
-      cluster = next.value.cluster;
+      cluster = next->cluster;
     }
     return Error::loop;
   }
@@ -1431,10 +1423,10 @@ class Volume {
     u32 skip = offset / geometry_.bytes_per_cluster;
     for (u32 index = 0; index < skip; ++index) {
       const auto next = next_cluster(cluster);
-      if (!next || next.value.end) {
-        return !next ? next.error : Error::corrupt;
+      if (!next || next->end) {
+        return !next ? next.error() : Error::corrupt;
       }
-      cluster = next.value.cluster;
+      cluster = next->cluster;
     }
     u32 within = offset % geometry_.bytes_per_cluster;
     u32 remaining = size;
@@ -1460,10 +1452,10 @@ class Volume {
       within = 0;
       if (remaining != 0) {
         const auto next = next_cluster(cluster);
-        if (!next || next.value.end) {
-          return !next ? next.error : Error::corrupt;
+        if (!next || next->end) {
+          return !next ? next.error() : Error::corrupt;
         }
-        cluster = next.value.cluster;
+        cluster = next->cluster;
       }
     }
     return Error::none;
@@ -1495,7 +1487,7 @@ class Volume {
 
   [[nodiscard]] Result<u32> fat_entry(u32 cluster) {
     if (!valid_cluster(cluster)) {
-      return Result<u32>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
     const u64 fat_sector =
         geometry_.reserved_sectors +
@@ -1506,8 +1498,8 @@ class Volume {
                       static_cast<u64>(cluster) * 4,
         raw, sizeof(raw));
     return error == Error::none
-               ? Result<u32>::success(little_u32(raw) & detail::fat_mask)
-               : Result<u32>::failure(error);
+               ? Result<u32>(little_u32(raw) & detail::fat_mask)
+               : std::unexpected(error);
   }
 
   template <typename D = Device>
@@ -1555,12 +1547,12 @@ class Volume {
     for (u32 scanned = 0; scanned < geometry_.cluster_count; ++scanned) {
       const auto value = fat_entry(candidate);
       if (!value) {
-        return Result<u32>::failure(value.error);
+        return std::unexpected(value.error());
       }
-      if (value.value == 0) {
+      if ((*value) == 0) {
         Error error = write_fat_entry(candidate, detail::end_of_chain);
         if (error != Error::none) {
-          return Result<u32>::failure(error);
+          return std::unexpected(error);
         }
         zero_bytes(sector_, geometry_.bytes_per_sector);
         const u64 base = cluster_byte_offset(candidate);
@@ -1572,7 +1564,7 @@ class Volume {
               sector_, geometry_.bytes_per_sector);
           if (error != Error::none) {
             (void)write_fat_entry(candidate, 0);
-            return Result<u32>::failure(error);
+            return std::unexpected(error);
           }
         }
         allocation_hint_ = candidate == geometry_.cluster_count + 1
@@ -1581,13 +1573,13 @@ class Volume {
         if (free_clusters_known_ && free_clusters_ != 0) {
           --free_clusters_;
         }
-        return Result<u32>::success(candidate);
+        return Result<u32>(candidate);
       }
       candidate = candidate == geometry_.cluster_count + 1
                       ? 2
                       : candidate + 1;
     }
-    return Result<u32>::failure(Error::no_space);
+    return std::unexpected(Error::no_space);
   }
 
   template <typename D = Device>
@@ -1601,19 +1593,19 @@ class Volume {
         if (first != 0) {
           (void)free_chain(first);
         }
-        return allocated.error;
+        return allocated.error();
       }
       if (first == 0) {
-        first = allocated.value;
+        first = (*allocated);
       } else {
-        const Error error = write_fat_entry(last, allocated.value);
+        const Error error = write_fat_entry(last, (*allocated));
         if (error != Error::none) {
-          (void)write_fat_entry(allocated.value, 0);
+          (void)write_fat_entry((*allocated), 0);
           (void)free_chain(first);
           return error;
         }
       }
-      last = allocated.value;
+      last = (*allocated);
     }
     return Error::none;
   }
@@ -1629,10 +1621,10 @@ class Volume {
          ++traversed) {
       const auto value = fat_entry(cluster);
       if (!value) {
-        return value.error;
+        return value.error();
       }
-      const bool end = value.value >= detail::end_of_chain;
-      const u32 next = value.value;
+      const bool end = (*value) >= detail::end_of_chain;
+      const u32 next = (*value);
       const Error error = write_fat_entry(cluster, 0);
       if (error != Error::none) {
         return error;
@@ -1687,7 +1679,7 @@ class Volume {
 
   [[nodiscard]] Result<ClusterLink> next_cluster(u32 cluster) {
     if (!valid_cluster(cluster)) {
-      return Result<ClusterLink>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
     const u64 fat_sector =
         geometry_.reserved_sectors +
@@ -1699,17 +1691,17 @@ class Volume {
     u8 raw[4]{};
     const Error error = read_exact(*device_, offset, raw, sizeof(raw));
     if (error != Error::none) {
-      return Result<ClusterLink>::failure(error);
+      return std::unexpected(error);
     }
     const u32 value = little_u32(raw) & detail::fat_mask;
     if (value >= detail::end_of_chain) {
-      return Result<ClusterLink>::success(ClusterLink{0, true});
+      return Result<ClusterLink>(ClusterLink{0, true});
     }
     if (value == 0 || value == 1 || value == detail::bad_cluster ||
         value >= detail::reserved_cluster || !valid_cluster(value)) {
-      return Result<ClusterLink>::failure(Error::corrupt);
+      return std::unexpected(Error::corrupt);
     }
-    return Result<ClusterLink>::success(ClusterLink{value, false});
+    return Result<ClusterLink>(ClusterLink{value, false});
   }
 
   Device* device_{};

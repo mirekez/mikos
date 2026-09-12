@@ -12,6 +12,8 @@ Start with:
 
 - [Requirements](REQUIREMENTS.md)
 - [Development plan](PLAN.md)
+- [Kernel C++ containers and size budget](doc/kernel-cxx.md)
+- [Kernel/driver C++ cleanup and ABI boundaries](doc/cxx-modernization.md)
 - [RV32 BusyBox proof of concept](doc/poc-rv32.md)
 - [Polling network proof of concept](doc/network-poc.md)
 - [Regression and acceptance tests](tests/README.md)

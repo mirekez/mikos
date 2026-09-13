@@ -10,13 +10,18 @@ fi
 scratch="$(mktemp -d /tmp/mikos-toolchain-check.XXXXXX)"
 trap 'rm -rf "$scratch"' EXIT
 cat > "$scratch/check.c" <<'EOF'
+#define _GNU_SOURCE
 #include <features.h>
+#include <limits.h>
 #include <stdio.h>
 #if !defined(__GLIBC__) || !defined(__riscv) || __riscv_xlen != 32
 #error mikOS userspace requires RV32 glibc
 #endif
 #if !defined(__riscv_float_abi_soft) || defined(__riscv_flen)
 #error Tribe userspace requires ILP32 without floating-point instructions
+#endif
+#if !defined(LONG_BIT) || LONG_BIT != 32
+#error Complete GCC system headers are required; finish the final compiler stage
 #endif
 int main(void) { return puts("mikOS toolchain check") < 0; }
 EOF

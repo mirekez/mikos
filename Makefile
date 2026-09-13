@@ -191,6 +191,7 @@ stress-ng:
 	$(MAKE) -C tests/busybox stress-ng
 
 $(ROOTFS_IMAGE): tests/busybox/Makefile \
+		$(BUILD)/mikos_ssh_key.pub \
 		tests/busybox/config/busybox.config \
 		tests/busybox/config/dropbear_localoptions.h \
 		tests/busybox/download_busybox.sh \
@@ -210,6 +211,12 @@ $(ROOTFS_IMAGE): tests/busybox/Makefile \
 		tests/busybox/verify_rootfs.sh \
 		tests/busybox/patches/stress-ng-mikos.patch
 	$(MAKE) -C tests/busybox rootfs
+
+$(BUILD)/mikos_ssh_key:
+	$(MAKE) -C tests/busybox $@
+
+$(BUILD)/mikos_ssh_key.pub: $(BUILD)/mikos_ssh_key
+	$(MAKE) -C tests/busybox $@
 
 $(TRIBE_EMBEDDED_BUSYBOX_OBJECT): $(ROOTFS_IMAGE)
 	@mkdir -p $(@D)

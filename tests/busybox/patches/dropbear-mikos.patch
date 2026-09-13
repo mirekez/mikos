@@ -528,7 +528,13 @@
 +		}
 --- a/src/common-channel.c
 +++ b/src/common-channel.c
-@@ -1063,0 +1064,13 @@ static void close_chan_fd(struct Channel *channel, int fd, int how) {
+@@ -1062,9 +1062,23 @@
+ 			closein = 1;
+ 		}
+ 	} else {
+-		TRACE(("CLOSE some fd %d", fd))
+-		m_close(fd);
+-		closein = closeout = 1;
 +#if DROPBEAR_MIKOS_TEST_ACCOUNT
 +		/* A PTY master is one fd used for both channel directions, but it
 +		 * cannot be half-closed with shutdown().  MikOS runs a fork child to
@@ -542,5 +548,10 @@
 +		} else
 +#endif
 +		{
-@@ -1066,0 +1080 @@ static void close_chan_fd(struct Channel *channel, int fd, int how) {
++			TRACE(("CLOSE some fd %d", fd))
++			m_close(fd);
++			closein = closeout = 1;
 +		}
+ 	}
+
+ 	if (closeout && (fd == channel->readfd)) {

@@ -16,15 +16,20 @@ patch_file="$7"
 host="$(basename "$cross_prefix")"
 host="${host%-}"
 
+# Keep activated host-toolchain headers and Autoconf aliases out of the RV32 build.
+unset CPP CXX LD AS NM OBJCOPY OBJDUMP CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+unset build_alias host_alias target_alias
+
 if [[ -f "$source_tree/Makefile" ]]; then
   make -C "$source_tree" distclean >/dev/null 2>&1 || true
 fi
 rm -rf "$source_tree/obj"
 install -m 0644 "$options" "$source_tree/localoptions.h"
-if patch -d "$source_tree" -p1 --forward --dry-run \
+# The release preserves trailing spaces in a few signature-call lines.
+if patch -l -d "$source_tree" -p1 --forward --dry-run \
     <"$patch_file" >/dev/null 2>&1; then
-  patch -d "$source_tree" -p1 <"$patch_file"
-elif ! patch -d "$source_tree" -p1 --reverse --dry-run \
+  patch -l -d "$source_tree" -p1 <"$patch_file"
+elif ! patch -l -d "$source_tree" -p1 --reverse --dry-run \
     <"$patch_file" >/dev/null 2>&1; then
   echo "Dropbear MikOS patch does not apply cleanly" >&2
   exit 1

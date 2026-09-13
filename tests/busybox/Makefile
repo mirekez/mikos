@@ -1,5 +1,6 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := all
+.DELETE_ON_ERROR:
 
 ROOT := $(abspath ../..)
 # Conda exports BUILD as a host triplet; only a make command-line override
@@ -40,6 +41,7 @@ DROPBEAR_ADDRESS := 0x81400000
 DROPBEAR_HOST_OUT := $(BUILD)/dropbear-host
 DROPBEAR_HOST_STAMP := $(DROPBEAR_HOST_OUT)/.built
 DROPBEAR_HOST_KEY := $(ROOT)/build/mikos_ssh_key
+DROPBEAR_PUBLIC_KEY := $(DROPBEAR_HOST_KEY).pub
 DROPBEAR_CLIENT_KEY := $(DROPBEAR_HOST_OUT)/mikos_ssh_key.dropbear
 
 ROOTFS_STAGE := $(BUILD)/rootfs
@@ -99,6 +101,7 @@ $(STRESS_NG): $(STRESS_NG_SOURCE)/.source-ready
 		CC=$(RISCV_LINUX_PREFIX)gcc CXX=$(RISCV_LINUX_PREFIX)g++ \
 		STATIC=1 BUILD_SMALL=1 GARBAGE_COLLECT=1 \
 		CFLAGS=-DSTRESS_MIKOS \
+		CPPFLAGS= CXXFLAGS= \
 		LDFLAGS='-Wl,-Ttext-segment=$(STRESS_NG_ADDRESS)' \
 		LIB_ACL= LIB_AIO= LIB_APPARMOR= LIB_BSD= LIB_CAP= \
 		LIB_CRYPT= LIB_EGL= LIB_GBM= LIB_GLES2= LIB_IPSEC_MB= \
@@ -136,8 +139,15 @@ $(DROPBEAR_CLIENT_KEY): $(DROPBEAR_HOST_STAMP) $(DROPBEAR_HOST_KEY)
 	chmod 0600 "$$tmp"; \
 	mv -f "$$tmp" '$@'
 
+$(DROPBEAR_HOST_KEY):
+	@mkdir -p $(@D)
+	ssh-keygen -q -t ed25519 -N '' -C mikos-local-test -f '$@'
+
+$(DROPBEAR_PUBLIC_KEY): $(DROPBEAR_HOST_KEY)
+	ssh-keygen -y -f '$<' > '$@'
+
 $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
-		$(ROOTFS_CONFIG) set_rootfs_owners.sh verify_rootfs.sh
+		$(ROOTFS_CONFIG) $(DROPBEAR_PUBLIC_KEY) set_rootfs_owners.sh verify_rootfs.sh
 	rm -rf $(ROOTFS_STAGE)
 	install -d $(ROOTFS_STAGE)/bin $(ROOTFS_STAGE)/sbin \
 		$(ROOTFS_STAGE)/usr/sbin \
@@ -163,6 +173,8 @@ $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 	chmod 0600 $(ROOTFS_STAGE)/etc/dropbear/dropbear_ed25519_host_key
 	install -m 0600 rootfs/root/.ssh/authorized_keys \
 		$(ROOTFS_STAGE)/root/.ssh/authorized_keys
+	@printf '\n' >> $(ROOTFS_STAGE)/root/.ssh/authorized_keys
+	cat $(DROPBEAR_PUBLIC_KEY) >> $(ROOTFS_STAGE)/root/.ssh/authorized_keys
 	touch -d @946684800 $(ROOTFS_STAGE) $(ROOTFS_STAGE)/bin \
 		$(ROOTFS_STAGE)/sbin $(ROOTFS_STAGE)/usr \
 		$(ROOTFS_STAGE)/usr/sbin \

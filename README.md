@@ -88,8 +88,12 @@ The helper builds an RV32IMA/ILP32 glibc compiler and static libraries under
 separate build directory, leaves the bare-metal installation in place, and
 resumes completed build stages when rerun. `RISCV_USERSPACE_HOME` overrides
 the installation directory; `RISCV_TOOLCHAIN_BUILD` overrides the default
-`build/toolchains/rv32-linux` build directory. Reserve at least 8 GiB free for
-the build in addition to the source checkout; `JOBS` defaults to 2.
+`build/toolchains/rv32-linux` build directory. The default preflight reserves
+8 GiB free for the build in addition to the source checkout; `JOBS` defaults
+to 2. `RISCV_TOOLCHAIN_MIN_FREE_MIB` overrides that conservative space check
+when using a smaller separate build filesystem. Intermediate objects are
+cleaned after libc installation to reduce peak space use. A build under
+`/tmp` can use a separate filesystem, but is lost when that directory is cleared.
 Install the host build dependencies listed in the
 [GNU toolchain README](https://github.com/riscv-collab/riscv-gnu-toolchain#prerequisites).
 The source checkout must include its GCC, binutils, glibc, and Linux-header

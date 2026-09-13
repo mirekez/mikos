@@ -14,6 +14,10 @@ llvm_readelf="$5"
 jobs="$6"
 tool_directory="$(dirname "$cross_prefix")"
 
+# Conda's host flags can contain x86 ISA options and host-only include paths.
+# BusyBox supplies target flags from its own configuration.
+unset CFLAGS CXXFLAGS CPPFLAGS AFLAGS LDFLAGS
+
 PATH="$tool_directory:$PATH" make -C "$source_tree" O="$output" \
   -j"$jobs" CROSS_COMPILE="$cross_prefix" \
   CONFIG_EXTRA_LDFLAGS="-Wl,-Ttext-segment=$address" busybox

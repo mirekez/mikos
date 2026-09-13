@@ -15,10 +15,16 @@ make -C tests/busybox dropbear
 make -C tests/busybox rootfs
 ```
 
-These targets require `$RISCV_HOME/bin/riscv32-unknown-linux-gnu-gcc` and its
-Linux/glibc static libraries. Set `RISCV_LINUX_PREFIX` for a different prefix.
-The bare-metal `riscv32-unknown-elf-*` tools suffice for `make kernel`, but
-cannot build these Linux userspace workloads.
+These targets require an RV32/ILP32 glibc compiler and static libraries.
+Run `make userspace-toolchain` from the repository root to build them from
+`$RISCV_HOME/riscv-gnu-toolchain` into `$RISCV_HOME/linux`; see the
+[setup instructions](../../README.md#build-and-test). The build automatically
+detects this installation as well as `$RISCV_HOME/bin/riscv32-unknown-linux-gnu-gcc`.
+Set `RISCV_LINUX_PREFIX` for a different prefix. The preflight statically links
+a small program to catch missing libraries or an incompatible target ABI.
+The bare-metal `riscv32-unknown-elf-*` tools suffice for `make kernel`.
+BusyBox and Dropbear run on mikOS using its Linux-compatible syscall ABI;
+no Linux guest kernel is needed.
 
 `download_busybox.sh` fetches the pinned BusyBox revision into
 `build/tests/busybox`. To use an existing checkout without network access:

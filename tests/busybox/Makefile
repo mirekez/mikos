@@ -54,11 +54,7 @@ ROOTFS_CONFIG := rootfs/etc/group rootfs/etc/inittab rootfs/etc/passwd \
 .PHONY: check-linux-toolchain
 
 check-linux-toolchain:
-	@command -v '$(RISCV_LINUX_PREFIX)gcc' >/dev/null || { \
-		echo 'RV32 Linux toolchain missing: $(RISCV_LINUX_PREFIX)gcc' >&2; \
-		echo 'Set RISCV_HOME or RISCV_LINUX_PREFIX to a Linux/glibc toolchain.' >&2; \
-		echo 'The bare-metal unknown-elf toolchain supports make kernel, but cannot build Linux userspace.' >&2; \
-		exit 1; }
+	@bash check_linux_toolchain.sh '$(RISCV_LINUX_PREFIX)'
 
 $(BUSYBOX_SOURCE)/.source-ready $(STRESS_NG_SOURCE)/.source-ready \
   $(DROPBEAR_SOURCE)/.source-ready: | check-linux-toolchain

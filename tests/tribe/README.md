@@ -55,6 +55,13 @@ For an interactive UART session, run:
 tests/tribe/tribe_interactive.sh --multicore
 ```
 
+This session includes BusyBox and Dropbear, so it also needs the RV32/ILP32
+glibc userspace toolchain. If only the bare-metal compiler is installed,
+run `make userspace-toolchain` from the repository root first; see
+[the setup instructions](../../README.md#build-and-test). No Linux guest
+kernel is involved. The launcher checks this prerequisite before building
+the simulator.
+
 With `CPPHDL_HOME` set, build the checkout's own bridge source from
 `tribe_cpu/linux/net/ethgig_tap.cpp` and start it in another terminal:
 

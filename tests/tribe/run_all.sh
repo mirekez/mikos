@@ -16,7 +16,7 @@ run_case() {
     echo "PASS: $name" | tee -a "$summary"
   else
     failed=1
-    if grep -E -q 'RV32 Linux toolchain missing:|missing Tribe TAP bridge socket:|missing host TAP interface:' "$results/$name.log"; then
+    if grep -E -q 'RV32 Linux toolchain (missing|unusable):|missing Tribe TAP bridge socket:|missing host TAP interface:' "$results/$name.log"; then
       echo "BLOCKED: $name (missing test inputs; exit $status)" | tee -a "$summary"
     else
       echo "FAIL: $name (exit $status)" | tee -a "$summary"

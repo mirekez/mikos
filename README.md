@@ -71,6 +71,37 @@ when installed elsewhere. Image creation also needs `e2fsprogs` and the
 standard host build tools. The first image build downloads BusyBox and
 Dropbear; an existing BusyBox checkout can be selected with
 `BUSYBOX_REFERENCE=/path/to/busybox`. stress-ng is vendored in this repository.
+
+If `~/riscv/bin` contains only `riscv32-unknown-elf-*`, prepare the userspace
+compiler once before starting the interactive shell:
+
+```sh
+export RISCV_HOME="$HOME/riscv"
+# Existing, populated https://github.com/riscv-collab/riscv-gnu-toolchain checkout:
+export RISCV_TOOLCHAIN_SOURCE="$RISCV_HOME/riscv-gnu-toolchain"
+make userspace-toolchain
+make image
+```
+
+The helper builds an RV32IMA/ILP32 glibc compiler and static libraries under
+`$RISCV_HOME/linux`, which subsequent builds detect automatically. It uses a
+separate build directory, leaves the bare-metal installation in place, and
+resumes completed build stages when rerun. `RISCV_USERSPACE_HOME` overrides
+the installation directory; `RISCV_TOOLCHAIN_BUILD` overrides the default
+`build/toolchains/rv32-linux` build directory. Reserve at least 8 GiB free for
+the build in addition to the source checkout; `JOBS` defaults to 2.
+Install the host build dependencies listed in the
+[GNU toolchain README](https://github.com/riscv-collab/riscv-gnu-toolchain#prerequisites).
+The source checkout must include its GCC, binutils, glibc, and Linux-header
+submodules. If absent, obtain it with
+`git clone --recursive https://github.com/riscv-collab/riscv-gnu-toolchain "$RISCV_TOOLCHAIN_SOURCE"`.
+
+No Linux guest kernel is built or booted. BusyBox and Dropbear use Linux's
+userspace ABI, implemented by mikOS, so they still need a compatible C library.
+The interactive launcher checks that the compiler can statically link an
+RV32/ILP32 glibc program before rebuilding the simulator. Hard-float `ilp32d`
+toolchains are unsuitable for the current Tribe profile.
+
 QEMU acceptance runners are under
 `tests/qemu/` and remain available through `make qemu-test` and
 `make qemu-net-test`.

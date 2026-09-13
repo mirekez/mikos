@@ -2,7 +2,8 @@
 # and GNU binutils. Linux userspace workloads require the Linux toolchain.
 RISCV_HOME ?= $(HOME)/riscv
 RISCV_PREFIX ?= $(if $(wildcard $(RISCV_HOME)/bin/riscv32-unknown-linux-gnu-gcc),$(RISCV_HOME)/bin/riscv32-unknown-linux-gnu-,$(RISCV_HOME)/bin/riscv32-unknown-elf-)
-RISCV_LINUX_PREFIX ?= $(if $(findstring linux,$(RISCV_PREFIX)),$(RISCV_PREFIX),$(RISCV_HOME)/bin/riscv32-unknown-linux-gnu-)
+RISCV_USERSPACE_HOME ?= $(RISCV_HOME)/linux
+RISCV_LINUX_PREFIX ?= $(if $(findstring linux,$(RISCV_PREFIX)),$(RISCV_PREFIX),$(if $(wildcard $(RISCV_USERSPACE_HOME)/bin/riscv32-unknown-linux-gnu-gcc),$(RISCV_USERSPACE_HOME)/bin/riscv32-unknown-linux-gnu-,$(RISCV_HOME)/bin/riscv32-unknown-linux-gnu-))
 export RISCV_HOME
 
 # Keep discovery lazy: native regressions and clean do not need a cross compiler.

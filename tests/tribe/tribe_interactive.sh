@@ -94,6 +94,8 @@ if [[ -n "$test_mode" ]]; then
 fi
 
 source "$root/tests/tribe/paths.sh"
+# Check the userspace prerequisite before spending time rebuilding the CPU.
+make -C "$root/tests/busybox" check-linux-toolchain
 simulator="$(tribe_build_directory "$simulator_name")/$simulator_name/$simulator_name"
 rootfs="${TRIBE_INTERACTIVE_SD_IMAGE:-$root/build/tests/busybox/rootfs.ext4}"
 client_key="$root/build/tests/busybox/dropbear-host/mikos_ssh_key.dropbear"

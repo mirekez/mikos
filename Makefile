@@ -179,6 +179,11 @@ kernel-cxx-test: $(KERNEL_ELF) $(TRIBE_KERNEL_ELF) \
 busybox:
 	$(MAKE) -C tests/busybox all
 
+.PHONY: userspace-toolchain
+userspace-toolchain:
+	RISCV_HOME='$(RISCV_HOME)' RISCV_USERSPACE_HOME='$(RISCV_USERSPACE_HOME)' \
+		bash tests/busybox/build_toolchain.sh
+
 dropbear-client:
 	$(MAKE) -C tests/busybox dropbear-client
 

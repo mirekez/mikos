@@ -2,15 +2,9 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-work="$root/build/tests/tribe"
-source_tree="$work/cpphdl-source"
-build_tree="$work/cpphdl-build"
-repository="${CPPHDL_REPOSITORY:-https://github.com/mirekez/cpphdl.git}"
-reference="${CPPHDL_REFERENCE:-}"
-revision="${CPPHDL_REVISION:-d131e7b670e5b69b8df322ca0adfe9f714446494}"
+source "$root/tests/tribe/paths.sh"
 jobs="${JOBS:-2}"
-toolchain="${CPPHDL_TOOLCHAIN:-$root/.conda}"
-riscv_home="${RISCV_HOME:-/home/me/riscv}"
+riscv_home="${RISCV_HOME:-$HOME/riscv}"
 target="tribe64"
 
 usage() {
@@ -35,72 +29,23 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-mkdir -p "$work"
-if [[ ! -d "$source_tree/.git" ]]; then
-  git clone --no-checkout "${reference:-$repository}" "$source_tree"
+build_tree="$(tribe_build_directory "$target")"
+if [[ -z "${CPPHDL_HOME:-}" ]]; then
+  echo 'Set CPPHDL_HOME to the cpphdl checkout containing the Tribe bug fixes (for example: export CPPHDL_HOME="$HOME/cpphdl").' >&2
+  exit 1
 fi
-
-if ! git -C "$source_tree" cat-file -e "$revision^{commit}" 2>/dev/null; then
-  git -C "$source_tree" fetch --depth 1 origin "$revision"
-fi
-git -C "$source_tree" checkout --detach --force "$revision"
-
-config="$source_tree/tribe/Config.h"
-if [[ "$target" == "tribe64" ]]; then
-  for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
-    sed -i "s/^#define ${feature}\(.*\)$/\/\/ ${feature} disabled for MikOS\1/" \
-      "$config"
-  done
-
-  for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
-    if rg -q "^#define ${feature}\\b" "$config"; then
-      echo "FAIL: $feature remains enabled in Tribe Config.h" >&2
-      exit 1
-    fi
-  done
-else
-  for feature in ENABLE_RV32IA ENABLE_ISR ENABLE_MMU_TLB; do
-    if ! rg -q "^#define ${feature}\\b" "$config"; then
-      echo "FAIL: $feature is required by multicore Tribe" >&2
-      exit 1
-    fi
-  done
-fi
-for feature in ENABLE_ZICSR ENABLE_TRAPS; do
-  if ! rg -q "^#define ${feature}\\b" "$config"; then
-    echo "FAIL: $feature is required by MikOS user-mode ecalls" >&2
+source_tree="$(cd "$CPPHDL_HOME" && pwd)"
+if [[ ! -f "$source_tree/tribe_cpu/CMakeLists.txt" ]] ||
+     ! rg -q 'TRIBE_CFG_MMU_TLB' "$source_tree/tribe_cpu/CMakeLists.txt"; then
+    echo "CPPHDL_HOME must point to a current cpphdl checkout with tribe_cpu and TRIBE_CFG_* CMake options" >&2
     exit 1
-  fi
-done
-
-# Upstream currently wires CSR inputs unconditionally when ISR ports are
-# absent, and enables stacktrace from header presence without honoring its
-# failed CMake link probe. Keep both compatibility fixes local to this clone.
-git -C "$source_tree" apply "$root/tests/tribe/patches/no-isr-csr-time.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/polling-dma-invalidate.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/preserve-host-control-frames.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/tcp-rx-burst-backlog.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/reliable-eth-queues.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/coalesce-tcp-ingress.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/ssh-kex-rx-burst-capacity.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/coalesce-completed-tcp-ingress.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/full-ethernet-frame-rx.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/verilator-memory-config.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/multicore-clint-hart0.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/native-port-cache-fast-path.patch"
-git -C "$source_tree" apply \
-  "$root/tests/tribe/patches/cache-eth-dma-trace-toggle.patch"
+fi
+toolchain="${CPPHDL_TOOLCHAIN:-$source_tree/.conda}"
+features=0
+[[ "$target" == tribe64_multicore ]] && features=1
+feature_arguments=(-DTRIBE_CFG_RV32IA="$features" -DTRIBE_CFG_ISR="$features"
+                     -DTRIBE_CFG_MMU_TLB="$features")
+echo "Using current cpphdl sources: $source_tree (including working-tree edits)"
 
 "$toolchain/bin/cmake" -S "$source_tree" -B "$build_tree" \
   -G "Unix Makefiles" \
@@ -115,7 +60,8 @@ git -C "$source_tree" apply \
   -DCPPHDL_BUILD_TRIBE=ON \
   -DBUILD_TESTING=OFF \
   -DTRIBE_RAM_BYTES_CONFIG=33554432 \
-  -DTRIBE_IO_REGION_SIZE_CONFIG=4194304
+  -DTRIBE_IO_REGION_SIZE_CONFIG=4194304 \
+  "${feature_arguments[@]}"
 
 RISCV_HOME="$riscv_home" \
   "$toolchain/bin/cmake" --build "$build_tree" --target "$target" -j"$jobs"

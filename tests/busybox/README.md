@@ -8,11 +8,17 @@ The build is reproducible from the checked-in BusyBox configuration and pinned
 source revisions:
 
 ```sh
+export RISCV_HOME="$HOME/riscv"
 make -C tests/busybox busybox
 make -C tests/busybox stress-ng
 make -C tests/busybox dropbear
 make -C tests/busybox rootfs
 ```
+
+These targets require `$RISCV_HOME/bin/riscv32-unknown-linux-gnu-gcc` and its
+Linux/glibc static libraries. Set `RISCV_LINUX_PREFIX` for a different prefix.
+The bare-metal `riscv32-unknown-elf-*` tools suffice for `make kernel`, but
+cannot build these Linux userspace workloads.
 
 `download_busybox.sh` fetches the pinned BusyBox revision into
 `build/tests/busybox`. To use an existing checkout without network access:
@@ -53,7 +59,6 @@ connection under MikOS additionally requires the planned TCP stream socket,
 slice. A Linux RV32 runtime invoking `/sbin/init` can start this image's server
 now.
 
-The pinned stress-ng Git submodule and MikOS-only patch live under
-`third_party/` and `patches/` here so the complete compatibility test is
-self-contained. Initialize the submodule with `git submodule update --init`
-after cloning MikOS.
+The pinned stress-ng source snapshot and MikOS-only patch live under
+`third_party/` and `patches/` here. The build copies the vendored source into
+the build directory before applying the patch; no submodule setup is needed.

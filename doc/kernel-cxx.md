@@ -4,7 +4,8 @@ Include `<mikos/container/standard.hpp>` in kernel code. The build prepares
 checksum-pinned sources automatically under `build/kernel-cxx`; nothing from
 the host's C++ library is linked. First preparation needs curl, tar, CMake,
 flock and network access. Archives cached there support subsequent offline
-builds. Set `RISCV_PREFIX` / `RISCV_SYSROOT` for another RV32 toolchain.
+builds. Set `RISCV_HOME` (default `~/riscv`) to an RV32 Newlib or Linux
+toolchain installation, or override `RISCV_PREFIX` / `RISCV_SYSROOT`.
 
 | Name | Implementation | Allocation |
 |---|---|---|

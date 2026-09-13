@@ -25,9 +25,13 @@ constexpr std::uint8_t message_frame = 2;
   message[1] = static_cast<std::uint8_t>(size >> 8);
   message[2] = static_cast<std::uint8_t>(size);
   std::memcpy(message.data() + 3, frame, size);
-  return sendto(socket_fd, message.data(), message.size(), 0,
-                reinterpret_cast<const sockaddr*>(&simulator),
-                simulator_size) == static_cast<ssize_t>(message.size());
+  const ssize_t sent = sendto(socket_fd, message.data(), message.size(), 0,
+                             reinterpret_cast<const sockaddr*>(&simulator),
+                             simulator_size);
+  if (sent != static_cast<ssize_t>(message.size())) {
+    return false;
+  }
+  return true;
 }
 
 [[nodiscard]] bool receive_frame(int socket_fd,
@@ -128,7 +132,8 @@ int main(int argc, char** argv) {
     mikos::EthernetHeader ethernet;
     mikos::Ipv4Header ip;
     mikos::IcmpEchoHeader icmp;
-    mikos::u8 payload[4];
+    // Exceed the former 256-byte MAC buffer to exercise full-frame reception.
+    mikos::u8 payload[512];
   } echo{};
   mikos::copy_octets(echo.ethernet.source, peer_mac.octet);
   mikos::copy_octets(echo.ethernet.destination, guest_mac.octet);
@@ -144,10 +149,9 @@ int main(int argc, char** argv) {
   echo.icmp.type = 8;
   echo.icmp.identifier = mikos::net16(7);
   echo.icmp.sequence = mikos::net16(9);
-  echo.payload[0] = 0xde;
-  echo.payload[1] = 0xad;
-  echo.payload[2] = 0xbe;
-  echo.payload[3] = 0xef;
+  for (unsigned i = 0; i < sizeof(echo.payload); ++i) {
+    echo.payload[i] = static_cast<mikos::u8>(i * 37u + 11u);
+  }
   echo.icmp.checksum = mikos::net16(mikos::internet_checksum(
       reinterpret_cast<const mikos::u8*>(&echo.icmp),
       sizeof(echo) - sizeof(echo.ethernet) - sizeof(echo.ip)));
@@ -158,17 +162,32 @@ int main(int argc, char** argv) {
       sizeof(mikos::Ipv4Header);
   bool echo_ok = false;
   for (unsigned attempt = 0; attempt < 480 && !echo_ok; ++attempt) {
-    if (!send_frame(socket_fd, simulator, simulator_size, &echo,
-                    sizeof(echo))) {
-      return 1;
-    }
     received.clear();
-    if (!receive_frame(socket_fd, received, 500) ||
-        received.size() < sizeof(echo)) {
+    // Drain already queued replies before retrying. The simulator may have
+    // closed its socket after transmitting the valid final datagram.
+    if (!receive_frame(socket_fd, received, 0)) {
+      const bool sent = send_frame(socket_fd, simulator, simulator_size, &echo,
+                                   sizeof(echo));
+      if (!receive_frame(socket_fd, received, 500)) {
+        if (!sent) {
+          std::cerr << "simulator closed before a valid echo reply was received\n";
+          return 1;
+        }
+        continue;
+      }
+    }
+    if (received.size() < sizeof(echo)) {
+      if (received.size() >= 14 && received[12] == 8 && received[13] == 0)
+        std::cerr << "short IPv4 reply: " << received.size() << " bytes\n";
       continue;
     }
     const auto& reply = *reinterpret_cast<const EchoPacket*>(received.data());
-    echo_ok = reply.icmp.type == 0 && reply.icmp.code == 0 &&
+    echo_ok = reply.ethernet.type == mikos::net16(0x0800) &&
+              reply.ip.version_ihl == 0x45 && reply.ip.protocol == 1 &&
+              reply.ip.total_length == echo.ip.total_length &&
+              reply.icmp.type == 0 && reply.icmp.code == 0 &&
+              reply.icmp.identifier == echo.icmp.identifier &&
+              reply.icmp.sequence == echo.icmp.sequence &&
               std::memcmp(reply.ethernet.source, guest_mac.octet, 6) == 0 &&
               std::memcmp(reply.ip.source, guest_ip.octet, 4) == 0 &&
               std::memcmp(reply.ip.destination, peer_ip.octet, 4) == 0 &&
@@ -180,13 +199,31 @@ int main(int argc, char** argv) {
                   icmp_size) == 0 &&
               std::memcmp(reply.payload, echo.payload,
                           sizeof(echo.payload)) == 0;
+    if (!echo_ok) {
+      for (unsigned i = 0; i < sizeof(echo.payload); ++i) {
+        if (reply.payload[i] != echo.payload[i]) {
+          std::cerr << "first payload mismatch at " << i << ": got "
+                    << unsigned(reply.payload[i]) << " expected " << unsigned(echo.payload[i]) << '\n';
+          break;
+        }
+      }
+      std::cerr << "invalid echo reply: bytes=" << received.size()
+                << " ip_length=" << mikos::net16(reply.ip.total_length)
+                << " type=" << unsigned(reply.icmp.type)
+                << " ip_checksum=" << mikos::internet_checksum(
+                     reinterpret_cast<const mikos::u8*>(&reply.ip), sizeof(reply.ip))
+                << " icmp_checksum=" << mikos::internet_checksum(
+                     reinterpret_cast<const mikos::u8*>(&reply.icmp), icmp_size)
+                << " payload_match=" << (std::memcmp(reply.payload, echo.payload,
+                                                    sizeof(echo.payload)) == 0) << '\n';
+    }
   }
   if (!echo_ok) {
     std::cerr << "missing valid IPv4 ICMP echo reply\n";
     return 1;
   }
 
-  std::cout << "PASS: IPv4 ping received from MikOS on Tribe\n";
+  std::cout << "PASS: IPv4 ping with 512-byte payload received from MikOS on Tribe\n";
   close(socket_fd);
   return 0;
 }

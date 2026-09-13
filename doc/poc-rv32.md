@@ -30,21 +30,23 @@ Build and run:
 
 ```sh
 export PATH="$PWD/.conda/bin:$PATH"
+export RISCV_HOME="$HOME/riscv"
 make test
-make busybox
-make stress-ng
-make -C tests/busybox rootfs
-make kernel
+make image
 make qemu-test
 ```
 
+`make kernel` builds only the kernel ELF and supports the bare-metal Newlib
+toolchain. `make image` and the acceptance runners also need the RV32
+Linux/glibc toolchain to build the root filesystem's Linux programs.
+
 QEMU 10.1 is configured from
-`/home/me/riscv/riscv-gnu-toolchain/qemu` into `build/qemu`. To rebuild it:
+`$RISCV_HOME/riscv-gnu-toolchain/qemu` into `build/qemu`. To rebuild it:
 
 ```sh
 mkdir -p build/qemu
 cd build/qemu
-/home/me/riscv/riscv-gnu-toolchain/qemu/configure \
+"$RISCV_HOME/riscv-gnu-toolchain/qemu/configure" \
   --target-list=riscv32-softmmu --disable-docs --disable-gtk \
   --disable-sdl --disable-werror --disable-slirp
 ninja qemu-system-riscv32

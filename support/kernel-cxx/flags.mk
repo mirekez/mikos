@@ -8,9 +8,8 @@ KERNEL_CXX_HEADERS := -nostdinc++ \
 KERNEL_CXX_HASH := $(KERNEL_CXX_ROOT)/libcxx-21.1.3.src/src/hash.cpp
 KERNEL_CXX_BUILTINS := $(KERNEL_CXX_ROOT)/compiler-rt-21.1.3.src/lib/builtins
 # Only target C declarations are used. No Linux libc or libstdc++ is linked.
-RISCV_SYSROOT ?= $(shell $(RISCV_PREFIX)gcc -print-sysroot)
-KERNEL_CXX_TARGET_HEADERS := $(KERNEL_CXX_HEADERS) --sysroot=$(RISCV_SYSROOT) \
-  -isystem $(RISCV_SYSROOT)/usr/include
+KERNEL_CXX_TARGET_HEADERS = $(KERNEL_CXX_HEADERS) \
+  $(if $(RISCV_C_INCLUDE),--sysroot=$(RISCV_SYSROOT) -isystem $(RISCV_C_INCLUDE),$(error RV32 C headers not found; set RISCV_HOME (for example: export RISCV_HOME=$$HOME/riscv) or RISCV_PREFIX and RISCV_SYSROOT; see README.md))
 
 $(KERNEL_CXX_READY): $(ROOT)/support/kernel-cxx/prepare.sh \
                      $(ROOT)/support/kernel-cxx/configure.cmake \

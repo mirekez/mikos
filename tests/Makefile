@@ -4,12 +4,12 @@ ROOT := $(abspath ..)
 BUILD := $(ROOT)/build/tests/regression
 CXX := $(ROOT)/.conda/bin/clang++
 CPPFLAGS := -I$(ROOT) -I$(ROOT)/include -I$(ROOT)/tests
-CXXFLAGS := -std=c++2c -fno-exceptions -fno-rtti -Wall -Wextra -Werror
-RISCV_PREFIX ?= /home/me/riscv/bin/riscv32-unknown-linux-gnu-
+CXXFLAGS := -std=c++2c -stdlib=libc++ -fno-exceptions -fno-rtti -Wall -Wextra -Werror
+LDFLAGS := -L$(ROOT)/.conda/lib -Wl,-rpath,$(ROOT)/.conda/lib
+include $(ROOT)/support/toolchain.mk
 .DEFAULT_GOAL := all
 include $(ROOT)/support/kernel-cxx/flags.mk
-CPPFLAGS += -isystem $(KERNEL_CXX_ROOT)/include \
-  -isystem $(KERNEL_CXX_ROOT)/inplace_vector-63569fe8502c3504d7d81bb6d378f3ec21fb1e95/include
+CPPFLAGS += -isystem $(KERNEL_CXX_ROOT)/inplace_vector-63569fe8502c3504d7d81bb6d378f3ec21fb1e95/include
 KERNEL_CXX_SANITIZERS ?= undefined
 
 LOCAL_TEST_SOURCES := $(sort $(wildcard kernel/*_test.cpp) \
@@ -26,6 +26,7 @@ BRIDGE_TEST_BINARY := $(BUILD)/qemu/ethgig_tap_self_test
 TEST_BINARIES := $(LOCAL_TEST_BINARIES) $(DRIVER_TEST_BINARIES)
 TEST_DEPS := $(addsuffix .d,$(TEST_BINARIES))
 
+$(TEST_BINARIES): Makefile
 $(TEST_BINARIES): | $(KERNEL_CXX_READY)
 
 .PHONY: all test regression bridge-check fs-driver-check x86-driver-check clean
@@ -47,7 +48,7 @@ $(BUILD)/kernel/standard_containers: kernel/standard_containers.cpp \
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(KERNEL_CXX_HEADERS) -nostdlib++ \
 	  -O2 -g -fsanitize=$(KERNEL_CXX_SANITIZERS) -fno-sanitize-recover=all -fno-omit-frame-pointer \
-	  -MMD -MP -MF $@.d $(sort $(filter %.cpp,$^) $(KERNEL_CXX_HASH)) -o $@
+	  -MMD -MP -MF $@.d $(sort $(filter %.cpp,$^) $(KERNEL_CXX_HASH)) $(LDFLAGS) -o $@
 
 -include $(BUILD)/kernel/standard_containers.d
 
@@ -76,7 +77,7 @@ fs-driver-check: \
 
 $(BUILD)/%: %.cpp support/test.hpp
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d $< $(LDFLAGS) -o $@
 
 $(BUILD)/kernel/pseudo_filesystem_test: kernel/pseudo_filesystem_test.cpp \
 		$(ROOT)/kernel/pseudo_filesystem.cpp \
@@ -84,14 +85,14 @@ $(BUILD)/kernel/pseudo_filesystem_test: kernel/pseudo_filesystem_test.cpp \
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d \
 		kernel/pseudo_filesystem_test.cpp \
-		$(ROOT)/kernel/pseudo_filesystem.cpp -o $@
+		$(ROOT)/kernel/pseudo_filesystem.cpp $(LDFLAGS) -o $@
 
 $(BUILD)/net/stack_test: net/stack_test.cpp $(ROOT)/network/stack.cpp \
 		$(ROOT)/include/mikos/net/socket.hpp \
 		$(ROOT)/include/mikos/net/tcp.hpp support/test.hpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d \
-		net/stack_test.cpp $(ROOT)/network/stack.cpp -o $@
+		net/stack_test.cpp $(ROOT)/network/stack.cpp $(LDFLAGS) -o $@
 
 $(BRIDGE_TEST_BINARY): $(ROOT)/tests/qemu/ethgig_tap.cpp
 	@mkdir -p $(@D)
@@ -99,7 +100,7 @@ $(BRIDGE_TEST_BINARY): $(ROOT)/tests/qemu/ethgig_tap.cpp
 
 $(BUILD)/drivers/%: ../drivers/%.cpp support/test.hpp
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d $< $(LDFLAGS) -o $@
 
 clean:
 	rm -f $(TEST_BINARIES) $(TEST_DEPS)

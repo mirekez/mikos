@@ -1,9 +1,11 @@
 SHELL := /bin/bash
+.DEFAULT_GOAL := all
 
 ROOT := $(abspath ../..)
-BUILD ?= $(ROOT)/build/tests/busybox
-RISCV_PREFIX ?= /home/me/riscv/bin/riscv32-unknown-linux-gnu-
-LD := $(RISCV_PREFIX)ld
+# Conda exports BUILD as a host triplet; only a make command-line override
+# should replace our output directory.
+BUILD := $(ROOT)/build/tests/busybox
+include $(ROOT)/support/toolchain.mk
 LLVM_READELF := $(ROOT)/.conda/bin/llvm-readelf
 JOBS ?= 4
 MKE2FS ?= /usr/sbin/mke2fs
@@ -20,7 +22,7 @@ BUSYBOX_CONFIG := config/busybox.config
 BUSYBOX_ADDRESS := 0x81000000
 
 STRESS_NG_REFERENCE := third_party/stress-ng
-STRESS_NG_COMMIT := f73c6bd5f34df31dbaea8215e1e9c3f5cbc8d060
+# Vendored snapshot of f73c6bd5f34df31dbaea8215e1e9c3f5cbc8d060.
 STRESS_NG_SOURCE := $(BUILD)/stress-ng-source
 STRESS_NG := $(STRESS_NG_SOURCE)/stress-ng
 STRESS_NG_ADDRESS := 0x81000000
@@ -49,6 +51,17 @@ ROOTFS_CONFIG := rootfs/etc/group rootfs/etc/inittab rootfs/etc/passwd \
 	rootfs/root/.ssh/authorized_keys
 
 .PHONY: all payloads rootfs busybox stress-ng dropbear dropbear-client clean
+.PHONY: check-linux-toolchain
+
+check-linux-toolchain:
+	@command -v '$(RISCV_LINUX_PREFIX)gcc' >/dev/null || { \
+		echo 'RV32 Linux toolchain missing: $(RISCV_LINUX_PREFIX)gcc' >&2; \
+		echo 'Set RISCV_HOME or RISCV_LINUX_PREFIX to a Linux/glibc toolchain.' >&2; \
+		echo 'The bare-metal unknown-elf toolchain supports make kernel, but cannot build Linux userspace.' >&2; \
+		exit 1; }
+
+$(BUSYBOX_SOURCE)/.source-ready $(STRESS_NG_SOURCE)/.source-ready \
+  $(DROPBEAR_SOURCE)/.source-ready: | check-linux-toolchain
 
 all: rootfs
 
@@ -76,19 +89,18 @@ $(BUSYBOX_OUT)/.config: $(BUSYBOX_SOURCE)/.source-ready $(BUSYBOX_CONFIG)
 
 $(BUSYBOX): $(BUSYBOX_OUT)/.config build_busybox.sh
 	./build_busybox.sh $(BUSYBOX_SOURCE) $(BUSYBOX_OUT) \
-		$(RISCV_PREFIX) $(BUSYBOX_ADDRESS) $(LLVM_READELF) $(JOBS)
+		$(RISCV_LINUX_PREFIX) $(BUSYBOX_ADDRESS) $(LLVM_READELF) $(JOBS)
 
-$(STRESS_NG_SOURCE)/.source-ready: $(STRESS_NG_PATCH)
+$(STRESS_NG_SOURCE)/.source-ready: $(STRESS_NG_PATCH) Makefile
 	rm -rf $(STRESS_NG_SOURCE)
 	@mkdir -p $(STRESS_NG_SOURCE)
-	git -C $(STRESS_NG_REFERENCE) archive --format=tar $(STRESS_NG_COMMIT) | \
-		tar -xf - -C $(STRESS_NG_SOURCE)
+	cp -a $(STRESS_NG_REFERENCE)/. $(STRESS_NG_SOURCE)/
 	patch -d $(STRESS_NG_SOURCE) -p1 < $(STRESS_NG_PATCH)
 	@touch $@
 
 $(STRESS_NG): $(STRESS_NG_SOURCE)/.source-ready
 	$(MAKE) -C $(STRESS_NG_SOURCE) -j$(JOBS) \
-		CC=$(RISCV_PREFIX)gcc CXX=$(RISCV_PREFIX)g++ \
+		CC=$(RISCV_LINUX_PREFIX)gcc CXX=$(RISCV_LINUX_PREFIX)g++ \
 		STATIC=1 BUILD_SMALL=1 GARBAGE_COLLECT=1 \
 		CFLAGS=-DSTRESS_MIKOS \
 		LDFLAGS='-Wl,-Ttext-segment=$(STRESS_NG_ADDRESS)' \
@@ -96,7 +108,7 @@ $(STRESS_NG): $(STRESS_NG_SOURCE)/.source-ready
 		LIB_CRYPT= LIB_EGL= LIB_GBM= LIB_GLES2= LIB_IPSEC_MB= \
 		LIB_JPEG= LIB_JUDY= LIB_KMOD= LIB_LZMA= LIB_MD= \
 		LIB_MPFR= LIB_NL= LIB_SCTP= LIB_XXHASH= LIB_Z= stress-ng
-	$(RISCV_PREFIX)strip $@
+	$(RISCV_LINUX_PREFIX)strip $@
 	$(LLVM_READELF) -l $@ > $(STRESS_NG_SOURCE)/program-headers.txt
 	rg -q 'LOAD +0x[0-9a-f]+ +$(STRESS_NG_ADDRESS)' \
 		$(STRESS_NG_SOURCE)/program-headers.txt
@@ -111,7 +123,7 @@ $(DROPBEAR_SOURCE)/.source-ready: download_dropbear.sh
 $(DROPBEAR): Makefile $(DROPBEAR_SOURCE)/.source-ready $(DROPBEAR_CONFIG) \
 		$(DROPBEAR_PATCH) \
 		build_dropbear.sh
-	./build_dropbear.sh $(DROPBEAR_SOURCE) $(RISCV_PREFIX) \
+	./build_dropbear.sh $(DROPBEAR_SOURCE) $(RISCV_LINUX_PREFIX) \
 		$(DROPBEAR_ADDRESS) $(LLVM_READELF) $(JOBS) $(DROPBEAR_CONFIG) \
 		$(DROPBEAR_PATCH)
 

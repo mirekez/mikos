@@ -5,14 +5,14 @@ BUILD := $(ROOT)/build
 CONDA := $(ROOT)/.conda/bin
 CXX := $(CONDA)/clang++
 LLVM_READELF := $(CONDA)/llvm-readelf
-RISCV_PREFIX ?= /home/me/riscv/bin/riscv32-unknown-linux-gnu-
+include support/toolchain.mk
 LD := $(RISCV_PREFIX)ld
 OBJCOPY := $(RISCV_PREFIX)objcopy
 
 .DEFAULT_GOAL := all
 include support/kernel-cxx/flags.mk
 
-RV_FLAGS := --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 \
+RV_FLAGS = --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 \
 	-mcmodel=medany -msmall-data-limit=0 -std=c++2c -ffreestanding \
 	-fno-exceptions -fno-rtti -fno-unwind-tables \
 	-fno-asynchronous-unwind-tables -fno-threadsafe-statics \
@@ -44,7 +44,7 @@ KERNEL_OBJECTS := $(patsubst %.cpp,$(BUILD)/%.o,$(filter %.cpp,$(KERNEL_SOURCES)
 	$(patsubst %.S,$(BUILD)/%.o,$(filter %.S,$(KERNEL_SOURCES)))
 KERNEL_DEPS := $(KERNEL_OBJECTS:.o=.d)
 
-TRIBE_RV_FLAGS := $(subst -march=rv32ima_zicsr,-march=rv32im_zicsr,$(RV_FLAGS)) \
+TRIBE_RV_FLAGS = $(subst -march=rv32ima_zicsr,-march=rv32im_zicsr,$(RV_FLAGS)) \
 	-DMIKOS_TRIBE
 TRIBE_KERNEL_ELF := $(BUILD)/mikos-tribe-rv32.elf
 TRIBE_KERNEL_MAP := $(BUILD)/mikos-tribe-rv32.map
@@ -70,14 +70,14 @@ TRIBE_KERNEL_OBJECTS := \
 	$(patsubst %.cpp,$(BUILD)/tribe/%.o,$(filter %.cpp,$(TRIBE_KERNEL_SOURCES))) \
 	$(patsubst %.S,$(BUILD)/tribe/%.o,$(filter %.S,$(TRIBE_KERNEL_SOURCES)))
 TRIBE_KERNEL_DEPS := $(TRIBE_KERNEL_OBJECTS:.o=.d)
-TRIBE_INTERACTIVE_RV_FLAGS := $(TRIBE_RV_FLAGS) -DMIKOS_TRIBE_INTERACTIVE
+TRIBE_INTERACTIVE_RV_FLAGS = $(TRIBE_RV_FLAGS) -DMIKOS_TRIBE_INTERACTIVE
 TRIBE_INTERACTIVE_ELF := $(BUILD)/mikos-tribe-interactive-rv32.elf
 TRIBE_INTERACTIVE_MAP := $(BUILD)/mikos-tribe-interactive-rv32.map
 TRIBE_INTERACTIVE_OBJECTS := \
 	$(patsubst %.cpp,$(BUILD)/tribe-interactive/%.o,$(filter %.cpp,$(TRIBE_KERNEL_SOURCES))) \
 	$(patsubst %.S,$(BUILD)/tribe-interactive/%.o,$(filter %.S,$(TRIBE_KERNEL_SOURCES)))
 TRIBE_INTERACTIVE_DEPS := $(TRIBE_INTERACTIVE_OBJECTS:.o=.d)
-TRIBE_INTERACTIVE_MULTICORE_RV_FLAGS := $(TRIBE_INTERACTIVE_RV_FLAGS) \
+TRIBE_INTERACTIVE_MULTICORE_RV_FLAGS = $(TRIBE_INTERACTIVE_RV_FLAGS) \
 	-DMIKOS_TRIBE_MULTICORE
 TRIBE_INTERACTIVE_MULTICORE_ELF := \
 	$(BUILD)/mikos-tribe-interactive-multicore-rv32.elf
@@ -109,7 +109,7 @@ $(BUILD)/kernel/softfloat/%.o: $(KERNEL_CXX_READY)
 	  -c $(KERNEL_CXX_BUILTINS)/$*.c -o $@
 
 $(KERNEL_OBJECTS) $(TRIBE_KERNEL_OBJECTS) $(TRIBE_INTERACTIVE_OBJECTS) \
-  $(TRIBE_INTERACTIVE_MULTICORE_OBJECTS): Makefile support/kernel-cxx/flags.mk $(KERNEL_CXX_READY)
+  $(TRIBE_INTERACTIVE_MULTICORE_OBJECTS): Makefile support/toolchain.mk support/kernel-cxx/flags.mk $(KERNEL_CXX_READY)
 
 $(BUILD)/kernel/cxx_hash.o: $(KERNEL_CXX_READY)
 	@mkdir -p $(@D)
@@ -138,22 +138,28 @@ QEMU := $(BUILD)/qemu/qemu-system-riscv32
 NET_PEER := $(BUILD)/tests/qemu/net_peer
 ETHGIG_TAP := $(BUILD)/tests/qemu/ethgig_tap
 TRIBE_NET_PEER := $(BUILD)/tests/tribe/net_peer
+CPPHDL_HOME ?=
+export CPPHDL_HOME
+CPPHDL_TAP := $(BUILD)/tests/tribe/ethgig_tap
 
-.PHONY: all test kernel tribe-kernel tribe-interactive-kernel \
+.PHONY: all test kernel image tribe-kernel tribe-interactive-kernel \
 	tribe-interactive-multicore-kernel inspect busybox dropbear-client \
 	stress-ng run qemu-test qemu-net-test qemu-ssh-top tribe-prepare tribe-test \
 	tribe-interactive tribe-interactive-ping-test \
 	tribe-interactive-tcp-test tribe-interactive-process-test \
 	tribe-interactive-ssh-test ethgig-tap clean
+.PHONY: tribe-boot-test tribe-kernel-test tribe-all-tests tribe-tap tribe-peer-test
 
 all: test kernel
 
-test:
+test: tribe-peer-test
 	$(MAKE) -C tests test
 
-kernel: $(ROOTFS_IMAGE) $(KERNEL_ELF)
+kernel: $(KERNEL_ELF)
 
-tribe-kernel: $(ROOTFS_IMAGE) $(TRIBE_KERNEL_ELF)
+image: $(ROOTFS_IMAGE) $(KERNEL_ELF)
+
+tribe-kernel: $(TRIBE_KERNEL_ELF)
 
 tribe-interactive-kernel: $(ROOTFS_IMAGE) $(TRIBE_INTERACTIVE_ELF)
 
@@ -296,6 +302,25 @@ qemu-net-test: $(ROOTFS_IMAGE) inspect $(NET_PEER) $(QEMU)
 
 tribe-prepare:
 	tests/tribe/prepare_cpphdl.sh
+
+tribe-peer-test: $(TRIBE_NET_PEER)
+	python3 tests/tribe/test_net_peer.py $(TRIBE_NET_PEER)
+
+tribe-kernel-test: tribe-prepare tribe-kernel $(TRIBE_NET_PEER)
+	bash tests/tribe/run_kernel.sh
+
+tribe-boot-test: tribe-prepare tribe-kernel
+	bash tests/tribe/run_boot.sh
+
+tribe-all-tests:
+	bash tests/tribe/run_all.sh
+
+tribe-tap:
+	@test -f '$(CPPHDL_HOME)/tribe_cpu/linux/net/ethgig_tap.cpp' || { \
+		echo 'Set CPPHDL_HOME to your current cpphdl checkout (export CPPHDL_HOME=$$HOME/cpphdl).' >&2; exit 1; }
+	@mkdir -p $(dir $(CPPHDL_TAP))
+	$(CXX) -std=c++2c -O2 -Wall -Wextra \
+		'$(CPPHDL_HOME)/tribe_cpu/linux/net/ethgig_tap.cpp' -o $(CPPHDL_TAP)
 
 tribe-test: tribe-prepare $(ROOTFS_IMAGE) $(TRIBE_KERNEL_ELF) $(TRIBE_NET_PEER)
 	tests/tribe/run_tribe.sh

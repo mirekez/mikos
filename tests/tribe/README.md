@@ -1,6 +1,6 @@
 # Tribe acceptance test
 
-`make tribe-test` clones the pinned cpphdl revision, builds the 64-bit-bus Tribe
+`make tribe-test` builds the checkout selected by `CPPHDL_HOME`, builds the 64-bit-bus Tribe
 simulator with 32 MiB RAM, builds the MikOS Tribe image, and exercises:
 
 - the polling NS16550A UART;
@@ -17,14 +17,37 @@ and report `MIKOS:EXT4_ROOT_OK`. The host regression suite also checks DMA
 register sequencing, completion, controller errors, timeouts, and destination
 validation.
 
-The default clone can be replaced with a local cpphdl checkout:
+To test the current cpphdl working tree, including uncommitted changes:
 
 ```sh
-CPPHDL_REFERENCE=/path/to/cpphdl make tribe-test
+export CPPHDL_HOME="$HOME/cpphdl"
+export RISCV_HOME="$HOME/riscv"
+make tribe-boot-test
+make tribe-kernel-test
+make tribe-all-tests
 ```
 
-`CPPHDL_REVISION`, `CPPHDL_REPOSITORY`, `CPPHDL_TOOLCHAIN`, `RISCV_HOME`,
-`JOBS`, `TRIBE_CYCLES`, and `TRIBE_TIMEOUT` are also configurable.
+Local mode builds `tribe_cpu` directly, using its `TRIBE_CFG_*` CMake options.
+The source checkout is not reset or automatically patched. Single-core and
+multicore builds are isolated under `build/tests/tribe/cpphdl-local-build`;
+`CPPHDL_BUILD_ROOT` overrides that location. It uses `$CPPHDL_HOME/.conda`
+unless `CPPHDL_TOOLCHAIN` is set. `tribe-kernel-test` runs the real kernel's
+container, platform-state, UART, ARP, and 512-byte ICMP payload checks without a disk or Linux
+userspace, stopping after the ICMP reply. `tribe-all-tests`
+also attempts every userspace acceptance target and writes per-test logs and
+`summary.txt` under `build/tests/tribe/results`; a blocked target is not a pass.
+`tribe-boot-test` isolates the boot, container, and platform-state checks and
+stops before device initialization, so a networking failure cannot mask their
+results.
+
+`CPPHDL_HOME` is required. CPU bug fixes and their regressions live in cpphdl;
+preparation does not apply a local patch stack or reset the source checkout.
+The previous `CPPHDL_REFERENCE`, `CPPHDL_REVISION`, and `CPPHDL_REPOSITORY`
+clone workflow has been retired. See [cpphdl fix migration](cpphdl-fixes.md)
+for the disposition of the former patches.
+
+`CPPHDL_TOOLCHAIN`, `CPPHDL_BUILD_ROOT`, `RISCV_HOME`, `JOBS`, `TRIBE_CYCLES`,
+and `TRIBE_TIMEOUT` are configurable.
 
 For an interactive UART session, run:
 
@@ -32,12 +55,24 @@ For an interactive UART session, run:
 tests/tribe/tribe_interactive.sh --multicore
 ```
 
-The TAP bridge socket defaults to `/tmp/tribe-ethgig.sock`. The launcher builds
-and starts the maintained bridge on `tap-tribe` itself, requesting `sudo` once
-when the host TAP must be created. It also replaces an older cpphdl bridge that
-uses the same default socket, because that bridge silently drops datagrams on
-backpressure and retains stale simulator-peer state. Set `TRIBE_ETH_TAP_SOCKET`
-or pass `--tap-socket` only for an intentionally externally managed bridge.
+With `CPPHDL_HOME` set, build the checkout's own bridge source from
+`tribe_cpu/linux/net/ethgig_tap.cpp` and start it in another terminal:
+
+```sh
+make tribe-tap
+sudo bash tests/tribe/start_tap.sh
+```
+
+The wrapper supplies the network setup that cpphdl's simpler bridge CLI
+expects: host `192.168.76.1/24`, the permanent guest neighbor entry, and a socket
+owned by the invoking user. The interactive launcher treats this as an
+externally managed bridge and does not replace it. Creating a TAP requires
+`CAP_NET_ADMIN`; the source path alone is insufficient. No Linux kernel is
+booted by these tests. The existing BusyBox/Dropbear tests do need their
+Linux-ABI userspace binaries in the shared rootfs.
+
+The TAP bridge socket defaults to `/tmp/tribe-ethgig.sock`. Set
+`TRIBE_ETH_TAP_SOCKET` or pass `--tap-socket` to select another running bridge.
 With `tap-tribe` configured as `192.168.76.1/24`, the guest is configured
 automatically; it can be pinged from the host:
 

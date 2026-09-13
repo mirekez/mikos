@@ -253,6 +253,13 @@ void copy_path(char* output, const char* input) {
                                    bool preloaded_busybox = false) {
   const auto node = drivers::fs::root::lookup(path);
   Image image{};
+  if (!node) {
+    write_text("MIKOS:ELF_LOOKUP_FAILED path=");
+    write_text(path);
+    write_text(" error=");
+    write_u32(static_cast<u32>(node.error()));
+    write_text("\n");
+  }
   if (!node ||
 #ifdef MIKOS_TRIBE_INTERACTIVE
       (preloaded_busybox ? !load_preloaded_busybox((*node), image)

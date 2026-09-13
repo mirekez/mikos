@@ -134,6 +134,13 @@ working tree. `CPPHDL_TOOLCHAIN` overrides its default compiler environment,
 local patch stack have been retired; CPU fixes belong in cpphdl itself.
 See [the migration notes](tests/tribe/cpphdl-fixes.md) for the changes and tests.
 
+`MIKOS:BAD_ELF` is a boot failure, even if the TAP connection and ext4 mount
+succeeded. Ensure cpphdl includes commit `590ffc4`, the load-retirement fix in
+`WritebackMem.h`:
+older simulators can lose a filesystem pointer during multiplication and fail
+to find the valid BusyBox ELF. After updating cpphdl, rerun the interactive
+script to rebuild it. The migration notes describe the failure and regression.
+
 `make tribe-boot-test` runs the kernel's container self-test and checks flat
 memory and disabled device interrupts through the polling UART, then stops
 before device initialization. It needs no disk, networking, or Linux userspace.

@@ -3,8 +3,29 @@
 Tribe tests now require `export CPPHDL_HOME="$HOME/cpphdl"`. Fixes are maintained
 in that checkout, including its working-tree changes, rather than applied by
 mikOS at build time. The old pinned clone and `tests/tribe/patches` are retired.
-A checkout used elsewhere must contain the fixes below. The current local
-checkout includes them in commit `3e739c3` (subsequently merged into `f1a1f7f`).
+A checkout used elsewhere must contain the fixes below. The original network
+fixes are in commit `3e739c3` (subsequently merged into `f1a1f7f`).
+
+## BusyBox boot failure after mounting ext4
+
+`MIKOS:EXT4_ROOT_OK` followed by `MIKOS:BAD_ELF` can result from Tribe losing
+a completed load value while a younger multiply or divide holds the pipeline.
+Writeback consumed the load's response-valid token, then exposed zero while
+the same instruction still occupied the memory stage. Repeated writeback
+overwrote a filesystem reader pointer with zero, causing directory lookup to
+fail before BusyBox's ELF header was read. The rootfs and BusyBox ELF were valid.
+
+cpphdl commit `590ffc4` fixes `tribe_cpu/WritebackMem.h` to retain the assembled
+result after consuming its valid token. The next load still needs its own
+response before retirement.
+`tribe_cpu/tests/load_retire_regression.sh` reproduces the lost pointer and
+checks signed/unsigned byte, halfword, and word loads across MUL/DIV stalls,
+dependent operands, and repeated loads of different data. It is also part of
+`network_regression.sh`.
+
+Update the cpphdl checkout and rerun `tests/tribe/tribe_interactive.sh --multicore`
+from mikOS to rebuild the simulator. mikOS now logs the image path and filesystem
+error when lookup fails, before the final `MIKOS:BAD_ELF` marker.
 
 ## Network failure causes
 

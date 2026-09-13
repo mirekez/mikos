@@ -73,46 +73,37 @@ kernel is involved. The launcher checks this prerequisite before building
 the simulator.
 
 With `CPPHDL_HOME` set, build the checkout's own bridge source from
-`tribe_cpu/linux/net/ethgig_tap.cpp` and start it in another terminal:
+`tribe_cpu/linux/net/ethgig_tap.cpp` and start it in the background from the
+repository root, in the same terminal:
 
 ```sh
 make tribe-tap
-sudo bash tests/tribe/start_tap.sh
-```
-
-The wrapper supplies the network setup that cpphdl's simpler bridge CLI
-expects: host `192.168.76.1/24`, the permanent guest neighbor entry, and a socket
-owned by the invoking user. The interactive launcher treats this as an
-externally managed bridge and does not replace it. Creating a TAP requires
-`CAP_NET_ADMIN`; the source path alone is insufficient. No Linux kernel is
-booted by these tests. The existing BusyBox/Dropbear tests do need their
-Linux-ABI userspace binaries in the shared rootfs.
-
-If the launcher reports `Tribe TAP bridge socket is missing`, it prints the
-manual setup commands for the selected socket, interface, and addresses.
-The launcher requires a running bridge; it does not create the host TAP itself.
-As an alternative to the cpphdl bridge wrapper above, run the mikOS bridge
-from the repository root, only if another bridge is not already running:
-
-```sh
-make ethgig-tap
-sudo build/tests/qemu/ethgig_tap \
-  --tap tap-tribe \
-  --address 192.168.76.1/24 \
-  --socket /tmp/tribe-ethgig.sock
-```
-
-Leave it running. In another host terminal, configure the permanent neighbor
-entry and start the console:
-
-```sh
-sudo ip neigh replace 192.168.76.2 \
-  lladdr 02:00:00:00:00:02 nud permanent dev tap-tribe
+sudo bash tests/tribe/start_tap.sh --background
 tests/tribe/tribe_interactive.sh --multicore
 ```
 
-Host `192.168.76.1/24` and Tribe `192.168.76.2/24` share the same subnet, so
-no gateway is needed between them.
+The setup wrapper configures `tap-tribe`, host `192.168.76.1/24`, the permanent
+neighbor entry for guest `192.168.76.2`, and socket ownership. It returns after
+the socket is ready, prints the log path (`build/tests/tribe/tap.log`) and a
+`sudo kill -- PID` stop command, and leaves the bridge running independently
+of the simulator. No separate `ip neigh` command or second terminal is needed.
+Host and guest share a subnet, so no gateway is needed between them. Omit
+`--background` to keep the bridge in the foreground for debugging.
+
+Run the interactive launcher as your normal user. Only TAP setup needs sudo;
+`sudo ./tribe_interactive.sh` normally drops `CPPHDL_HOME` and other exported
+build settings. No Linux guest kernel is involved.
+
+Start a bridge only if one is not already running. The wrapper refuses to
+replace an existing socket. The missing-socket hint prints the background
+setup commands with any selected network overrides passed explicitly through
+sudo. When setting up a custom socket manually, for example:
+
+```sh
+sudo env TRIBE_ETH_TAP_SOCKET=/tmp/my-tribe.sock \
+  bash tests/tribe/start_tap.sh --background
+tests/tribe/tribe_interactive.sh --multicore --tap-socket /tmp/my-tribe.sock
+```
 
 The TAP bridge socket defaults to `/tmp/tribe-ethgig.sock`. Set
 `TRIBE_ETH_TAP_SOCKET` or pass `--tap-socket` to select another running bridge.

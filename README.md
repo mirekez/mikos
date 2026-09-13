@@ -154,17 +154,19 @@ Linux/glibc cross-toolchain described above to build those Linux-ABI programs.
 
 To use the TAP bridge source from
 `$CPPHDL_HOME/tribe_cpu/linux/net/ethgig_tap.cpp`, build it here and start the
-wrapper in another terminal:
+wrapper in the background from the same terminal:
 
 ```sh
 make tribe-tap
-sudo bash tests/tribe/start_tap.sh
+sudo bash tests/tribe/start_tap.sh --background
 ```
 
 The wrapper configures `tap-tribe` as `192.168.76.1/24`, installs the guest
 neighbor entry, and runs the selected cpphdl bridge on
-`/tmp/tribe-ethgig.sock`. Leave it running while executing the interactive
-tests. With `CPPHDL_HOME` set, the launcher uses this bridge without passing
+`/tmp/tribe-ethgig.sock`. It returns once the socket is ready and prints
+the log path and a command to stop the background bridge. Run the interactive
+launcher without sudo; sudo normally drops exported settings such as
+`CPPHDL_HOME`. With `CPPHDL_HOME` set, the launcher uses this bridge without passing
 the mikOS-specific command-line options that cpphdl's bridge does not accept.
 TAP creation needs host `CAP_NET_ADMIN`; merely having the bridge source does
 not grant that permission. `TRIBE_ETH_TAP_SOCKET` and `TRIBE_INTERACTIVE_TAP`

@@ -7,6 +7,15 @@ address="${TRIBE_INTERACTIVE_HOST_ADDRESS:-192.168.76.1}"
 guest="${TRIBE_INTERACTIVE_GUEST_ADDRESS:-192.168.76.2}"
 mac="${TRIBE_INTERACTIVE_GUEST_MAC:-02:00:00:00:00:02}"
 bridge="$root/build/tests/tribe/ethgig_tap"
+background=0
+if [[ "${1:-}" == --background ]]; then
+  background=1
+  shift
+fi
+if (($#)); then
+  echo "usage: $0 [--background]" >&2
+  exit 2
+fi
 
 if [[ ! -x "$bridge" ]]; then
   echo 'Build the cpphdl bridge first: make tribe-tap' >&2
@@ -34,15 +43,34 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
-"$bridge" --tap "$tap" --socket "$socket" &
+if ((background)); then
+  log="$root/build/tests/tribe/tap.log"
+  # Detach from the terminal so Ctrl+C in the simulator leaves the bridge up.
+  setsid "$bridge" --tap "$tap" --socket "$socket" >"$log" 2>&1 < /dev/null &
+else
+  "$bridge" --tap "$tap" --socket "$socket" &
+fi
 bridge_pid=$!
 for _ in {1..100}; do
   [[ -S "$socket" ]] && break
-  kill -0 "$bridge_pid" 2>/dev/null || { wait "$bridge_pid"; exit 1; }
+  if ! kill -0 "$bridge_pid" 2>/dev/null; then
+    wait "$bridge_pid" || true
+    if ((background)); then cat "$log" >&2; fi
+    echo 'TAP bridge exited before its socket was ready.' >&2
+    exit 1
+  fi
   sleep 0.05
 done
 [[ -S "$socket" ]] || { echo "Bridge socket did not appear: $socket" >&2; exit 1; }
 chown "${SUDO_UID:-$UID}:${SUDO_GID:-$(id -g)}" "$socket"
 chmod 0600 "$socket"
-echo "cpphdl TAP bridge ready: $tap $address/24, $socket (Ctrl+C to stop)"
-wait "$bridge_pid"
+echo "cpphdl TAP bridge ready: $tap $address/24, $socket"
+if ((background)); then
+  echo "Guest: $guest/24; permanent neighbor: $mac. No gateway is needed between them."
+  echo "Log: $log"
+  echo "Stop the background bridge: sudo kill -- $bridge_pid"
+  bridge_pid=""
+else
+  echo 'Leave this terminal running; Ctrl+C stops the bridge.'
+  wait "$bridge_pid"
+fi

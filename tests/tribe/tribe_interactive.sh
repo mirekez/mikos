@@ -64,6 +64,9 @@ done
 
 if [[ -z "${CPPHDL_HOME:-}" ]]; then
   echo 'Set CPPHDL_HOME to your cpphdl checkout (export CPPHDL_HOME="$HOME/cpphdl").' >&2
+  if ((EUID == 0)) && [[ -n "${SUDO_USER:-}" ]]; then
+    echo 'Run this launcher without sudo; sudo normally removes CPPHDL_HOME. Only TAP setup needs sudo.' >&2
+  fi
   exit 1
 fi
 
@@ -113,15 +116,34 @@ if [[ ! -S "$tap_socket" ]]; then
   {
     echo "Tribe TAP bridge socket is missing: $tap_socket"
     echo "This launcher needs an already-running TAP bridge."
-    echo "In another host terminal, start one only if another bridge isn't already running:"
+    echo "In this terminal, start one in the background only if another bridge isn't already running:"
     printf '  cd %q\n' "$root"
-    echo "  make ethgig-tap"
-    printf '  sudo build/tests/qemu/ethgig_tap --tap %q --address %q --socket %q\n' \
-      "$tap_name" "$host_address/24" "$tap_socket"
-    echo "Leave that terminal running. In a second host terminal, configure the guest neighbor:"
-    printf '  sudo ip neigh replace %q lladdr %q nud permanent dev %q\n' \
-      "$guest_address" "$guest_mac" "$tap_name"
-    echo "Then rerun this launcher with the same options. If a bridge is already running"
+    echo "  make tribe-tap"
+    tap_environment=()
+    if [[ "$tap_name" != tap-tribe ]]; then
+      tap_environment+=("TRIBE_INTERACTIVE_TAP=$tap_name")
+    fi
+    if [[ "$host_address" != 192.168.76.1 ]]; then
+      tap_environment+=("TRIBE_INTERACTIVE_HOST_ADDRESS=$host_address")
+    fi
+    if [[ "$guest_address" != 192.168.76.2 ]]; then
+      tap_environment+=("TRIBE_INTERACTIVE_GUEST_ADDRESS=$guest_address")
+    fi
+    if [[ "$guest_mac" != 02:00:00:00:00:02 ]]; then
+      tap_environment+=("TRIBE_INTERACTIVE_GUEST_MAC=$guest_mac")
+    fi
+    if [[ "$tap_socket" != /tmp/tribe-ethgig.sock ]]; then
+      tap_environment+=("TRIBE_ETH_TAP_SOCKET=$tap_socket")
+    fi
+    printf '  sudo'
+    if ((${#tap_environment[@]})); then
+      printf ' env'
+      printf ' %q' "${tap_environment[@]}"
+    fi
+    printf ' bash tests/tribe/start_tap.sh --background\n'
+    echo "This configures the host IP and permanent guest neighbor, and returns when the bridge is ready."
+    echo "It prints the bridge log path and stop command."
+    echo "Then rerun this launcher without sudo, with the same options. If a bridge is already running"
     echo "on another socket, select it with --tap-socket PATH instead of starting a second one."
     echo "Inside the Tribe BusyBox console, configure the guest interface if needed:"
     printf '  ifconfig eth0 %q netmask 255.255.255.0 up\n' "$guest_address"

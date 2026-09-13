@@ -88,6 +88,32 @@ externally managed bridge and does not replace it. Creating a TAP requires
 booted by these tests. The existing BusyBox/Dropbear tests do need their
 Linux-ABI userspace binaries in the shared rootfs.
 
+If the launcher reports `Tribe TAP bridge socket is missing`, it prints the
+manual setup commands for the selected socket, interface, and addresses.
+The launcher requires a running bridge; it does not create the host TAP itself.
+As an alternative to the cpphdl bridge wrapper above, run the mikOS bridge
+from the repository root, only if another bridge is not already running:
+
+```sh
+make ethgig-tap
+sudo build/tests/qemu/ethgig_tap \
+  --tap tap-tribe \
+  --address 192.168.76.1/24 \
+  --socket /tmp/tribe-ethgig.sock
+```
+
+Leave it running. In another host terminal, configure the permanent neighbor
+entry and start the console:
+
+```sh
+sudo ip neigh replace 192.168.76.2 \
+  lladdr 02:00:00:00:00:02 nud permanent dev tap-tribe
+tests/tribe/tribe_interactive.sh --multicore
+```
+
+Host `192.168.76.1/24` and Tribe `192.168.76.2/24` share the same subnet, so
+no gateway is needed between them.
+
 The TAP bridge socket defaults to `/tmp/tribe-ethgig.sock`. Set
 `TRIBE_ETH_TAP_SOCKET` or pass `--tap-socket` to select another running bridge.
 With `tap-tribe` configured as `192.168.76.1/24`, the guest is configured

@@ -110,10 +110,23 @@ fi
 make -C "$root" "$kernel_target" dropbear-client "$maintained_bridge"
 
 if [[ ! -S "$tap_socket" ]]; then
-  echo "Tribe TAP bridge socket is missing: $tap_socket" >&2
-  if [[ -n "${CPPHDL_HOME:-}" ]]; then
-    echo "Run make tribe-tap, then sudo bash $root/tests/tribe/start_tap.sh in another terminal." >&2
-  fi
+  {
+    echo "Tribe TAP bridge socket is missing: $tap_socket"
+    echo "This launcher needs an already-running TAP bridge."
+    echo "In another host terminal, start one only if another bridge isn't already running:"
+    printf '  cd %q\n' "$root"
+    echo "  make ethgig-tap"
+    printf '  sudo build/tests/qemu/ethgig_tap --tap %q --address %q --socket %q\n' \
+      "$tap_name" "$host_address/24" "$tap_socket"
+    echo "Leave that terminal running. In a second host terminal, configure the guest neighbor:"
+    printf '  sudo ip neigh replace %q lladdr %q nud permanent dev %q\n' \
+      "$guest_address" "$guest_mac" "$tap_name"
+    echo "Then rerun this launcher with the same options. If a bridge is already running"
+    echo "on another socket, select it with --tap-socket PATH instead of starting a second one."
+    echo "Inside the Tribe BusyBox console, configure the guest interface if needed:"
+    printf '  ifconfig eth0 %q netmask 255.255.255.0 up\n' "$guest_address"
+    echo "Host: $host_address/24; Tribe: $guest_address/24. No gateway is needed between them."
+  } >&2
   exit 1
 fi
 if ! "$maintained_bridge" --probe-socket "$tap_socket"; then

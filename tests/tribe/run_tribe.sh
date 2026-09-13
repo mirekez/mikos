@@ -36,8 +36,13 @@ kernel="$root/build/mikos-tribe-rv32.elf"
 peer="$root/build/tests/tribe/net_peer"
 log="$root/build/tribe-test.log"
 peer_log="$root/build/tribe-net-peer.log"
-cycles="${TRIBE_CYCLES:-45000000}"
-default_wall_timeout=600
+default_cycles=120000000
+default_wall_timeout=1200
+if ((kernel_only)); then
+  default_cycles=45000000
+  default_wall_timeout=600
+fi
+cycles="${TRIBE_CYCLES:-$default_cycles}"
 if [[ "$simulator_name" == "tribe64_multicore" ]]; then
   default_wall_timeout=1800
 fi
@@ -149,6 +154,7 @@ if ! grep -E -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
    ! grep -E -q '^MIKOS:ICMP_ECHO_REPLY$' "$log" ||
    ! grep -E -q '^MIKOS:PMP_UNAVAILABLE$' "$log" ||
    ! grep -E -q '^MIKOS:TRIBE_POLLING$' "$log" ||
+   [[ "$(grep -E -c '^MIKOS_WRITE_OK$' "$log" || true)" != 2 ]] ||
    ! grep -E -q '^MIKOS_BUSYBOX_OK$' "$log" ||
    ! grep -E -q '^MIKOS:BUSYBOX_EXIT 0$' "$log" ||
    ! grep -E -q '^MIKOS:EXIT 0$' "$log"; then

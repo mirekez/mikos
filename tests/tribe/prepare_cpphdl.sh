@@ -46,7 +46,8 @@ fi
 toolchain="${CPPHDL_TOOLCHAIN:-$source_tree/.conda}"
 features=0
 [[ "$target" == tribe64_multicore ]] && features=1
-feature_arguments=(-DTRIBE_CFG_RV32IA="$features" -DTRIBE_CFG_ISR="$features"
+# Static glibc uses RV32A atomics even on a single core.
+feature_arguments=(-DTRIBE_CFG_RV32IA=1 -DTRIBE_CFG_ISR="$features"
                      -DTRIBE_CFG_MMU_TLB="$features")
 echo "Using current cpphdl sources: $source_tree (including working-tree edits)"
 

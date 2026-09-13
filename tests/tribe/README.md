@@ -5,7 +5,7 @@ simulator with 32 MiB RAM, builds the MikOS Tribe image, and exercises:
 
 - the polling NS16550A UART;
 - mounting the shared ext4 root through the `tribe_sd` controller;
-- BusyBox startup and `echo` under MikOS;
+- BusyBox startup and file create/read/rename/delete under MikOS;
 - rootless Ethernet ARP plus an IPv4 ICMP echo request/reply.
 
 The SD driver uses DMA for aligned multi-sector payload reads. Reused
@@ -42,12 +42,22 @@ results.
 
 `CPPHDL_HOME` is required. CPU bug fixes and their regressions live in cpphdl;
 preparation does not apply a local patch stack or reset the source checkout.
+Use a checkout containing `e897220` (trap/return retirement), including
+`7ae932b` (synchronous traps without an MMU) and the earlier networking fixes.
 The previous `CPPHDL_REFERENCE`, `CPPHDL_REVISION`, and `CPPHDL_REPOSITORY`
 clone workflow has been retired. See [cpphdl fix migration](cpphdl-fixes.md)
 for the disposition of the former patches.
 
 `CPPHDL_TOOLCHAIN`, `CPPHDL_BUILD_ROOT`, `RISCV_HOME`, `JOBS`, `TRIBE_CYCLES`,
 and `TRIBE_TIMEOUT` are configurable.
+
+Full userspace acceptance defaults to 120 million cycles and a 1200-second
+single-core wall timeout (1800 seconds for multicore). Loading the static
+BusyBox ELF from SD alone can consume most of the kernel-only budget. Kernel-only checks retain their
+45-million-cycle budget and 600-second single-core timeout. Successful runs
+stop as soon as their completion marker appears. The acceptance runner also
+requires both file-content readbacks, so a final successful `echo` cannot
+hide an earlier filesystem error.
 
 For an interactive UART session, run:
 
@@ -291,12 +301,12 @@ Type `q` to leave `top`, `exit` to shut down cleanly, Ctrl+C to stop the
 simulator, or Ctrl+Z to suspend it. `TRIBE_INTERACTIVE_CYCLES` controls the
 safety limit.
 
-For the default single-core build, the preparation script removes
-`ENABLE_RV32IA`, `ENABLE_ISR`, and `ENABLE_MMU_TLB` from the test clone's
-`tribe/Config.h`. The multicore build retains them because cpphdl's multicore
-target requires its atomic and cross-hart fence interfaces. MikOS uses polling
-drivers on this board. `ENABLE_ZICSR` and `ENABLE_TRAPS` remain enabled because
-entering user mode and servicing BusyBox `ecall` instructions require them;
-disabling either would remove the mechanism that implements system calls. The
-minimal single-core Tribe CSR model also excludes PMP, so that test emits
+The preparation script enables `TRIBE_CFG_RV32IA=1` for both simulators because
+static glibc uses atomic instructions. Single-core builds disable
+`TRIBE_CFG_ISR` and `TRIBE_CFG_MMU_TLB`; multicore builds enable them for the
+cross-hart interfaces. These CMake options leave the cpphdl source configuration
+unchanged. MikOS uses polling drivers on this board. CSR and synchronous-trap
+support remain enabled because entering user mode and servicing BusyBox
+`ecall` instructions require them. The cpphdl checkout must include trap
+redirection with the MMU disabled. The minimal single-core Tribe CSR model also excludes PMP, so that test emits
 `MIKOS:PMP_UNAVAILABLE`; the normal MikOS/QEMU build still programs PMP.

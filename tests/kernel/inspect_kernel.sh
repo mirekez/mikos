@@ -9,7 +9,7 @@ symbols="${elf%.elf}.undefined.txt"
 "$root/.conda/bin/llvm-readelf" -S "$elf" >"$sections"
 "$root/.conda/bin/llvm-nm" --undefined-only "$elf" >"$symbols"
 
-if rg -q '\.(eh_frame|gcc_except_table|init_array|fini_array)' "$sections"; then
+if grep -E -q '\.(eh_frame|gcc_except_table|init_array|fini_array)' "$sections"; then
   echo "FAIL: forbidden runtime section in kernel" >&2
   exit 1
 fi
@@ -23,7 +23,7 @@ fi
 echo "PASS: freestanding kernel inspection"
 
 all_symbols="$($root/.conda/bin/llvm-nm "$elf")"
-if rg -q '(__cxa_|_Unwind_|__gxx_personality|_ZTI|_ZTS|_GLOBAL__sub_I_|_Z(nw|na|dl|da))' <<<"$all_symbols"; then
+if grep -E -q '(__cxa_|_Unwind_|__gxx_personality|_ZTI|_ZTS|_GLOBAL__sub_I_|_Z(nw|na|dl|da))' <<<"$all_symbols"; then
   echo "FAIL: unexpected hosted C++ runtime or global allocation" >&2
   exit 1
 fi

@@ -51,7 +51,7 @@ wait_for_prompt_count() {
   local deadline=$((SECONDS + wall_timeout))
   while ((SECONDS < deadline)); do
     local count
-    count="$( (rg -o '/ # ' "$log" 2>/dev/null || true) | wc -l)"
+    count="$( (grep -E -o '/ # ' "$log" 2>/dev/null || true) | wc -l)"
     if ((count >= required)); then
       return 0
     fi
@@ -79,7 +79,7 @@ simulator_pid=""
 
 for marker in 'MIKOS:NET_IP 10.0.2.15' 'MIKOS:BUSYBOX_EXIT 0' \
               'MIKOS:EXIT 0'; do
-  if ! rg -q "${marker}" "$log"; then
+  if ! grep -E -q "${marker}" "$log"; then
     sed -n '1,320p' "$log" >&2
     echo "missing marker: $marker" >&2
     exit 1

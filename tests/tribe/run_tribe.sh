@@ -132,7 +132,7 @@ fi
 if ((kernel_only)); then
   for marker in MIKOS:BOOT MIKOS:KERNEL_CXX_OK MIKOS:FLAT_DEVICE_IRQ_OFF \
       MIKOS:ARP_REPLY MIKOS:ICMP_ECHO_REPLY; do
-    if ! rg -qx "$marker" "$log"; then
+    if ! grep -E -qx "$marker" "$log"; then
       cat "$log" >&2
       echo "FAIL: missing kernel marker: $marker" >&2
       exit 1
@@ -142,16 +142,16 @@ if ((kernel_only)); then
   exit 0
 fi
 
-if ! rg -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
-   ! rg -q '^MIKOS:NET_IP 10\.0\.2\.15$' "$log" ||
-   ! rg -q '^MIKOS:NET_MAC 02:00:00:00:00:02$' "$log" ||
-   ! rg -q '^MIKOS:ARP_REPLY$' "$log" ||
-   ! rg -q '^MIKOS:ICMP_ECHO_REPLY$' "$log" ||
-   ! rg -q '^MIKOS:PMP_UNAVAILABLE$' "$log" ||
-   ! rg -q '^MIKOS:TRIBE_POLLING$' "$log" ||
-   ! rg -q '^MIKOS_BUSYBOX_OK$' "$log" ||
-   ! rg -q '^MIKOS:BUSYBOX_EXIT 0$' "$log" ||
-   ! rg -q '^MIKOS:EXIT 0$' "$log"; then
+if ! grep -E -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
+   ! grep -E -q '^MIKOS:NET_IP 10\.0\.2\.15$' "$log" ||
+   ! grep -E -q '^MIKOS:NET_MAC 02:00:00:00:00:02$' "$log" ||
+   ! grep -E -q '^MIKOS:ARP_REPLY$' "$log" ||
+   ! grep -E -q '^MIKOS:ICMP_ECHO_REPLY$' "$log" ||
+   ! grep -E -q '^MIKOS:PMP_UNAVAILABLE$' "$log" ||
+   ! grep -E -q '^MIKOS:TRIBE_POLLING$' "$log" ||
+   ! grep -E -q '^MIKOS_BUSYBOX_OK$' "$log" ||
+   ! grep -E -q '^MIKOS:BUSYBOX_EXIT 0$' "$log" ||
+   ! grep -E -q '^MIKOS:EXIT 0$' "$log"; then
   sed -n '1,320p' "$log" >&2
   cat "$peer_log" >&2
   echo "FAIL: MikOS Tribe acceptance markers missing" >&2

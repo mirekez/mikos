@@ -26,7 +26,7 @@ if ((status)); then
   exit "$status"
 fi
 for marker in MIKOS:BOOT MIKOS:KERNEL_CXX_OK MIKOS:FLAT_DEVICE_IRQ_OFF; do
-  if ! rg -qx "$marker" "$log"; then
+  if ! grep -E -qx "$marker" "$log"; then
     cat "$log" >&2
     echo "FAIL: missing boot marker: $marker" >&2
     exit 1

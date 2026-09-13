@@ -14,8 +14,8 @@ check_mode_owner() {
   local mode="$2"
   local details
   details="$($debugfs -R "stat $path" "$image" 2>/dev/null)"
-  rg -q "Type: regular +Mode:  $mode" <<<"$details"
-  rg -q 'User: +0 +Group: +0' <<<"$details"
+  grep -E -q "Type: regular +Mode:  $mode" <<<"$details"
+  grep -E -q 'User: +0 +Group: +0' <<<"$details"
 }
 
 check_mode_owner /sbin/init 0755
@@ -26,11 +26,11 @@ check_mode_owner /etc/dropbear/dropbear_ed25519_host_key 0600
 check_mode_owner /root/.ssh/authorized_keys 0600
 
 inittab="$($debugfs -R 'cat /etc/inittab' "$image" 2>/dev/null)"
-rg -q '^::sysinit:/etc/init\.d/rcS$' <<<"$inittab"
+grep -E -q '^::sysinit:/etc/init\.d/rcS$' <<<"$inittab"
 
 startup="$($debugfs -R 'cat /etc/init.d/rcS' "$image" 2>/dev/null)"
-rg -q '^/usr/sbin/dropbear -s -F \\$' <<<"$startup"
-rg -q '^  -r /etc/dropbear/dropbear_ed25519_host_key -p 22 &$' \
+grep -E -q '^/usr/sbin/dropbear -s -F \\$' <<<"$startup"
+grep -E -q '^  -r /etc/dropbear/dropbear_ed25519_host_key -p 22 &$' \
   <<<"$startup"
-rg -q '^echo "MIKOS_SSH_STARTING 192.168.76.2:22 pid=\$!"$' \
+grep -E -q '^echo "MIKOS_SSH_STARTING 192.168.76.2:22 pid=\$!"$' \
   <<<"$startup"

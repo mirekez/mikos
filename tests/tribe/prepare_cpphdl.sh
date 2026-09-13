@@ -34,11 +34,14 @@ if [[ -z "${CPPHDL_HOME:-}" ]]; then
   echo 'Set CPPHDL_HOME to the cpphdl checkout containing the Tribe bug fixes (for example: export CPPHDL_HOME="$HOME/cpphdl").' >&2
   exit 1
 fi
+if [[ ! -f "$CPPHDL_HOME/tribe_cpu/CMakeLists.txt" ]]; then
+  echo "CPPHDL_HOME must point to the cpphdl source checkout, not its build directory (for example: export CPPHDL_HOME=\"\$HOME/cpphdl\")." >&2
+  exit 1
+fi
 source_tree="$(cd "$CPPHDL_HOME" && pwd)"
-if [[ ! -f "$source_tree/tribe_cpu/CMakeLists.txt" ]] ||
-     ! rg -q 'TRIBE_CFG_MMU_TLB' "$source_tree/tribe_cpu/CMakeLists.txt"; then
-    echo "CPPHDL_HOME must point to a current cpphdl checkout with tribe_cpu and TRIBE_CFG_* CMake options" >&2
-    exit 1
+if ! grep -Fq 'TRIBE_CFG_MMU_TLB' "$source_tree/tribe_cpu/CMakeLists.txt"; then
+  echo "The cpphdl checkout at $source_tree is missing the required TRIBE_CFG_* CMake options; update the checkout." >&2
+  exit 1
 fi
 toolchain="${CPPHDL_TOOLCHAIN:-$source_tree/.conda}"
 features=0

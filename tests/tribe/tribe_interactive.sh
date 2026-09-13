@@ -125,7 +125,7 @@ if ! ip link show dev "$tap_name" >/dev/null 2>&1; then
   exit 1
 fi
 if ! ip -4 -o address show dev "$tap_name" | \
-     rg -q "[[:space:]]${host_address}/24([[:space:]]|$)"; then
+     grep -E -q "[[:space:]]${host_address}/24([[:space:]]|$)"; then
   echo "Host TAP $tap_name does not own $host_address/24." >&2
   exit 1
 fi
@@ -135,7 +135,7 @@ fi
 # requires CAP_NET_ADMIN and the old command hid that failure.  Both endpoint
 # MACs are fixed in this test profile, so install a permanent host mapping.
 neighbor_pattern="^${guest_address}([[:space:]]+dev[[:space:]]+${tap_name})?[[:space:]]+lladdr[[:space:]]+${guest_mac}[[:space:]]+PERMANENT$"
-if ! ip neigh show to "$guest_address" dev "$tap_name" | rg -qi "$neighbor_pattern"; then
+if ! ip neigh show to "$guest_address" dev "$tap_name" | grep -E -qi "$neighbor_pattern"; then
   if ! ip neigh replace "$guest_address" lladdr "$guest_mac" \
        nud permanent dev "$tap_name" 2>/dev/null; then
     if [[ -t 0 ]] && command -v sudo >/dev/null 2>&1; then

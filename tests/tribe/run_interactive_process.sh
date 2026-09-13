@@ -62,7 +62,7 @@ wait_for_marker() {
   local marker="$1"
   local deadline=$((SECONDS + wall_timeout))
   while ((SECONDS < deadline)); do
-    if rg -q "$marker" "$log" 2>/dev/null; then
+    if grep -E -q "$marker" "$log" 2>/dev/null; then
       return 0
     fi
     if ! kill -0 "$simulator_pid" 2>/dev/null; then
@@ -104,7 +104,7 @@ wait "$simulator_pid"
 simulator_pid=""
 
 for marker in 'MIKOS:BUSYBOX_EXIT 0' 'MIKOS:EXIT 0'; do
-  if ! rg -q "$marker" "$log"; then
+  if ! grep -E -q "$marker" "$log"; then
     sed -n '1,360p' "$log" >&2
     echo "missing marker: $marker" >&2
     exit 1

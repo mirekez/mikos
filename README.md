@@ -77,7 +77,9 @@ QEMU acceptance runners are under
 
 ## Testing with the current cpphdl / tribe_cpu checkout
 
-Attach your working cpphdl checkout with an exported path:
+Attach your working cpphdl source checkout (not its `build/` directory) with
+an exported path. The build and test scripts use standard `grep`; ripgrep
+(`rg`) is not required.
 
 ```sh
 export RISCV_HOME="$HOME/riscv"

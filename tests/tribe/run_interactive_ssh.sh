@@ -145,7 +145,7 @@ wait_for_log() {
   local marker="$1"
   local deadline=$((SECONDS + wall_timeout))
   while ((SECONDS < deadline)); do
-    if rg -q "$marker" "$log" 2>/dev/null; then
+    if grep -E -q "$marker" "$log" 2>/dev/null; then
       return 0
     fi
     if ! kill -0 "$simulator_pid" 2>/dev/null; then
@@ -172,7 +172,7 @@ wait_for_log_count() {
   local deadline=$((SECONDS + wall_timeout))
   local count
   while ((SECONDS < deadline)); do
-    count="$(rg -c "$marker" "$log" 2>/dev/null || true)"
+    count="$(grep -E -c "$marker" "$log" 2>/dev/null || true)"
     if (( ${count:-0} >= expected )); then
       return 0
     fi
@@ -198,7 +198,7 @@ wait_for_ssh_log() {
   local marker="$1"
   local deadline=$((SECONDS + wall_timeout))
   while ((SECONDS < deadline)); do
-    if rg -q "$marker" "$ssh_log" 2>/dev/null; then
+    if grep -E -q "$marker" "$ssh_log" 2>/dev/null; then
       return 0
     fi
     if ! kill -0 "$simulator_pid" 2>/dev/null ||
@@ -295,13 +295,13 @@ finish_ssh_client() {
     # it again. Accept the resulting LF, CRLF, or CRCRLF line ending while
     # still requiring the marker to occupy the complete logical line.
     if [[ -n "$remote_marker" ]] &&
-       rg -q "^${remote_marker}\r*$" "$ssh_log" 2>/dev/null; then
+       grep -E -q "^${remote_marker}"$'\r*$' "$ssh_log" 2>/dev/null; then
       marker_seen=1
     fi
     # A nested command must restore the login shell's real PPID. A zero PPID
     # makes the PTY scheduler reject every subsequent wakeup, so fail at the
     # first corrupt park instead of consuming the full native-C++ timeout.
-    if rg -q '^MIKOS:PTY_CHILD_PARK child=[1-9][0-9]* parent=0([[:space:]]|$)' \
+    if grep -E -q '^MIKOS:PTY_CHILD_PARK child=[1-9][0-9]* parent=0([[:space:]]|$)' \
         "$log" 2>/dev/null; then
       sed -n '1,520p' "$log" >&2
       sed -n '1,240p' "$ssh_log" >&2
@@ -346,9 +346,9 @@ exercise_interactive_shell() {
   # the remote shell is blocked at its first prompt. VINTR sent earlier is
   # consumed by the local `script` PTY and merely echoed as ^C.
   wait_for_log 'MIKOS:PTY_CHILD_PARK child=[1-9][0-9]* parent=[1-9][0-9]*'
-  park_count="$(rg -c 'MIKOS:PTY_CHILD_PARK child=' "$log" 2>/dev/null || true)"
-  resume_count="$(rg -c 'MIKOS:PTY_CHILD_RESUME child=' "$log" 2>/dev/null || true)"
-  child_exit_count="$(rg -c 'MIKOS:CHILD_EXIT pid=[1-9][0-9]* status=0' \
+  park_count="$(grep -E -c 'MIKOS:PTY_CHILD_PARK child=' "$log" 2>/dev/null || true)"
+  resume_count="$(grep -E -c 'MIKOS:PTY_CHILD_RESUME child=' "$log" 2>/dev/null || true)"
+  child_exit_count="$(grep -E -c 'MIKOS:CHILD_EXIT pid=[1-9][0-9]* status=0' \
     "$log" 2>/dev/null || true)"
 
   # BusyBox's interactive line editor may put the slave in raw mode. In that
@@ -364,7 +364,7 @@ exercise_interactive_shell() {
   # byte would force a multi-minute Dropbear/BusyBox image swap in native C++.
   # BusyBox consumes this batch one line at a time, so top still starts only
   # after ls exits and exercises the identical nested PTY-blocking state.
-  relay_count="$(rg -c 'MIKOS:PTY_CHILD_RELAY child=' "$log" 2>/dev/null || true)"
+  relay_count="$(grep -E -c 'MIKOS:PTY_CHILD_RELAY child=' "$log" 2>/dev/null || true)"
   printf '%s\n' \
     'printf '\''%s\n'\'' "$SSH_TTY"' \
     'ls /' \
@@ -376,7 +376,7 @@ exercise_interactive_shell() {
   wait_for_log 'MIKOS:EXEC pid=[1-9][0-9]* path=/bin/(top|sh).*argv0=top'
   wait_for_log_count 'MIKOS:PTY_CHILD_RELAY child=' "$((relay_count + 1))"
   wait_for_log_count 'MIKOS:PTY_CHILD_PARK child=' "$((park_count + 2))"
-  if rg -q '^MIKOS:PTY_CHILD_PARK child=[1-9][0-9]* parent=0([[:space:]]|$)' \
+  if grep -E -q '^MIKOS:PTY_CHILD_PARK child=[1-9][0-9]* parent=0([[:space:]]|$)' \
       "$log"; then
     echo "FAIL: nested command restored the SSH shell with PPID 0" >&2
     return 1
@@ -387,11 +387,11 @@ exercise_interactive_shell() {
   # the same ancestry when input arrives. Exercise two top wakeups, its clean
   # exit, and the restored shell's next prompt so a one-way handoff cannot
   # pass.
-  park_count="$(rg -c 'MIKOS:PTY_CHILD_PARK child=' "$log" 2>/dev/null || true)"
-  resume_count="$(rg -c 'MIKOS:PTY_CHILD_RESUME child=' "$log" 2>/dev/null || true)"
-  child_exit_count="$(rg -c 'MIKOS:CHILD_EXIT pid=[1-9][0-9]* status=0' \
+  park_count="$(grep -E -c 'MIKOS:PTY_CHILD_PARK child=' "$log" 2>/dev/null || true)"
+  resume_count="$(grep -E -c 'MIKOS:PTY_CHILD_RESUME child=' "$log" 2>/dev/null || true)"
+  child_exit_count="$(grep -E -c 'MIKOS:CHILD_EXIT pid=[1-9][0-9]* status=0' \
     "$log" 2>/dev/null || true)"
-  relay_count="$(rg -c 'MIKOS:PTY_CHILD_RELAY child=' "$log" 2>/dev/null || true)"
+  relay_count="$(grep -E -c 'MIKOS:PTY_CHILD_RELAY child=' "$log" 2>/dev/null || true)"
   printf '1' >&"$ssh_input_fd"
   wait_for_log_count 'MIKOS:PTY_CHILD_RESUME child=' "$((resume_count + 1))"
   wait_for_log_count 'MIKOS:PTY_CHILD_RELAY child=' "$((relay_count + 1))"
@@ -444,7 +444,7 @@ if [[ "$uart_preempt_probe" == 1 ]]; then
   kill -STOP "$ssh_pause_target"
   printf '\n' >&3
   wait_for_log "MIKOS:BACKGROUND_CONNECTION_HOLD $connection_pid"
-  if rg -q "MIKOS:BACKGROUND_PARK $connection_pid|MIKOS:BACKGROUND_PARK_NO_PARENT" "$log"; then
+  if grep -E -q "MIKOS:BACKGROUND_PARK $connection_pid|MIKOS:BACKGROUND_PARK_NO_PARENT" "$log"; then
     echo "FAIL: nested SSH child yielded to UART while holding a live connection" >&2
     exit 1
   fi
@@ -459,7 +459,7 @@ else
   finish_ssh_client MIKOS_SSH_AUTH_OK_1 1
 fi
 if [[ "$pty_only" == 1 ]]; then
-  if ! rg -q '^/dev/pts/[0-3]\r*$' "$ssh_log"; then
+  if ! grep -E -q $'^/dev/pts/[0-3]\r*$' "$ssh_log"; then
     sed -n '1,240p' "$ssh_log" >&2
     echo "FAIL: SSH session did not allocate a working remote PTY" >&2
     exit 1
@@ -476,7 +476,7 @@ fi
 start_ssh_client MIKOS_SSH_AUTH_OK_2 1 1
 exercise_interactive_shell
 finish_ssh_client '' 2
-if ! rg -q '^/dev/pts/[0-3]\r*$' "$ssh_log"; then
+if ! grep -E -q $'^/dev/pts/[0-3]\r*$' "$ssh_log"; then
   sed -n '1,240p' "$ssh_log" >&2
   echo "FAIL: second SSH session did not allocate a working remote PTY" >&2
   exit 1

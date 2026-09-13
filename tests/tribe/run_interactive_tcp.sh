@@ -55,7 +55,7 @@ wait_for_prompt_count() {
   local deadline=$((SECONDS + wall_timeout))
   while ((SECONDS < deadline)); do
     local count
-    count="$( (rg -o '/ # ' "$log" 2>/dev/null || true) | wc -l)"
+    count="$( (grep -E -o '/ # ' "$log" 2>/dev/null || true) | wc -l)"
     if ((count >= required)); then
       return 0
     fi
@@ -78,7 +78,7 @@ printf 'nc -l -p %s -e /bin/sh\n' "$guest_port" >&3
 
 listen_marker="MIKOS:TCP_LISTEN $guest_port"
 deadline=$((SECONDS + wall_timeout))
-while ! rg -q "$listen_marker" "$log" 2>/dev/null; do
+while ! grep -E -q "$listen_marker" "$log" 2>/dev/null; do
   if ((SECONDS >= deadline)) || ! kill -0 "$simulator_pid" 2>/dev/null; then
     sed -n '1,360p' "$log" >&2
     echo "guest TCP listener did not become ready" >&2
@@ -103,7 +103,7 @@ wait "$simulator_pid"
 simulator_pid=""
 
 for marker in 'MIKOS_TCP_STREAM_OK' 'MIKOS:BUSYBOX_EXIT 0' 'MIKOS:EXIT 0'; do
-  if ! rg -q "$marker" "$log"; then
+  if ! grep -E -q "$marker" "$log"; then
     sed -n '1,360p' "$log" >&2
     echo "missing marker: $marker" >&2
     exit 1

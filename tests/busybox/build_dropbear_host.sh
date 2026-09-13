@@ -30,7 +30,7 @@ install -m 0644 "$options" "$scratch/localoptions.h"
     --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx
   make -j"$jobs" PROGRAMS='dbclient dropbearconvert' \
     dbclient dropbearconvert
-  ./dbclient -Q cipher | rg -qx none
+  ./dbclient -Q cipher | grep -E -qx none
 )
 
 install -d "$output"

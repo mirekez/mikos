@@ -18,4 +18,4 @@ PATH="$tool_directory:$PATH" make -C "$source_tree" O="$output" \
   -j"$jobs" CROSS_COMPILE="$cross_prefix" \
   CONFIG_EXTRA_LDFLAGS="-Wl,-Ttext-segment=$address" busybox
 "$llvm_readelf" -l "$output/busybox" >"$output/program-headers.txt"
-rg -q "LOAD +0x[0-9a-f]+ +$address" "$output/program-headers.txt"
+grep -E -q "LOAD +0x[0-9a-f]+ +$address" "$output/program-headers.txt"

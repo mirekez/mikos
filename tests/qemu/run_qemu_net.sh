@@ -30,14 +30,14 @@ qemu_pid=$!
 
 for _ in $(seq 1 500); do
   if [[ -S "$qemu_socket" ]] &&
-     rg -q '^MIKOS:NET_MAC 52:54:00:12:34:56$' "$log"; then
+     grep -E -q '^MIKOS:NET_MAC 52:54:00:12:34:56$' "$log"; then
     break
   fi
   sleep 0.01
 done
 
 if [[ ! -S "$qemu_socket" ]] ||
-   ! rg -q '^MIKOS:NET_MAC 52:54:00:12:34:56$' "$log"; then
+   ! grep -E -q '^MIKOS:NET_MAC 52:54:00:12:34:56$' "$log"; then
   sed -n '1,240p' "$log"
   echo "FAIL: QEMU network endpoint did not become ready" >&2
   exit 1
@@ -47,12 +47,12 @@ fi
 wait "$qemu_pid"
 qemu_pid=""
 
-if ! rg -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
-   ! rg -q '^MIKOS:NET_IP 10\.0\.2\.15$' "$log" ||
-   ! rg -q '^MIKOS:NET_MAC 52:54:00:12:34:56$' "$log" ||
-   ! rg -q '^MIKOS:ARP_REPLY$' "$log" ||
-   ! rg -q '^MIKOS:ICMP_ECHO_REPLY$' "$log" ||
-   ! rg -q '^MIKOS:EXIT 0$' "$log"; then
+if ! grep -E -q '^MIKOS:EXT4_ROOT_OK$' "$log" ||
+   ! grep -E -q '^MIKOS:NET_IP 10\.0\.2\.15$' "$log" ||
+   ! grep -E -q '^MIKOS:NET_MAC 52:54:00:12:34:56$' "$log" ||
+   ! grep -E -q '^MIKOS:ARP_REPLY$' "$log" ||
+   ! grep -E -q '^MIKOS:ICMP_ECHO_REPLY$' "$log" ||
+   ! grep -E -q '^MIKOS:EXIT 0$' "$log"; then
   sed -n '1,240p' "$log"
   echo "FAIL: guest network probe" >&2
   exit 1

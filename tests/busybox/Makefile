@@ -110,7 +110,7 @@ $(STRESS_NG): $(STRESS_NG_SOURCE)/.source-ready
 		LIB_MPFR= LIB_NL= LIB_SCTP= LIB_XXHASH= LIB_Z= stress-ng
 	$(RISCV_LINUX_PREFIX)strip $@
 	$(LLVM_READELF) -l $@ > $(STRESS_NG_SOURCE)/program-headers.txt
-	rg -q 'LOAD +0x[0-9a-f]+ +$(STRESS_NG_ADDRESS)' \
+	grep -E -q 'LOAD +0x[0-9a-f]+ +$(STRESS_NG_ADDRESS)' \
 		$(STRESS_NG_SOURCE)/program-headers.txt
 
 $(DROPBEAR_SOURCE)/.source-ready: download_dropbear.sh

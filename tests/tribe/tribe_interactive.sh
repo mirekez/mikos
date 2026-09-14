@@ -171,7 +171,7 @@ fi
 # cycle-level model.  A failed flush is especially misleading because ip(8)
 # requires CAP_NET_ADMIN and the old command hid that failure.  Both endpoint
 # MACs are fixed in this test profile, so install a permanent host mapping.
-neighbor_pattern="^${guest_address}([[:space:]]+dev[[:space:]]+${tap_name})?[[:space:]]+lladdr[[:space:]]+${guest_mac}[[:space:]]+PERMANENT$"
+neighbor_pattern="^${guest_address}([[:space:]]+dev[[:space:]]+${tap_name})?[[:space:]]+lladdr[[:space:]]+${guest_mac}[[:space:]]+PERMANENT[[:space:]]*$"
 if ! ip neigh show to "$guest_address" dev "$tap_name" | grep -E -qi "$neighbor_pattern"; then
   if ! ip neigh replace "$guest_address" lladdr "$guest_mac" \
        nud permanent dev "$tap_name" 2>/dev/null; then

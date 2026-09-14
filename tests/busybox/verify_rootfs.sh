@@ -12,12 +12,19 @@ debugfs="$2"
 check_mode_owner() {
   local path="$1"
   local mode="$2"
+  local type="${3:-regular}"
   local details
   details="$($debugfs -R "stat $path" "$image" 2>/dev/null)"
-  grep -E -q "Type: regular +Mode:  $mode" <<<"$details"
-  grep -E -q 'User: +0 +Group: +0' <<<"$details"
+  if ! grep -E -q "Type: $type +Mode:  $mode" <<<"$details" ||
+     ! grep -E -q 'User: +0 +Group: +0' <<<"$details"; then
+    echo "rootfs: $path must be a root-owned $type with mode $mode" >&2
+    echo "$details" >&2
+    return 1
+  fi
 }
 
+check_mode_owner /root 0700 directory
+check_mode_owner /root/.ssh 0700 directory
 check_mode_owner /sbin/init 0755
 check_mode_owner /bin/netstat 0755
 check_mode_owner /usr/sbin/dropbear 0755

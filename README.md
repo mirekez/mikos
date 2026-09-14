@@ -181,6 +181,13 @@ select another socket/interface; preserve these variables when invoking sudo
 if overriding the defaults. See [Tribe tests](tests/tribe/README.md) for the
 individual test targets and timeout controls.
 
+If Dropbear reports `/root must be owned by user or root, and not writable by
+group or others`, rebuild the rootfs with `make -C tests/busybox rootfs`, then
+restart the simulator. The image builder sets `/root` and `/root/.ssh` to 0700,
+and `authorized_keys` to 0600, all owned by root. These permissions are verified
+in the ext4 image and do not depend on the host's umask. Reconfiguring `eth0`
+does not resolve an SSH filesystem-permission failure.
+
 ## author
 
 This software is developed by Mike Reznikov (https://www.linkedin.com/in/mike-reznikov) based on the results of own research.

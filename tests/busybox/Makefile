@@ -155,6 +155,9 @@ $(ROOTFS_IMAGE): Makefile $(BUSYBOX) $(STRESS_NG) $(DROPBEAR) \
 		$(ROOTFS_STAGE)/root/.ssh $(ROOTFS_STAGE)/run \
 		$(ROOTFS_STAGE)/var/run $(ROOTFS_STAGE)/dev/pts \
 		$(ROOTFS_STAGE)/proc $(ROOTFS_STAGE)/sys
+	# Intermediate directories created by install -d inherit the host umask.
+	# Dropbear rejects group/other-writable home directories during public-key auth.
+	install -d -m 0700 $(ROOTFS_STAGE)/root $(ROOTFS_STAGE)/root/.ssh
 	install -m 0755 $(BUSYBOX) $(ROOTFS_STAGE)/bin/busybox
 	ln $(ROOTFS_STAGE)/bin/busybox $(ROOTFS_STAGE)/bin/mkdir
 	ln $(ROOTFS_STAGE)/bin/busybox $(ROOTFS_STAGE)/bin/netstat

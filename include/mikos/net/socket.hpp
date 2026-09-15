@@ -407,6 +407,13 @@ class SocketTable {
 
   void reset(u8 handle) {
     if (auto* value = slot(handle); value != nullptr) {
+      // An aborted handshake has no application owner. Free its backlog
+      // entry instead of reporting a connection that never established to
+      // accept(), which would make a serialized server fork for a dead peer.
+      if (value->state == SocketState::syn_received) {
+        static_cast<void>(release(handle));
+        return;
+      }
       value->receive_size = 0;
       clear_reassembly(handle);
       value->state = SocketState::reset;

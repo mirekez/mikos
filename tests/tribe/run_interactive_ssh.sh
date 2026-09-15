@@ -14,6 +14,7 @@ early_client="${TRIBE_INTERACTIVE_SSH_EARLY_CLIENT:-0}"
 late_diagnostics="${TRIBE_INTERACTIVE_SSH_DIAGNOSTICS:-0}"
 uart_preempt_probe="${TRIBE_INTERACTIVE_SSH_UART_PREEMPT_PROBE:-0}"
 pty_only="${TRIBE_INTERACTIVE_SSH_PTY_ONLY:-0}"
+reconnect_only=0
 quiet="${TRIBE_INTERACTIVE_SSH_QUIET:-0}"
 pcap="${TRIBE_INTERACTIVE_SSH_PCAP:-$root/build/tribe-interactive-ssh.pcap}"
 eth_trace="${TRIBE_INTERACTIVE_SSH_ETH_TRACE:-$root/build/tribe-interactive-ssh.eth.log}"
@@ -36,18 +37,25 @@ while [[ $# -gt 0 ]]; do
     --verilator)
       simulator_backend=(--verilator)
       ;;
+    --reconnect)
+      reconnect_only=1
+      ;;
     -h|--help)
-      echo "usage: $0 [--multicore] [--verilator]" >&2
+      echo "usage: $0 [--multicore] [--verilator] [--reconnect]" >&2
       exit 0
       ;;
     *)
-      echo "usage: $0 [--multicore] [--verilator]" >&2
+      echo "usage: $0 [--multicore] [--verilator] [--reconnect]" >&2
       echo "unknown argument: $1" >&2
       exit 2
       ;;
   esac
   shift
 done
+if [[ "$reconnect_only" == 1 && "$pty_only" == 1 ]]; then
+  echo "--reconnect requires two sessions; unset TRIBE_INTERACTIVE_SSH_PTY_ONLY" >&2
+  exit 2
+fi
 for required in "$dropbear_identity" \
                 "$root/build/tests/busybox/rootfs.ext4" \
                 "$root/build/tests/qemu/ethgig_tap"; do
@@ -429,6 +437,9 @@ fi
 wait_for_log 'MIKOS:TCP_ACCEPT fd='
 wait_for_log 'MIKOS:TCP_WRITE 26'
 wait_for_log 'MIKOS:TCP_READ '
+# The early-client diagnostic may accept before the first park. Capture the
+# count while the first session is active so its next park is unambiguous.
+initial_park_count="$(grep -E -c 'MIKOS:BACKGROUND_PARK 2[[:space:]]*$' "$log" || true)"
 if [[ "$uart_preempt_probe" == 1 ]]; then
   # Stop the peer before the KEX reply, then leave UART input pending. This
   # forces the nested SSH child into BACKGROUND_CONNECTION_HOLD with no network
@@ -473,6 +484,17 @@ fi
 # not a remote command with a PTY. It must write a prompt, yield from a blocked
 # slave read so Dropbear can relay the prompt/input, resume, execute typed
 # commands, close, and leave the listener reusable.
+# BACKGROUND_PARK is printed before the kernel reloads BusyBox from SD.
+# Reconnect during that masked-interrupt image restore, when a host SYN used
+# to go unanswered until the host connect timeout expired. Do not wait for
+# BUSYBOX_ENTRY: that would hide the network starvation regression.
+wait_for_log_count 'MIKOS:BACKGROUND_PARK 2[[:space:]]*$' "$((initial_park_count + 1))"
+if [[ "$reconnect_only" == 1 ]]; then
+  start_ssh_client MIKOS_SSH_AUTH_OK_2
+  finish_ssh_client MIKOS_SSH_AUTH_OK_2 2
+  echo "PASS: authenticated SSH commands completed before and after reconnecting during BusyBox restoration"
+  exit 0
+fi
 start_ssh_client MIKOS_SSH_AUTH_OK_2 1 1
 exercise_interactive_shell
 finish_ssh_client '' 2

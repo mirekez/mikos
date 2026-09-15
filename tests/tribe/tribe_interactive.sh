@@ -200,7 +200,7 @@ echo "SSH after MIKOS_SSH_STARTING (sessions are serialized):" >&2
 echo "  $root/build/tests/busybox/dropbear-host/dbclient -i $client_key -c none -y -y root@$guest_address" >&2
 echo "Do not wrap dbclient in 'timeout 1000': native C++ authentication can take about 25 minutes." >&2
 echo "The -i Dropbear-format identity above is required; dbclient's default identity will not authenticate." >&2
-echo "After exiting dbclient, wait for Dropbear to return to its listen loop before reconnecting." >&2
+echo "SSH sessions are serialized; reconnect after the previous client exits." >&2
 
 simulator_arguments=(--noveril)
 if [[ "$use_verilator" == 1 ]]; then

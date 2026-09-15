@@ -1,5 +1,9 @@
 #include <drivers/storage/root_device.hpp>
 
+#ifdef MIKOS_TRIBE_INTERACTIVE
+#include <mikos/kernel.hpp>
+#endif
+
 #ifdef MIKOS_TRIBE
 #include <drivers/storage/tribe_sd.hpp>
 #else
@@ -26,6 +30,12 @@ u64 Device::sector_count() const {
 
 bool Device::read_sector(u64 sector, u8* output) {
 #ifdef MIKOS_TRIBE
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  // Metadata lookups also run with interrupts masked during exec/restore.
+  // Only service packets here: poll() does not access storage or switch the
+  // current process, so the filesystem operation cannot be reentered.
+  network::poll();
+#endif
   // SectorReader reuses its one-sector cache. Keep those fills on the
   // CPU-visible PIO path: Tribe's DMA completion can be observed before its
   // external D-cache invalidation has retired, exposing stale cache contents.
@@ -56,17 +66,38 @@ bool Device::read_sectors(u64 sector, u8* output, u32 byte_count) {
       return false;
     }
     for (u64 index = 0; index < count; ++index) {
-      if (!tribe_sd::read_block(static_cast<u32>(sector + index),
-                                output + index * sector_size)) {
+      if (!read_sector(sector + index, output + index * sector_size)) {
         return false;
       }
     }
     return true;
   }
 #endif
+#ifdef MIKOS_TRIBE_INTERACTIVE
+  if (output == nullptr || byte_count == 0 ||
+      byte_count % sector_size != 0 || sector > 0xffffffffu ||
+      byte_count / sector_size > 0xffffffffu - sector) {
+    return false;
+  }
+  // A complete executable DMA read can outlast a host TCP connect timeout.
+  // Bound each transfer and service the network between them, including
+  // while the filesystem restores an image with interrupts masked.
+  while (byte_count != 0) {
+    network::poll();
+    const u32 count = byte_count > 4096 ? 4096 : byte_count;
+    if (!tribe_sd::read_blocks(static_cast<u32>(sector), output, count)) {
+      return false;
+    }
+    sector += count / sector_size;
+    output += count;
+    byte_count -= count;
+  }
+  return true;
+#else
   return sector <= 0xffffffffu &&
          tribe_sd::read_blocks(static_cast<u32>(sector), output,
                                byte_count);
+#endif
 #else
   return virtio_block::read_sectors(sector, output, byte_count);
 #endif

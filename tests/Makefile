@@ -94,6 +94,14 @@ $(BUILD)/net/stack_test: net/stack_test.cpp $(ROOT)/network/stack.cpp \
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d \
 		net/stack_test.cpp $(ROOT)/network/stack.cpp $(LDFLAGS) -o $@
 
+$(BUILD)/drivers/root_device_poll_test: drivers/root_device_poll_test.cpp \
+    $(ROOT)/drivers/storage/root_device.cpp support/test.hpp
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DMIKOS_TRIBE \
+		-DMIKOS_TRIBE_INTERACTIVE -DMIKOS_TRIBE_MULTICORE \
+		-MMD -MP -MF $@.d drivers/root_device_poll_test.cpp \
+		$(ROOT)/drivers/storage/root_device.cpp $(LDFLAGS) -o $@
+
 $(BRIDGE_TEST_BINARY): $(ROOT)/tests/qemu/ethgig_tap.cpp
 	@mkdir -p $(@D)
 	$(CXX) -std=c++2c -Wall -Wextra -Werror $< -o $@

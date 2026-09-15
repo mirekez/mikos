@@ -22,7 +22,8 @@ mikos::u32 transmit_failures{};
 void make_packet(mikos::u8 flags, mikos::u32 sequence,
                  mikos::u32 acknowledgement,
                  const mikos::u8* payload = nullptr,
-                 mikos::u32 payload_size = 0) {
+                 mikos::u32 payload_size = 0,
+                 mikos::u16 peer_port = 49152) {
   using namespace mikos;
   const u32 headers =
       sizeof(EthernetHeader) + sizeof(Ipv4Header) + sizeof(TcpHeader);
@@ -43,7 +44,7 @@ void make_packet(mikos::u8 flags, mikos::u32 sequence,
   ip.protocol = 6;
   copy_octets(ip.source, peer_ip.octet);
   copy_octets(ip.destination, guest_ip.octet);
-  tcp.source_port = net16(49152);
+  tcp.source_port = net16(peer_port);
   tcp.destination_port = net16(22);
   tcp.sequence = net32(sequence);
   tcp.acknowledgement = net32(acknowledgement);
@@ -326,6 +327,48 @@ int main() {
     poll();
   }
   MIKOS_CHECK(suite, transmit_count == before_closed_polling);
+
+  // A reconnect may already have timed out while the previous process was
+  // restored. Its queued SYNs elicit SYN-ACKs followed by host RSTs, without
+  // ever completing a handshake. None may wake accept or consume backlog.
+  for (u32 attempt = 0; attempt < socket_capacity + 1; ++attempt) {
+    const u32 sequence = 2000 + attempt * 100;
+    const u16 port = static_cast<u16>(49152 + attempt);
+    make_packet(tcp_syn, sequence, 0, nullptr, 0, port);
+    poll();
+    TcpView reply{};
+    MIKOS_CHECK(suite, transmitted_tcp(reply));
+    MIKOS_CHECK(suite, reply.tcp->flags == (tcp_syn | tcp_ack));
+    MIKOS_CHECK(suite, net32(reply.tcp->acknowledgement) == sequence + 1);
+    make_packet(tcp_syn, sequence, 0, nullptr, 0, port);
+    poll();
+    make_packet(tcp_rst, sequence + 1, 0, nullptr, 0, port);
+    poll();
+    MIKOS_CHECK(suite, !socket_readable(listener.handle));
+    MIKOS_CHECK(suite, socket_accept(listener.handle).result ==
+                           SocketResult::would_block);
+    MIKOS_CHECK(suite, !contains(tcp_table(), " 03 "));
+  }
+
+  // The original listener must still accept a fresh connection and data.
+  make_packet(tcp_syn, 9000, 0);
+  poll();
+  TcpView reconnect_reply{};
+  MIKOS_CHECK(suite, transmitted_tcp(reconnect_reply));
+  const u32 reconnect_sequence = net32(reconnect_reply.tcp->sequence);
+  make_packet(tcp_ack | tcp_psh, 9001, reconnect_sequence + 1, request,
+              sizeof(request));
+  poll();
+  const auto reconnected = socket_accept(listener.handle);
+  MIKOS_CHECK(suite, reconnected.result == SocketResult::success);
+  MIKOS_CHECK(suite, socket_read(reconnected.handle, input, sizeof(input)).size ==
+                         sizeof(request));
+  MIKOS_CHECK(suite, input[0] == 'p' && input[3] == 'g');
+  make_packet(tcp_rst, 9005, 0);
+  poll();
+  MIKOS_CHECK(suite, socket_read(reconnected.handle, input, sizeof(input)).result ==
+                         SocketResult::reset);
+  MIKOS_CHECK(suite, socket_close(reconnected.handle) == SocketResult::success);
   MIKOS_CHECK(suite, socket_close(listener.handle) == SocketResult::success);
 
   const u32 before_corrupt = transmit_count;

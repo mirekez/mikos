@@ -233,6 +233,26 @@ handoffs. The test also requires `/proc/self/fd/<n>` resolution and
 interactive PTY exchange as the first and only session for a shorter focused
 regression.
 
+The full regression starts the second connection immediately after the second
+`MIKOS:BACKGROUND_PARK 2` marker, before BusyBox finishes reloading from SD.
+This checks that TCP handshakes remain responsive during executable restoration
+with interrupts masked. The marker announces the start of the handoff; it does
+not mean that the console image has finished loading. The storage driver polls
+between 4 KiB DMA reads and between metadata sectors. TCP discards reset
+handshakes that never established instead of passing them to Dropbear.
+
+To focus on reconnects, run two authenticated command sessions with:
+
+```sh
+TRIBE_ETH_TAP_SOCKET=/tmp/tribe-ethgig.sock \
+  tests/tribe/run_interactive_ssh.sh --multicore --reconnect
+```
+
+This uses the existing TAP bridge and starts the second client during BusyBox
+restoration. It requires both commands to produce their expected output and
+both clients to exit successfully. Omit `--reconnect` for the full command and
+interactive `top` regression.
+
 PTY slave output applies the negotiated terminal output modes. In the default
 `OPOST | ONLCR` mode, each line feed is atomically expanded to CR-LF before it
 reaches Dropbear. This is required because dbclient puts the host terminal in

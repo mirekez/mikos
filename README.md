@@ -188,6 +188,16 @@ and `authorized_keys` to 0600, all owned by root. These permissions are verified
 in the ext4 image and do not depend on the host's umask. Reconfiguring `eth0`
 does not resolve an SSH filesystem-permission failure.
 
+If the first SSH session works but a reconnect times out, rebuild the kernel
+and restart `tests/tribe/tribe_interactive.sh --multicore`. Older kernels stopped
+servicing TCP while restoring BusyBox from SD after a session; on the native
+simulator this could exceed the host's connection timeout. The storage driver
+now polls between bounded reads, including metadata lookups, and aborted TCP
+handshakes no longer reach
+Dropbear's `accept`. Sessions remain serialized, but a reconnect can complete
+its TCP handshake while the kernel restores the previous process. The SSH
+regression deliberately reconnects during this restoration.
+
 ## author
 
 This software is developed by Mike Reznikov (https://www.linkedin.com/in/mike-reznikov) based on the results of own research.

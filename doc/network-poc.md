@@ -48,6 +48,9 @@ make test
 make qemu-net-test
 make tribe-interactive-ping-test  # requires an existing tap-tribe bridge
 make tribe-interactive-tcp-test   # BusyBox nc passive stream acceptance
+make -C tests network-test       # Deterministic production TCP acceptance series
+make -C tests network-sanitize   # The same series under ASan/UBSan
+make -C tests network-linux-peer # Real Linux TCP peer through the existing TAP
 ```
 
 The network test waits until the guest has posted receive buffers, injects a
@@ -72,9 +75,14 @@ Ethernet tests without root privileges or host network configuration.
 MikOS implements the narrow `socket(AF_INET, SOCK_DGRAM, 0)` control descriptor
 and a bounded passive `SOCK_STREAM` path with bind/listen/accept, stream I/O,
 poll/select readiness, and `/proc/net/tcp` reporting. It does not yet provide
-active connect, netlink (and therefore BusyBox `ip`), DHCP, a complete TCP
-implementation, an SSH service process model, PTYs, multiple long-lived
-processes, or complete `/proc` data.
+active connect, netlink (and therefore BusyBox `ip`), DHCP, SACK,
+timestamps/PAWS, or configurable keepalive. The passive transport now enforces
+peer and congestion windows, negotiates MSS/window scaling, uses clock-based
+RTT/RTO and persist timers, and retains FIN/TIME-WAIT state through cleanup.
+The [TCP acceptance suite](../tests/network/README.md) defines the supported
+contract, capacity limits, timeout policies, and deterministic failure tests.
+Dropbear, PTYs and serialized interactive SSH sessions are supported by the
+Tribe profile; that integration remains separate from protocol acceptance.
 
 The next acceptance gates are, in order:
 

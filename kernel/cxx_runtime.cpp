@@ -1,6 +1,7 @@
 #include <mikos/kernel.hpp>
 #include <mikos/memory/arena.hpp>
 #include <__verbose_abort>
+#include <cstdlib>
 #include <new>
 
 namespace mikos::memory {
@@ -16,7 +17,9 @@ namespace mikos::memory {
 
 // No global allocating new/delete: dynamic containers must carry an explicit
 // kernel allocator. Accidental std::allocator use fails the final link.
-extern "C" [[noreturn]] void abort() noexcept {
+// Match the C library declaration brought in by the standard containers.
+// Newlib and glibc use different exception specifications for abort().
+extern "C" void abort() noexcept(noexcept(std::abort())) {
   mikos::memory::allocation_contract_failure();
 }
 extern "C" [[noreturn]] void __assert_fail(const char*, const char*, unsigned,

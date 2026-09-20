@@ -58,17 +58,17 @@ void poll();
 [[nodiscard]] InterfaceControlResult interface_ioctl(u32 request,
                                                      Ifreq32& value);
 [[nodiscard]] OpenResult socket_open(abi::socket::Type type);
-[[nodiscard]] SocketResult socket_retain(u8 handle);
-[[nodiscard]] SocketResult socket_close(u8 handle);
-[[nodiscard]] SocketResult socket_bind(u8 handle, Endpoint local);
-[[nodiscard]] SocketResult socket_listen(u8 handle, u32 backlog);
-[[nodiscard]] AcceptResult socket_accept(u8 handle);
-[[nodiscard]] ReadResult socket_read(u8 handle, u8* output, u32 size);
-[[nodiscard]] ReadResult socket_write(u8 handle, const u8* input, u32 size);
-[[nodiscard]] SocketResult socket_shutdown(u8 handle, u32 how);
-[[nodiscard]] const SocketSlot* socket_slot(u8 handle);
-[[nodiscard]] bool socket_readable(u8 handle);
-[[nodiscard]] bool socket_writable(u8 handle);
+[[nodiscard]] SocketResult socket_retain(SocketHandle handle);
+[[nodiscard]] SocketResult socket_close(SocketHandle handle);
+[[nodiscard]] SocketResult socket_bind(SocketHandle handle, Endpoint local);
+[[nodiscard]] SocketResult socket_listen(SocketHandle handle, u32 backlog);
+[[nodiscard]] AcceptResult socket_accept(SocketHandle handle);
+[[nodiscard]] ReadResult socket_read(SocketHandle handle, u8* output, u32 size);
+[[nodiscard]] ReadResult socket_write(SocketHandle handle, const u8* input, u32 size);
+[[nodiscard]] SocketResult socket_shutdown(SocketHandle handle, u32 how);
+[[nodiscard]] const SocketSlot* socket_slot(SocketHandle handle);
+[[nodiscard]] bool socket_readable(SocketHandle handle);
+[[nodiscard]] bool socket_writable(SocketHandle handle);
 [[nodiscard]] const char* tcp_table();
 }
 

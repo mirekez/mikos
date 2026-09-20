@@ -1,8 +1,21 @@
 #include <mikos/net/socket.hpp>
+#include <type_traits>
 
 #include <support/test.hpp>
 
 namespace {
+
+using mikos::network::SocketHandle;
+using mikos::network::SocketTable;
+
+static_assert(std::is_trivially_copyable_v<SocketHandle>);
+static_assert(!std::is_constructible_v<SocketHandle, mikos::u8>);
+static_assert(!std::is_constructible_v<SocketHandle, int>);
+static_assert(!std::is_convertible_v<SocketHandle, std::size_t>);
+static_assert(!std::is_invocable_v<decltype(&SocketTable::retain),
+                                 SocketTable&, int>);
+static_assert(std::is_same_v<decltype(SocketHandle{}.index()), std::size_t>);
+static_assert(SocketHandle{} == mikos::network::invalid_socket);
 
 constexpr mikos::Ipv4Address any{{0, 0, 0, 0}};
 constexpr mikos::Ipv4Address local_ip{{192, 168, 76, 2}};
@@ -18,6 +31,12 @@ int main() {
   using mikos::network::SocketResult;
   using mikos::network::SocketState;
   mikos::network::SocketTable sockets;
+
+  MIKOS_CHECK(suite, sockets.slot(SocketHandle{}) == nullptr);
+  MIKOS_CHECK(suite, sockets.retain(SocketHandle{}) == SocketResult::bad_handle);
+  MIKOS_CHECK(suite, sockets.release(SocketHandle{}) == SocketResult::bad_handle);
+  MIKOS_CHECK(suite, sockets.listener({local_ip, 22}) ==
+                         mikos::network::invalid_socket);
 
   // Fill every reassembly slot across SEQ wraparound, preserve duplicates
   // even when full, drain in order, then reuse slots after reset/close.
@@ -285,12 +304,25 @@ int main() {
   MIKOS_CHECK(suite, reset_output == 0x5a);
 
   mikos::network::SocketTable capacity;
-  for (mikos::u32 i = 0; i < mikos::network::socket_capacity; ++i) {
-    MIKOS_CHECK(suite, capacity.open(Type::stream).result ==
-                           SocketResult::success);
+  std::array<SocketHandle, mikos::network::socket_capacity> handles;
+  for (auto& handle : handles) {
+    const auto opened = capacity.open(Type::stream);
+    MIKOS_CHECK(suite, opened.result == SocketResult::success);
+    handle = opened.handle;
+    MIKOS_CHECK(suite, handle != mikos::network::invalid_socket);
+    MIKOS_CHECK(suite, capacity.slot(handle) != nullptr);
   }
-  MIKOS_CHECK(suite, capacity.open(Type::stream).result ==
-                         SocketResult::no_space);
+  for (const auto handle : handles) {
+    MIKOS_CHECK(suite, std::ranges::count(handles, handle) == 1);
+  }
+  const auto exhausted = capacity.open(Type::stream);
+  MIKOS_CHECK(suite, exhausted.result == SocketResult::no_space);
+  MIKOS_CHECK(suite, exhausted.handle == mikos::network::invalid_socket);
+  MIKOS_CHECK(suite, capacity.release(handles.back()) == SocketResult::success);
+  MIKOS_CHECK(suite, capacity.slot(handles.back()) == nullptr);
+  const auto reused = capacity.open(Type::stream);
+  MIKOS_CHECK(suite, reused.result == SocketResult::success);
+  MIKOS_CHECK(suite, reused.handle == handles.back());
 
   return suite.finish();
 }

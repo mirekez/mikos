@@ -127,6 +127,7 @@ enum class Errno : i32 {
   address_family_not_supported = 97,
   address_in_use = 98,
   not_connected = 107,
+  timed_out = 110,
 };
 
 [[nodiscard]] constexpr i32 error(Errno value) {

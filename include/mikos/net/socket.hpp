@@ -1,14 +1,18 @@
 #pragma once
 
-#include <mikos/abi/socket.hpp>
-#include <mikos/net/ethernet.hpp>
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <limits>
+#include <mikos/abi/socket.hpp>
+#include <mikos/container/inplace_vector.hpp>
+#include <mikos/net/ethernet.hpp>
+#include <mikos/net/timing.hpp>
 #include <optional>
+#include <span>
 
 namespace mikos::network {
 
-inline constexpr u8 invalid_socket = 0xff;
 inline constexpr u32 socket_capacity = 13;
 inline constexpr u32 socket_receive_capacity = 4096;
 inline constexpr u32 listen_backlog_capacity = 4;
@@ -16,10 +20,28 @@ inline constexpr u32 reassembly_capacity = 16;
 inline constexpr u32 reassembly_segment_capacity = 1500;
 inline constexpr u32 transmit_capacity = 16;
 inline constexpr u32 transmit_segment_capacity = 1024;
-// poll() is a tight loop in the cycle-level Tribe model. Retrying after only a
-// few hundred calls can monopolize its single TX/RX datapath and prevent the
-// peer's cumulative ACK or next SSH record from reaching the guest.
-inline constexpr u32 transmit_initial_retry_polls = 4096;
+// An internal socket identity, distinct from a userspace file descriptor.
+// Only SocketTable can create an identity for a slot; default construction
+// produces the invalid handle. Copies remain cheap for process snapshots.
+class SocketHandle {
+ public:
+  constexpr SocketHandle() = default;
+
+  [[nodiscard]] constexpr std::size_t index() const { return index_; }
+  [[nodiscard]] constexpr bool operator==(const SocketHandle&) const = default;
+
+ private:
+  friend class SocketTable;
+  static constexpr auto invalid_index = std::numeric_limits<u8>::max();
+  static_assert(socket_capacity <= invalid_index);
+
+  explicit constexpr SocketHandle(std::size_t index)
+      : index_{static_cast<u8>(index)} {}
+
+  u8 index_{invalid_index};
+};
+
+inline constexpr SocketHandle invalid_socket{};
 
 enum class SocketState : u8 {
   free,
@@ -30,6 +52,12 @@ enum class SocketState : u8 {
   syn_received,
   established,
   close_wait,
+  fin_wait_1,
+  fin_wait_2,
+  closing,
+  last_ack,
+  time_wait,
+  closed,
   reset,
 };
 
@@ -46,6 +74,7 @@ enum class SocketResult : u8 {
   no_space,
   reset,
   end_of_file,
+  timed_out,
 };
 
 struct Endpoint {
@@ -55,6 +84,23 @@ struct Endpoint {
   [[nodiscard]] constexpr bool operator==(const Endpoint&) const = default;
 };
 
+[[nodiscard]] constexpr bool is_connection(SocketState state) {
+  switch (state) {
+    case SocketState::syn_received:
+    case SocketState::established:
+    case SocketState::close_wait:
+    case SocketState::fin_wait_1:
+    case SocketState::fin_wait_2:
+    case SocketState::closing:
+    case SocketState::last_ack:
+    case SocketState::time_wait:
+    case SocketState::reset:
+      return true;
+    default:
+      return false;
+  }
+}
+
 struct SocketSlot {
   SocketState state{SocketState::free};
   abi::socket::Type type{abi::socket::Type::datagram};
@@ -62,27 +108,57 @@ struct SocketSlot {
   Endpoint remote{};
   MacAddress remote_mac{};
   u32 send_next{};
+  u32 send_unacknowledged{};
+  u32 peer_window{65535};
+  u32 congestion_window{4 * 536};
+  u32 slow_start_threshold{65535};
+  u32 congestion_credit{};
+  u8 duplicate_acks{};
+  bool fast_recovery{};
+  u32 window_sequence{};
+  u32 window_acknowledgement{};
+  u16 peer_mss{536};
+  u8 peer_scale{};
+  bool scale_negotiated{};
+  bool receive_closed{};
+  bool read_closed{};
+  bool detached{};
+  bool fin_sent{};
+  bool fin_acked{};
+  bool active_close{};
+  bool persist_waiting{};
+  bool rtt_measured{};
+  SocketResult failure{SocketResult::reset};
+  u64 opened_at{};
+  u64 progress_at{};
+  u64 control_retry_at{};
+  u64 control_delay{tcp_initial_rto};
+  u64 persist_retry_at{};
+  u64 persist_delay{tcp_initial_rto};
+  u64 state_since{};
+  u64 rto{tcp_initial_rto};
+  u64 smoothed_rtt{};
+  u64 rtt_variance{};
   u32 receive_next{};
-  u32 receive_size{};
   u16 references{};
-  u8 listener{invalid_socket};
+  SocketHandle listener{invalid_socket};
   u8 backlog{};
   // Number of pending ACK send attempts. A successful immediate send clears
   // this; a busy TX descriptor leaves it set for the next poll.
   u8 acknowledgement_retries{};
   bool accepted{};
   bool send_closed{};
-  u8 receive_buffer[socket_receive_capacity]{};
+  inplace_vector<u8, socket_receive_capacity> receive_buffer{};
 };
 
 struct OpenResult {
   SocketResult result{SocketResult::no_space};
-  u8 handle{invalid_socket};
+  SocketHandle handle{invalid_socket};
 };
 
 struct AcceptResult {
   SocketResult result{SocketResult::would_block};
-  u8 handle{invalid_socket};
+  SocketHandle handle{invalid_socket};
   Endpoint peer{};
 };
 
@@ -92,51 +168,50 @@ struct ReadResult {
 };
 
 struct ReassemblyKey {
-  u8 handle{invalid_socket};
+  SocketHandle handle{invalid_socket};
   u32 sequence{};
 
-  [[nodiscard]] constexpr bool operator==(const ReassemblyKey&) const =
-      default;
+  [[nodiscard]] constexpr bool operator==(const ReassemblyKey&) const = default;
 };
 
 struct ReassemblySegment {
-  u16 size{};
   bool finish{};
-  u8 data[reassembly_segment_capacity]{};
+  inplace_vector<u8, reassembly_segment_capacity> data{};
 };
 
 struct TransmitKey {
-  u8 handle{invalid_socket};
+  SocketHandle handle{invalid_socket};
   u32 sequence{};
 
   [[nodiscard]] constexpr bool operator==(const TransmitKey&) const = default;
 };
 
 struct TransmitSegment {
-  u32 retry_at{};
-  u16 size{};
+  u64 retry_at{};
+  u64 delay{tcp_initial_rto};
+  u64 first_sent{};
+  bool fast_retry{};
   u8 flags{};
   u8 attempts{};
-  u8 data[transmit_segment_capacity]{};
+  inplace_vector<u8, transmit_segment_capacity> data{};
 };
 
 class SocketTable {
  public:
   [[nodiscard]] OpenResult open(abi::socket::Type type) {
-    const u8 handle = allocate();
+    const SocketHandle handle = allocate();
     if (handle == invalid_socket) {
       return {};
     }
-    auto& value = slots_[handle];
+    auto& value = slots_[handle.index()];
     value.type = type;
-    value.state = type == abi::socket::Type::datagram
-                      ? SocketState::control
-                      : SocketState::created;
+    value.state = type == abi::socket::Type::datagram ? SocketState::control
+                                                      : SocketState::created;
     value.references = 1;
     return {SocketResult::success, handle};
   }
 
-  [[nodiscard]] SocketResult retain(u8 handle) {
+  [[nodiscard]] SocketResult retain(SocketHandle handle) {
     auto* value = slot(handle);
     if (value == nullptr || value->references == 0xffff) {
       return SocketResult::bad_handle;
@@ -145,7 +220,7 @@ class SocketTable {
     return SocketResult::success;
   }
 
-  [[nodiscard]] SocketResult release(u8 handle) {
+  [[nodiscard]] SocketResult release(SocketHandle handle) {
     auto* value = slot(handle);
     if (value == nullptr || value->references == 0) {
       return SocketResult::bad_handle;
@@ -154,9 +229,9 @@ class SocketTable {
       return SocketResult::success;
     }
     if (value->state == SocketState::listening) {
-      for (u8 candidate_handle = 0; candidate_handle < socket_capacity;
-           ++candidate_handle) {
-        auto& candidate = slots_[candidate_handle];
+      for (std::size_t index = 0; index < slots_.size(); ++index) {
+        const SocketHandle candidate_handle{index};
+        auto& candidate = slots_[index];
         if (candidate.listener == handle && !candidate.accepted) {
           clear_reassembly(candidate_handle);
           candidate = {};
@@ -168,7 +243,7 @@ class SocketTable {
     return SocketResult::success;
   }
 
-  [[nodiscard]] SocketResult bind(u8 handle, Endpoint local) {
+  [[nodiscard]] SocketResult bind(SocketHandle handle, Endpoint local) {
     auto* value = slot(handle);
     if (value == nullptr) {
       return SocketResult::bad_handle;
@@ -193,7 +268,7 @@ class SocketTable {
     return SocketResult::success;
   }
 
-  [[nodiscard]] SocketResult listen(u8 handle, u32 backlog) {
+  [[nodiscard]] SocketResult listen(SocketHandle handle, u32 backlog) {
     auto* value = slot(handle);
     if (value == nullptr) {
       return SocketResult::bad_handle;
@@ -205,16 +280,16 @@ class SocketTable {
         value->state != SocketState::listening) {
       return SocketResult::not_bound;
     }
-    value->backlog = static_cast<u8>(
-        backlog > listen_backlog_capacity ? listen_backlog_capacity
-                                          : (backlog == 0 ? 1 : backlog));
+    value->backlog =
+        static_cast<u8>(std::clamp(backlog, u32{1}, listen_backlog_capacity));
     value->state = SocketState::listening;
     return SocketResult::success;
   }
 
-  [[nodiscard]] u8 listener(Endpoint local) const {
-    for (u8 handle = 0; handle < socket_capacity; ++handle) {
-      const auto& value = slots_[handle];
+  [[nodiscard]] SocketHandle listener(Endpoint local) const {
+    for (std::size_t index = 0; index < slots_.size(); ++index) {
+      const SocketHandle handle{index};
+      const auto& value = slots_[index];
       if (value.state == SocketState::listening &&
           value.local.port == local.port &&
           (unspecified(value.local.address) ||
@@ -225,59 +300,60 @@ class SocketTable {
     return invalid_socket;
   }
 
-  [[nodiscard]] u8 connection(Endpoint local, Endpoint remote) const {
-    for (u8 handle = 0; handle < socket_capacity; ++handle) {
-      const auto& value = slots_[handle];
-      if ((value.state == SocketState::syn_received ||
-           value.state == SocketState::established ||
-           value.state == SocketState::close_wait ||
-           value.state == SocketState::reset) &&
-          value.local == local && value.remote == remote) {
+  [[nodiscard]] SocketHandle connection(Endpoint local, Endpoint remote) const {
+    for (std::size_t index = 0; index < slots_.size(); ++index) {
+      const SocketHandle handle{index};
+      const auto& value = slots_[index];
+      if (is_connection(value.state) && value.local == local &&
+          value.remote == remote) {
         return handle;
       }
     }
     return invalid_socket;
   }
 
-  [[nodiscard]] OpenResult begin_connection(u8 listener_handle,
-                                             Endpoint local,
-                                             Endpoint remote,
-                                             MacAddress remote_mac,
-                                             u32 remote_sequence,
-                                             u32 local_sequence) {
+  [[nodiscard]] OpenResult begin_connection(SocketHandle listener_handle,
+                                            Endpoint local, Endpoint remote,
+                                            MacAddress remote_mac,
+                                            u32 remote_sequence,
+                                            u32 local_sequence) {
     auto* listening = slot(listener_handle);
-    if (listening == nullptr ||
-        listening->state != SocketState::listening) {
+    if (listening == nullptr || listening->state != SocketState::listening) {
       return {SocketResult::not_listening, invalid_socket};
     }
-    for (u8 handle = 0; handle < socket_capacity; ++handle) {
-      const auto& candidate = slots_[handle];
-      if (candidate.listener == listener_handle &&
-          candidate.remote == remote && !candidate.accepted) {
+    for (std::size_t index = 0; index < slots_.size(); ++index) {
+      const SocketHandle handle{index};
+      const auto& candidate = slots_[index];
+      if (candidate.listener == listener_handle && candidate.remote == remote &&
+          !candidate.accepted) {
         return {SocketResult::success, handle};
       }
     }
     if (pending(listener_handle) >= listening->backlog) {
       return {SocketResult::no_space, invalid_socket};
     }
-    const u8 handle = allocate();
+    const SocketHandle handle = allocate();
     if (handle == invalid_socket) {
       return {};
     }
-    auto& value = slots_[handle];
+    auto& value = slots_[handle.index()];
     value.state = SocketState::syn_received;
     value.type = abi::socket::Type::stream;
     value.local = local;
     value.remote = remote;
     value.remote_mac = remote_mac;
     value.send_next = local_sequence + 1;
+    value.send_unacknowledged = local_sequence;
+    value.window_sequence = remote_sequence;
+    value.window_acknowledgement = local_sequence;
     value.receive_next = remote_sequence + 1;
     value.references = 1;
     value.listener = listener_handle;
     return {SocketResult::success, handle};
   }
 
-  [[nodiscard]] SocketResult establish(u8 handle, u32 acknowledgement) {
+  [[nodiscard]] SocketResult establish(SocketHandle handle,
+                                       u32 acknowledgement) {
     auto* value = slot(handle);
     if (value == nullptr) {
       return SocketResult::bad_handle;
@@ -291,10 +367,11 @@ class SocketTable {
       return SocketResult::invalid_argument;
     }
     value->state = SocketState::established;
+    value->send_unacknowledged = acknowledgement;
     return SocketResult::success;
   }
 
-  [[nodiscard]] AcceptResult accept(u8 listener_handle) {
+  [[nodiscard]] AcceptResult accept(SocketHandle listener_handle) {
     const auto* listening = slot(listener_handle);
     if (listening == nullptr) {
       return {SocketResult::bad_handle, invalid_socket, {}};
@@ -302,8 +379,9 @@ class SocketTable {
     if (listening->state != SocketState::listening) {
       return {SocketResult::not_listening, invalid_socket, {}};
     }
-    for (u8 handle = 0; handle < socket_capacity; ++handle) {
-      auto& candidate = slots_[handle];
+    for (std::size_t index = 0; index < slots_.size(); ++index) {
+      const SocketHandle handle{index};
+      auto& candidate = slots_[index];
       if (candidate.listener == listener_handle && !candidate.accepted &&
           (candidate.state == SocketState::established ||
            candidate.state == SocketState::close_wait ||
@@ -315,18 +393,20 @@ class SocketTable {
     return {SocketResult::would_block, invalid_socket, {}};
   }
 
-  [[nodiscard]] ReadResult receive(u8 handle, u32 sequence, const u8* data,
-                                   u32 size, bool finish) {
+  [[nodiscard]] ReadResult receive(SocketHandle handle, u32 sequence,
+                                   const u8* data, u32 size, bool finish) {
     auto* value = slot(handle);
     if (value == nullptr) {
       return {SocketResult::bad_handle, 0};
     }
-    if (value->state != SocketState::established &&
-        value->state != SocketState::close_wait) {
+    if (!is_connection(value->state) ||
+        value->state == SocketState::syn_received ||
+        value->state == SocketState::reset) {
       return {value->state == SocketState::reset ? SocketResult::reset
                                                  : SocketResult::not_connected,
               0};
     }
+    if (value->receive_closed) return {SocketResult::success, 0};
     i32 distance = static_cast<i32>(sequence - value->receive_next);
     if (distance < 0) {
       // Do not discard an entire retransmission merely because its prefix was
@@ -341,7 +421,16 @@ class SocketTable {
       sequence += acknowledged;
       distance = 0;
     }
+    const auto window = static_cast<u32>(value->receive_buffer.capacity() -
+                                         value->receive_buffer.size());
+    if (static_cast<u32>(distance) >= window && (size != 0 || finish)) {
+      return {SocketResult::success, 0};
+    }
+    const u32 available = window - static_cast<u32>(distance);
+    if (size >= available) finish = false;
+    size = std::min(size, available);
     if (distance > 0) {
+      if (size == 0 && !finish) return {SocketResult::success, 0};
       return {store_reassembly(handle, sequence, data, size, finish), 0};
     }
     u32 total = 0;
@@ -360,52 +449,52 @@ class SocketTable {
 
   [[nodiscard]] ReadResult append_received(SocketSlot& value, const u8* data,
                                            u32 size, bool finish) {
-    u32 accepted = size;
-    const u32 available = socket_receive_capacity - value.receive_size;
-    if (accepted > available) {
-      accepted = available;
-    }
-    for (u32 i = 0; i < accepted; ++i) {
-      value.receive_buffer[value.receive_size + i] = data[i];
-    }
-    value.receive_size += accepted;
+    const auto accepted = static_cast<u32>(std::min<usize>(
+        size, value.receive_buffer.capacity() - value.receive_buffer.size()));
+    value.receive_buffer.append_range(std::span{data, accepted});
     value.receive_next += accepted;
     if (finish && accepted == size) {
       ++value.receive_next;
-      value.state = SocketState::close_wait;
+      value.receive_closed = true;
+      if (value.state == SocketState::fin_wait_1)
+        value.state = SocketState::closing;
+      else if (value.state == SocketState::fin_wait_2)
+        value.state = SocketState::time_wait;
+      else
+        value.state = SocketState::close_wait;
     }
     return {SocketResult::success, accepted};
   }
 
-  [[nodiscard]] ReadResult read(u8 handle, u8* output, u32 size) {
+  [[nodiscard]] ReadResult read(SocketHandle handle, u8* output, u32 size) {
     auto* value = slot(handle);
     if (value == nullptr) {
       return {SocketResult::bad_handle, 0};
     }
-    if (value->receive_size == 0) {
-      if (value->state == SocketState::close_wait) {
+    if (value->read_closed) return {SocketResult::end_of_file, 0};
+    if (value->receive_buffer.empty()) {
+      if (value->receive_closed) {
         return {SocketResult::end_of_file, 0};
       }
       if (value->state == SocketState::reset) {
-        return {SocketResult::reset, 0};
+        return {value->failure, 0};
       }
-      if (value->state != SocketState::established) {
+      if (!is_connection(value->state) ||
+          value->state == SocketState::syn_received) {
         return {SocketResult::not_connected, 0};
       }
       return {SocketResult::would_block, 0};
     }
-    u32 count = size < value->receive_size ? size : value->receive_size;
-    for (u32 i = 0; i < count; ++i) {
-      output[i] = value->receive_buffer[i];
-    }
-    for (u32 i = count; i < value->receive_size; ++i) {
-      value->receive_buffer[i - count] = value->receive_buffer[i];
-    }
-    value->receive_size -= count;
+    const auto count =
+        static_cast<u32>(std::min<usize>(size, value->receive_buffer.size()));
+    std::copy_n(value->receive_buffer.begin(), count, output);
+    value->receive_buffer.erase(value->receive_buffer.begin(),
+                                value->receive_buffer.begin() + count);
+    static_cast<void>(drain_reassembly(handle, *value));
     return {SocketResult::success, count};
   }
 
-  void reset(u8 handle) {
+  void reset(SocketHandle handle, SocketResult failure = SocketResult::reset) {
     if (auto* value = slot(handle); value != nullptr) {
       // An aborted handshake has no application owner. Free its backlog
       // entry instead of reporting a connection that never established to
@@ -414,34 +503,33 @@ class SocketTable {
         static_cast<void>(release(handle));
         return;
       }
-      value->receive_size = 0;
+      value->receive_buffer.clear();
       clear_reassembly(handle);
       value->state = SocketState::reset;
+      value->failure = failure;
+      value->receive_closed = false;
+      value->persist_waiting = false;
     }
   }
 
-  [[nodiscard]] bool readable(u8 handle) const {
+  [[nodiscard]] bool readable(SocketHandle handle) const {
     const auto* value = slot(handle);
     if (value == nullptr) {
       return false;
     }
     if (value->state == SocketState::listening) {
-      for (const auto& candidate : slots_) {
-        if (candidate.listener == handle && !candidate.accepted &&
-            (candidate.state == SocketState::established ||
-             candidate.state == SocketState::close_wait ||
-             candidate.state == SocketState::reset)) {
-          return true;
-        }
-      }
-      return false;
+      return std::ranges::any_of(slots_, [&](const auto& candidate) {
+        return candidate.listener == handle && !candidate.accepted &&
+               (candidate.state == SocketState::established ||
+                candidate.state == SocketState::close_wait ||
+                candidate.state == SocketState::reset);
+      });
     }
-    return value->receive_size != 0 ||
-           value->state == SocketState::close_wait ||
-           value->state == SocketState::reset;
+    return !value->receive_buffer.empty() || value->receive_closed ||
+           value->read_closed || value->state == SocketState::reset;
   }
 
-  [[nodiscard]] bool writable(u8 handle) const {
+  [[nodiscard]] bool writable(SocketHandle handle) const {
     const auto* value = slot(handle);
     return value != nullptr &&
            (value->state == SocketState::established ||
@@ -449,41 +537,54 @@ class SocketTable {
            !value->send_closed;
   }
 
-  [[nodiscard]] SocketSlot* slot(u8 handle) {
-    return handle < socket_capacity &&
-                   slots_[handle].state != SocketState::free
-               ? &slots_[handle]
+  [[nodiscard]] SocketSlot* slot(SocketHandle handle) {
+    return handle.index() < slots_.size() &&
+                   slots_[handle.index()].state != SocketState::free
+               ? &slots_[handle.index()]
                : nullptr;
   }
 
-  [[nodiscard]] const SocketSlot* slot(u8 handle) const {
-    return handle < socket_capacity &&
-                   slots_[handle].state != SocketState::free
-               ? &slots_[handle]
+  [[nodiscard]] const SocketSlot* slot(SocketHandle handle) const {
+    return handle.index() < slots_.size() &&
+                   slots_[handle.index()].state != SocketState::free
+               ? &slots_[handle.index()]
                : nullptr;
+  }
+
+  [[nodiscard]] SocketHandle handle_of(const SocketSlot& value) const {
+    return SocketHandle{static_cast<std::size_t>(&value - slots_.data())};
+  }
+
+  [[nodiscard]] std::span<SocketSlot, socket_capacity> slots() {
+    return slots_;
+  }
+
+  [[nodiscard]] std::span<const SocketSlot, socket_capacity> slots() const {
+    return slots_;
   }
 
  private:
   [[nodiscard]] static constexpr bool unspecified(Ipv4Address address) {
-    return address.octet[0] == 0 && address.octet[1] == 0 &&
-           address.octet[2] == 0 && address.octet[3] == 0;
+    return address == Ipv4Address{};
   }
 
-  [[nodiscard]] u8 allocate() const {
-    for (u8 handle = 0; handle < socket_capacity; ++handle) {
-      if (slots_[handle].state == SocketState::free) {
-        return handle;
-      }
+  [[nodiscard]] SocketHandle allocate() const {
+    const auto free =
+        std::ranges::find(slots_, SocketState::free, &SocketSlot::state);
+    if (free == slots_.end()) {
+      return invalid_socket;
     }
-    return invalid_socket;
+    return SocketHandle{static_cast<std::size_t>(free - slots_.begin())};
   }
 
-  [[nodiscard]] bool port_conflicts(u8 excluded, Endpoint local) const {
-    for (u8 handle = 0; handle < socket_capacity; ++handle) {
+  [[nodiscard]] bool port_conflicts(SocketHandle excluded,
+                                    Endpoint local) const {
+    for (std::size_t index = 0; index < slots_.size(); ++index) {
+      const SocketHandle handle{index};
       if (handle == excluded) {
         continue;
       }
-      const auto& value = slots_[handle];
+      const auto& value = slots_[handle.index()];
       if (value.type == abi::socket::Type::stream &&
           value.state != SocketState::free &&
           value.state != SocketState::control &&
@@ -506,19 +607,16 @@ class SocketTable {
     return 0;
   }
 
-  [[nodiscard]] u32 pending(u8 listener_handle) const {
-    u32 count = 0;
-    for (const auto& candidate : slots_) {
-      if (candidate.listener == listener_handle && !candidate.accepted) {
-        ++count;
-      }
-    }
-    return count;
+  [[nodiscard]] u32 pending(SocketHandle listener_handle) const {
+    return static_cast<u32>(
+        std::ranges::count_if(slots_, [&](const auto& candidate) {
+          return candidate.listener == listener_handle && !candidate.accepted;
+        }));
   }
 
-  [[nodiscard]] SocketResult store_reassembly(u8 handle, u32 sequence,
-                                               const u8* data, u32 size,
-                                               bool finish) {
+  [[nodiscard]] SocketResult store_reassembly(SocketHandle handle, u32 sequence,
+                                              const u8* data, u32 size,
+                                              bool finish) {
     if (size > reassembly_segment_capacity) {
       return SocketResult::no_space;
     }
@@ -528,20 +626,24 @@ class SocketTable {
         })) {
       return SocketResult::success;
     }
-    const auto free = std::ranges::find_if(reassembly_,
-        [](const auto& slot) { return !slot; });
+    const auto free = std::ranges::find_if(
+        reassembly_, [](const auto& slot) { return !slot; });
     if (free == reassembly_.end()) return SocketResult::no_space;
     auto& available = free->emplace().second;
     (*free)->first = key;
-    available.size = static_cast<u16>(size);
     available.finish = finish;
-    std::copy_n(data, size, available.data);
+    available.data.assign_range(std::span{data, size});
     return SocketResult::success;
   }
 
-  [[nodiscard]] ReadResult drain_reassembly(u8 handle, SocketSlot& value) {
+  [[nodiscard]] ReadResult drain_reassembly(SocketHandle handle,
+                                            SocketSlot& value) {
     u32 total = 0;
     for (;;) {
+      if (value.receive_closed) {
+        clear_reassembly(handle);
+        break;
+      }
       auto selected = reassembly_.end();
       for (auto it = reassembly_.begin(); it != reassembly_.end(); ++it) {
         if (!*it) continue;
@@ -562,17 +664,18 @@ class SocketTable {
       }
       auto* queued = &(*selected)->second;
       const u32 acknowledged = value.receive_next - (*selected)->first.sequence;
-      if (acknowledged > queued->size ||
-          (acknowledged == queued->size && !queued->finish)) {
+      if (acknowledged > queued->data.size() ||
+          (acknowledged == queued->data.size() && !queued->finish)) {
         selected->reset();
         continue;
       }
-      const u32 remaining = queued->size - acknowledged;
-      if (remaining > socket_receive_capacity - value.receive_size) {
+      const u32 remaining = queued->data.size() - acknowledged;
+      if (remaining >
+          value.receive_buffer.capacity() - value.receive_buffer.size()) {
         break;
       }
       const auto appended = append_received(
-          value, queued->data + acknowledged, remaining, queued->finish);
+          value, queued->data.data() + acknowledged, remaining, queued->finish);
       total += appended.size;
       selected->reset();
       if (appended.result != SocketResult::success ||
@@ -583,16 +686,17 @@ class SocketTable {
     return {SocketResult::success, total};
   }
 
-  void clear_reassembly(u8 handle) {
+  void clear_reassembly(SocketHandle handle) {
     for (auto& slot : reassembly_)
       if (slot && slot->first.handle == handle) slot.reset();
   }
 
-  SocketSlot slots_[socket_capacity]{};
+  std::array<SocketSlot, socket_capacity> slots_{};
   // Fixed slots preserve packet addresses and avoid allocation or moving
   // payloads when ACKs/close remove another entry. Capacity is only sixteen.
   std::array<std::optional<std::pair<ReassemblyKey, ReassemblySegment>>,
-             reassembly_capacity> reassembly_{};
+             reassembly_capacity>
+      reassembly_{};
 };
 
 }  // namespace mikos::network

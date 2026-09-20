@@ -146,7 +146,7 @@ struct ParkedBackground {
   char current_directory[256]{};
   char executable_path[256]{};
   process_model::SnapshotAllocation snapshot{};
-  u8 wait_socket{network::invalid_socket};
+  network::SocketHandle wait_socket{network::invalid_socket};
   BackgroundWait wait{BackgroundWait::none};
   bool used{};
 };
@@ -198,7 +198,7 @@ void reset_descriptors();
 [[nodiscard]] bool save_parent_descriptors();
 void restore_parent_descriptors();
 void discard_parent_descriptors();
-[[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket);
+[[nodiscard]] bool park_background(TrapFrame& frame, network::SocketHandle wait_socket);
 [[nodiscard]] bool resume_background_if_ready(TrapFrame& frame);
 [[nodiscard]] bool park_interactive_child(
     TrapFrame& frame, process_model::PtyHandle wait_pty,
@@ -539,7 +539,7 @@ struct Descriptor {
   Node node{};
   u32 offset{};
   u32 flags{};
-  u8 socket{network::invalid_socket};
+  network::SocketHandle socket{network::invalid_socket};
   process_model::PipeHandle pipe{};
   process_model::PipeEnd pipe_end{process_model::PipeEnd::read};
   process_model::PtyHandle pty{};
@@ -1066,7 +1066,7 @@ void capture_interactive_child(TrapFrame& frame,
   return true;
 }
 
-void capture_background(TrapFrame& frame, u8 wait_socket) {
+void capture_background(TrapFrame& frame, network::SocketHandle wait_socket) {
   background.frame = frame;
   background.brk = process.brk;
   background.mmap_begin = process.mmap_begin;
@@ -1150,7 +1150,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
 #endif
 }
 
-[[nodiscard]] bool park_background(TrapFrame& frame, u8 wait_socket) {
+[[nodiscard]] bool park_background(TrapFrame& frame, network::SocketHandle wait_socket) {
   if (!parent.active) {
 #ifdef MIKOS_TRIBE_INTERACTIVE
     static bool reported_no_parent = false;
@@ -1584,7 +1584,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
     write_text("MIKOS:TCP_CLOSE fd=");
     write_u32(descriptor);
     write_text(" handle=");
-    write_u32(slot.socket);
+    write_u32(static_cast<u32>(slot.socket.index()));
     write_text("\n");
   }
 #endif
@@ -1730,6 +1730,8 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
       return error(Errno::no_memory);
     case SocketResult::reset:
       return error(Errno::io);
+    case SocketResult::timed_out:
+      return error(Errno::timed_out);
   }
   return error(Errno::io);
 }
@@ -1870,7 +1872,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   write_u32(accepted_descriptor);
   write_text(" buffered=");
   const auto* accepted_socket = network::socket_slot(accepted.handle);
-  write_u32(accepted_socket == nullptr ? 0 : accepted_socket->receive_size);
+  write_u32(accepted_socket == nullptr ? 0 : accepted_socket->receive_buffer.size());
   write_text("\n");
 #endif
   return static_cast<i32>(accepted_descriptor);
@@ -1886,9 +1888,8 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
   if (socket == nullptr) {
     return error(Errno::bad_file_descriptor);
   }
-  if (peer && socket->state != network::SocketState::established &&
-      socket->state != network::SocketState::close_wait &&
-      socket->state != network::SocketState::reset) {
+  if (peer && (!network::is_connection(socket->state) ||
+               socket->state == network::SocketState::syn_received)) {
     return error(Errno::not_connected);
   }
   return write_sockaddr(peer ? socket->remote : socket->local, address,
@@ -2236,7 +2237,7 @@ void reinstate_suspended_ancestor(TrapFrame& frame) {
           write_u32(result.size);
           write_text(" remaining=");
           const auto* socket = network::socket_slot(slot.socket);
-          write_u32(socket == nullptr ? 0 : socket->receive_size);
+          write_u32(socket == nullptr ? 0 : socket->receive_buffer.size());
           write_text("\n");
         }
 #endif

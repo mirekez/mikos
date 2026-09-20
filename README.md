@@ -16,6 +16,7 @@ Start with:
 - [Kernel/driver C++ cleanup and ABI boundaries](doc/cxx-modernization.md)
 - [RV32 BusyBox proof of concept](doc/poc-rv32.md)
 - [Polling network proof of concept](doc/network-poc.md)
+- [TCP acceptance criteria and deterministic tests](tests/network/README.md)
 - [Regression and acceptance tests](tests/README.md)
 
 The current proof of concept boots on the supplied RV32 QEMU, enters a

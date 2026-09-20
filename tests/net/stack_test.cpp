@@ -1,10 +1,13 @@
 #include <drivers/net/net.hpp>
 #include <mikos/kernel.hpp>
+#include <mikos/arch.hpp>
 #include <mikos/net/tcp.hpp>
 
 #include <support/test.hpp>
 
 namespace {
+
+mikos::u64 fake_time{};
 
 constexpr mikos::MacAddress guest_mac{{2, 0, 0, 0, 0, 2}};
 constexpr mikos::MacAddress peer_mac{{2, 0, 0, 0, 0, 1}};
@@ -64,7 +67,11 @@ void make_packet(mikos::u8 flags, mikos::u32 sequence,
 }
 
 [[nodiscard]] bool transmitted_tcp(mikos::TcpView& view) {
-  return mikos::parse_tcp(transmitted_frame, transmitted_size, peer_ip, view);
+  const auto packet = mikos::parse_tcp(
+      std::span{transmitted_frame, transmitted_size}, peer_ip);
+  if (!packet) return false;
+  view = *packet;
+  return true;
 }
 
 [[nodiscard]] bool contains(const char* text, const char* needle) {
@@ -81,6 +88,8 @@ void make_packet(mikos::u8 flags, mikos::u32 sequence,
 }
 
 }  // namespace
+
+namespace mikos::arch { u64 time_ticks() { return fake_time; } }
 
 namespace mikos::drivers::net {
 
@@ -145,9 +154,9 @@ int main() {
   MIKOS_CHECK(suite, transmit_count == 1);
   TcpView syn_ack{};
   MIKOS_CHECK(suite, transmitted_tcp(syn_ack));
-  MIKOS_CHECK(suite, syn_ack.tcp->flags == (tcp_syn | tcp_ack));
-  MIKOS_CHECK(suite, net32(syn_ack.tcp->acknowledgement) == 1001);
-  const u32 server_sequence = net32(syn_ack.tcp->sequence);
+  MIKOS_CHECK(suite, syn_ack.tcp.flags == (tcp_syn | tcp_ack));
+  MIKOS_CHECK(suite, net32(syn_ack.tcp.acknowledgement) == 1001);
+  const u32 server_sequence = net32(syn_ack.tcp.sequence);
 
   make_packet(tcp_ack, 1001, server_sequence + 1);
   poll();
@@ -164,8 +173,8 @@ int main() {
   MIKOS_CHECK(suite, transmit_count == 2);
   TcpView data_ack{};
   MIKOS_CHECK(suite, transmitted_tcp(data_ack));
-  MIKOS_CHECK(suite, data_ack.tcp->flags == tcp_ack);
-  MIKOS_CHECK(suite, net32(data_ack.tcp->acknowledgement) == 1005);
+  MIKOS_CHECK(suite, data_ack.tcp.flags == tcp_ack);
+  MIKOS_CHECK(suite, net32(data_ack.tcp.acknowledgement) == 1005);
   u8 input[8]{};
   const auto read_result = socket_read(accepted.handle, input, sizeof(input));
   MIKOS_CHECK(suite, read_result.result == SocketResult::success);
@@ -180,29 +189,30 @@ int main() {
   TcpView response_view{};
   MIKOS_CHECK(suite, transmitted_tcp(response_view));
   MIKOS_CHECK(suite,
-              response_view.tcp->flags == (tcp_ack | tcp_psh));
-  MIKOS_CHECK(suite, net32(response_view.tcp->sequence) ==
+              response_view.tcp.flags == (tcp_ack | tcp_psh));
+  MIKOS_CHECK(suite, net32(response_view.tcp.sequence) ==
                          server_sequence + 1);
-  MIKOS_CHECK(suite, response_view.payload_size == sizeof(response));
+  MIKOS_CHECK(suite, response_view.payload.size() == sizeof(response));
   MIKOS_CHECK(suite, response_view.payload[1] == 'o');
 
   // Outbound payload is retained until a cumulative ACK covers it. This is
   // essential for SSH, which emits adjacent identification/KEX records and
   // cannot recover if either TCP segment is silently lost by the polling NIC.
   const u32 before_response_retry = transmit_count;
-  for (u32 i = 0; i < transmit_initial_retry_polls - 1; ++i) {
+  for (u32 i = 0; i < 100; ++i) {
     poll();
   }
   MIKOS_CHECK(suite, transmit_count == before_response_retry);
+  fake_time += tcp_initial_rto;
   poll();
   MIKOS_CHECK(suite, transmit_count == before_response_retry + 1);
   TcpView response_retry{};
   MIKOS_CHECK(suite, transmitted_tcp(response_retry));
-  MIKOS_CHECK(suite, net32(response_retry.tcp->sequence) ==
+  MIKOS_CHECK(suite, net32(response_retry.tcp.sequence) ==
                          server_sequence + 1);
-  MIKOS_CHECK(suite, response_retry.payload_size == sizeof(response));
+  MIKOS_CHECK(suite, response_retry.payload.size() == sizeof(response));
   const u32 after_first_retry = transmit_count;
-  for (u32 i = 0; i < transmit_initial_retry_polls; ++i) {
+  for (u32 i = 0; i < 100; ++i) {
     poll();
   }
   MIKOS_CHECK(suite, transmit_count == after_first_retry);
@@ -216,7 +226,7 @@ int main() {
   const auto failed_write_result =
       socket_write(accepted.handle, failed_write, sizeof(failed_write));
   MIKOS_CHECK(suite,
-              failed_write_result.result == SocketResult::no_space);
+              failed_write_result.result == SocketResult::would_block);
   const u32 after_failed_write = transmit_count;
   for (u32 i = 0; i < 300; ++i) {
     poll();
@@ -234,31 +244,35 @@ int main() {
                   sizeof(second_followup));
   TcpView second_followup_view{};
   MIKOS_CHECK(suite, transmitted_tcp(second_followup_view));
-  MIKOS_CHECK(suite, net32(second_followup_view.tcp->sequence) ==
+  MIKOS_CHECK(suite, net32(second_followup_view.tcp.sequence) ==
                          server_sequence + 8);
   const u32 before_ordered_retry = transmit_count;
-  for (u32 i = 0; i < transmit_initial_retry_polls - 1; ++i) {
+  for (u32 i = 0; i < 100; ++i) {
     poll();
   }
   MIKOS_CHECK(suite, transmit_count == before_ordered_retry);
+  fake_time += tcp_initial_rto;
   poll();
   MIKOS_CHECK(suite, transmit_count == before_ordered_retry + 1);
   TcpView first_followup_retry{};
   MIKOS_CHECK(suite, transmitted_tcp(first_followup_retry));
-  MIKOS_CHECK(suite, net32(first_followup_retry.tcp->sequence) ==
+  MIKOS_CHECK(suite, net32(first_followup_retry.tcp.sequence) ==
                          server_sequence + 5);
   MIKOS_CHECK(suite,
-              first_followup_retry.payload_size == sizeof(first_followup));
+              first_followup_retry.payload.size() == sizeof(first_followup));
 
   const u32 before_first_followup_ack = transmit_count;
   make_packet(tcp_ack, 1005, server_sequence + 8);
   poll();
+  MIKOS_CHECK(suite, transmit_count == before_first_followup_ack);
+  fake_time += tcp_initial_rto;
+  poll();
   MIKOS_CHECK(suite, transmit_count == before_first_followup_ack + 1);
   TcpView second_retry{};
   MIKOS_CHECK(suite, transmitted_tcp(second_retry));
-  MIKOS_CHECK(suite, net32(second_retry.tcp->sequence) ==
+  MIKOS_CHECK(suite, net32(second_retry.tcp.sequence) ==
                          server_sequence + 8);
-  MIKOS_CHECK(suite, second_retry.payload_size == sizeof(second_followup));
+  MIKOS_CHECK(suite, second_retry.payload.size() == sizeof(second_followup));
   MIKOS_CHECK(suite, second_retry.payload[0] == 'd');
   make_packet(tcp_ack, 1005, server_sequence + 10);
   poll();
@@ -277,8 +291,8 @@ int main() {
   MIKOS_CHECK(suite, transmit_count == before_failed_ack + 1);
   TcpView retried_ack{};
   MIKOS_CHECK(suite, transmitted_tcp(retried_ack));
-  MIKOS_CHECK(suite, retried_ack.tcp->flags == tcp_ack);
-  MIKOS_CHECK(suite, net32(retried_ack.tcp->acknowledgement) == 1006);
+  MIKOS_CHECK(suite, retried_ack.tcp.flags == tcp_ack);
+  MIKOS_CHECK(suite, net32(retried_ack.tcp.acknowledgement) == 1006);
   poll();
   MIKOS_CHECK(suite, transmit_count == before_failed_ack + 1);
   MIKOS_CHECK(suite,
@@ -291,10 +305,10 @@ int main() {
   for (u32 round = 0; round < 2; ++round) {
     for (u32 i = 0; i < transmit_capacity; ++i)
       MIKOS_CHECK(suite, socket_write(accepted.handle, &marker, 1).size == 1);
-    MIKOS_CHECK(suite, socket_write(accepted.handle, &marker, 1).result == SocketResult::no_space);
+    MIKOS_CHECK(suite, socket_write(accepted.handle, &marker, 1).result == SocketResult::would_block);
     TcpView last{};
     MIKOS_CHECK(suite, transmitted_tcp(last));
-    MIKOS_CHECK(suite, net32(last.tcp->sequence) == acknowledged_output + transmit_capacity - 1);
+    MIKOS_CHECK(suite, net32(last.tcp.sequence) == acknowledged_output + transmit_capacity - 1);
     acknowledged_output += transmit_capacity;
     make_packet(tcp_ack, 1006, acknowledged_output);
     poll();
@@ -315,13 +329,17 @@ int main() {
   TcpView half_close_view{};
   MIKOS_CHECK(suite, transmitted_tcp(half_close_view));
   MIKOS_CHECK(suite,
-              half_close_view.tcp->flags == (tcp_ack | tcp_psh));
-  MIKOS_CHECK(suite, half_close_view.payload_size == 1);
+              half_close_view.tcp.flags == (tcp_ack | tcp_psh));
+  MIKOS_CHECK(suite, half_close_view.payload.size() == 1);
   MIKOS_CHECK(suite, half_close_view.payload[0] == '!');
+  make_packet(tcp_ack, 1007, acknowledged_output + 1);
+  poll();
   MIKOS_CHECK(suite, socket_close(accepted.handle) == SocketResult::success);
   TcpView final_fin{};
   MIKOS_CHECK(suite, transmitted_tcp(final_fin));
-  MIKOS_CHECK(suite, final_fin.tcp->flags == (tcp_fin | tcp_ack));
+  MIKOS_CHECK(suite, final_fin.tcp.flags == (tcp_fin | tcp_ack));
+  make_packet(tcp_ack, 1007, acknowledged_output + 2);
+  poll();
   const u32 before_closed_polling = transmit_count;
   for (u32 i = 0; i < 300; ++i) {
     poll();
@@ -338,8 +356,8 @@ int main() {
     poll();
     TcpView reply{};
     MIKOS_CHECK(suite, transmitted_tcp(reply));
-    MIKOS_CHECK(suite, reply.tcp->flags == (tcp_syn | tcp_ack));
-    MIKOS_CHECK(suite, net32(reply.tcp->acknowledgement) == sequence + 1);
+    MIKOS_CHECK(suite, reply.tcp.flags == (tcp_syn | tcp_ack));
+    MIKOS_CHECK(suite, net32(reply.tcp.acknowledgement) == sequence + 1);
     make_packet(tcp_syn, sequence, 0, nullptr, 0, port);
     poll();
     make_packet(tcp_rst, sequence + 1, 0, nullptr, 0, port);
@@ -355,7 +373,7 @@ int main() {
   poll();
   TcpView reconnect_reply{};
   MIKOS_CHECK(suite, transmitted_tcp(reconnect_reply));
-  const u32 reconnect_sequence = net32(reconnect_reply.tcp->sequence);
+  const u32 reconnect_sequence = net32(reconnect_reply.tcp.sequence);
   make_packet(tcp_ack | tcp_psh, 9001, reconnect_sequence + 1, request,
               sizeof(request));
   poll();

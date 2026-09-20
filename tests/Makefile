@@ -14,7 +14,7 @@ KERNEL_CXX_SANITIZERS ?= undefined
 
 LOCAL_TEST_SOURCES := $(sort $(wildcard kernel/*_test.cpp) \
 	$(wildcard drivers/*_test.cpp) $(wildcard fs/*_test.cpp) \
-	$(wildcard net/*_test.cpp))
+	$(wildcard net/*_test.cpp) $(wildcard network/*_test.cpp))
 DRIVER_TEST_SOURCES := $(sort \
 	$(wildcard ../drivers/fs/fat32/tests/*_test.cpp) \
 	$(wildcard ../drivers/fs/ext4/tests/*_test.cpp))
@@ -111,6 +111,36 @@ $(BUILD)/drivers/%: ../drivers/%.cpp support/test.hpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $@.d $< $(LDFLAGS) -o $@
 
 clean:
-	rm -f $(TEST_BINARIES) $(TEST_DEPS)
+	rm -f $(TEST_BINARIES) $(TEST_DEPS) $(BUILD)/network/tcp_stack_sanitized $(BUILD)/network/linux_peer
 
 -include $(TEST_DEPS)
+
+.PHONY: network-test network-sanitize
+network-test: $(BUILD)/network/tcp_stack_test
+	$<
+
+$(BUILD)/network/tcp_stack_test: network/tcp_stack_test.cpp network/harness.cpp \
+    network/harness.hpp $(ROOT)/network/stack.cpp support/test.hpp
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -O2 -g -MMD -MP -MF $@.d \
+	  network/tcp_stack_test.cpp network/harness.cpp $(ROOT)/network/stack.cpp $(LDFLAGS) -o $@
+
+network-sanitize: $(BUILD)/network/tcp_stack_sanitized
+	$<
+
+$(BUILD)/network/tcp_stack_sanitized: network/tcp_stack_test.cpp network/harness.cpp \
+    network/harness.hpp $(ROOT)/network/stack.cpp $(wildcard $(ROOT)/include/mikos/net/*.hpp) Makefile | $(KERNEL_CXX_READY)
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -O1 -g -fsanitize=address,undefined \
+	  -fno-sanitize-recover=all -fno-omit-frame-pointer \
+	  network/tcp_stack_test.cpp network/harness.cpp $(ROOT)/network/stack.cpp $(LDFLAGS) -o $@
+
+.PHONY: network-linux-peer
+network-linux-peer: $(BUILD)/network/linux_peer
+	python3 network/linux_peer.py --binary $<
+
+$(BUILD)/network/linux_peer: network/linux_peer.cpp $(ROOT)/network/stack.cpp \
+    $(wildcard $(ROOT)/include/mikos/net/*.hpp) Makefile | $(KERNEL_CXX_READY)
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -O2 -g -pthread \
+	  network/linux_peer.cpp $(ROOT)/network/stack.cpp $(LDFLAGS) -o $@
